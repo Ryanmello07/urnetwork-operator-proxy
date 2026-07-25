@@ -5,7 +5,12 @@
 package geolocate
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"sync"
 	"time"
 )
 
@@ -62,4 +67,78 @@ type ConsensusLocation struct {
 
 	Sources  []SourceResult // every source's outcome (including failures)
 	ProbedAt time.Time
+}
+
+// Locate queries the production sources through client and returns a
+// cross-checked consensus. client, in production, egresses through a specific
+// provider, so each source's no-IP endpoint returns that provider's egress
+// location. Returns ErrNoConsensus if fewer than MinSources sources responded.
+func Locate(ctx context.Context, client *http.Client) (*ConsensusLocation, error) {
+	return locate(ctx, client, sources)
+}
+
+func locate(ctx context.Context, client *http.Client, srcs []source) (*ConsensusLocation, error) {
+	results := make([]SourceResult, len(srcs))
+	var wg sync.WaitGroup
+	for i := range srcs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = fetchSource(ctx, client, srcs[i])
+		}(i)
+	}
+	wg.Wait()
+
+	ok := make([]SourceResult, 0, len(results))
+	for _, r := range results {
+		if r.OK {
+			ok = append(ok, r)
+		}
+	}
+	if len(ok) < MinSources {
+		return nil, ErrNoConsensus
+	}
+	loc := consensus(ok)
+	loc.Sources = results
+	loc.ProbedAt = time.Now()
+	return &loc, nil
+}
+
+func fetchSource(ctx context.Context, client *http.Client, s source) SourceResult {
+	r := SourceResult{Name: s.Name}
+	ctx, cancel := context.WithTimeout(ctx, PerSourceTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.URL, nil)
+	if err != nil {
+		r.Err = err.Error()
+		return r
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		r.Err = err.Error()
+		return r
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		r.Err = fmt.Sprintf("status %d", resp.StatusCode)
+		return r
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBytes+1))
+	if err != nil {
+		r.Err = err.Error()
+		return r
+	}
+	if len(body) > MaxResponseBytes {
+		r.Err = "response too large"
+		return r
+	}
+	parsed, err := s.Parse(body)
+	if err != nil {
+		r.Err = err.Error()
+		return r
+	}
+	parsed.Name = s.Name
+	parsed.OK = true
+	return parsed
 }
