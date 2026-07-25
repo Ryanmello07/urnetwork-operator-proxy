@@ -105,6 +105,73 @@ func TestLocateTimeoutCountsAsFailure(t *testing.T) {
 	}
 }
 
+// TestLocateRunsSourcesConcurrently guards the fan-out: locate() must bound
+// its total latency by the slowest single source, not the sum of all
+// sources. Each of the 3 sources sleeps sleepPerSource before responding
+// with a valid, mutually-agreeing payload. If locate() ever regresses to
+// fetching sources sequentially, the elapsed wall-clock roughly triples and
+// trips the concurrentBound assertion below.
+func TestLocateRunsSourcesConcurrently(t *testing.T) {
+	old := PerSourceTimeout
+	PerSourceTimeout = 2 * time.Second
+	defer func() { PerSourceTimeout = old }()
+
+	const sleepPerSource = 200 * time.Millisecond
+	// Comfortably above one sleep (concurrent) and comfortably below three
+	// sleeps (sequential), so this fails decisively if the fan-out is
+	// serialized while staying robust to a loaded CI machine.
+	const concurrentBound = 450 * time.Millisecond
+
+	slowJSONServer := func(body string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(sleepPerSource)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		}))
+	}
+
+	s1 := slowJSONServer(`{"status":"success","countryCode":"US","country":"United States","city":"Fairfax","asn":401486}`)
+	s2 := slowJSONServer(`{"countryCode":"US","countryName":"United States","cityName":"Fairfax","regionName":"Virginia","asn":"401486"}`)
+	s3 := slowJSONServer(`{"country":"US","city":"Fairfax","region":"Virginia","org":"AS401486 RAVNIX LLC"}`)
+	// Servers sleep before every response, so Close() would block on any
+	// still-in-flight handler; deferring Close outside the timed region
+	// avoids polluting the elapsed measurement (Close is still called at
+	// the end of the test, after locate() has returned).
+	defer s1.Close()
+	defer s2.Close()
+	defer s3.Close()
+
+	srcs := []source{
+		{Name: "ip.pn", URL: s1.URL, Parse: parseIpPn},
+		{Name: "freeipapi", URL: s2.URL, Parse: parseFreeIpApi},
+		{Name: "ipinfo", URL: s3.URL, Parse: parseIpInfo},
+	}
+
+	start := time.Now()
+	loc, err := locate(context.Background(), &http.Client{}, srcs)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("locate err = %v", err)
+	}
+	if !loc.CountryConfident || loc.CountryCode != "us" {
+		t.Fatalf("country = %q confident=%v", loc.CountryCode, loc.CountryConfident)
+	}
+	okCount := 0
+	for _, s := range loc.Sources {
+		if s.OK {
+			okCount++
+		}
+	}
+	if okCount != 3 {
+		t.Fatalf("expected all 3 sources to succeed, got %d: %+v", okCount, loc.Sources)
+	}
+
+	if elapsed >= concurrentBound {
+		t.Fatalf("locate() took %v, want < %v; sources appear to be fetched sequentially instead of concurrently", elapsed, concurrentBound)
+	}
+}
+
 func TestLocateOversizedResponseRejected(t *testing.T) {
 	big := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("{" + strings.Repeat(" ", MaxResponseBytes+10) + "}"))
