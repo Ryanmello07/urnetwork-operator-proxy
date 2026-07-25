@@ -143,7 +143,14 @@ func consensus(ok []SourceResult) ConsensusLocation {
 			bestCity = c
 		}
 	}
-	if bestCityN >= 2 {
+	// CityConfident requires both city agreement AND a resolved Region: the
+	// server rejects any city-confident submission with an empty region,
+	// and that rejection kills the whole POST -- including a perfectly good
+	// country result. Region is only populated when some source supplied
+	// one (never fabricated), so when no agreeing source named a region,
+	// degrade cleanly to country granularity instead of submitting an
+	// incomplete record: leave City/Region empty and CityConfident false.
+	if bestCityN >= 2 && cityRegion[bestCity] != "" {
 		loc.City = cityDisplay[bestCity]
 		loc.Region = cityRegion[bestCity]
 		loc.CityConfident = true

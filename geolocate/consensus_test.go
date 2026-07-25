@@ -173,6 +173,62 @@ func TestConsensusCountryNameUnknownCodeStaysEmpty(t *testing.T) {
 	}
 }
 
+// TestConsensusCityAgreementNoRegionNotConfident is the regression test for
+// the availability bug: two sources agree on a city but neither supplied a
+// Region. The server rejects any submission with CityConfident==true and an
+// empty region, which previously threw away a perfectly good country result
+// too (the whole submission is one POST). CityConfident must therefore
+// require a non-empty Region, not just city agreement; when the region is
+// missing, City/Region must stay empty and CityConfident false so the result
+// degrades cleanly to country granularity instead of being rejected outright.
+func TestConsensusCityAgreementNoRegionNotConfident(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "a", OK: true, CountryCode: "US", Country: "United States", City: "Denver"},
+		{Name: "b", OK: true, CountryCode: "US", Country: "United States", City: "denver "},
+	}
+	loc := consensus(ok)
+	if loc.CityConfident {
+		t.Fatal("two sources agree on Denver but neither supplied a Region; CityConfident must be false")
+	}
+	if loc.City != "" {
+		t.Fatalf("City = %q, want empty when no source supplied a Region", loc.City)
+	}
+	if loc.Region != "" {
+		t.Fatalf("Region = %q, want empty when no source supplied a Region", loc.Region)
+	}
+	// The country result must be unaffected by the incomplete city data.
+	if !loc.CountryConfident {
+		t.Fatal("country agreement is independent of city completeness; CountryConfident must still be true")
+	}
+	if loc.CountryCode != "us" {
+		t.Fatalf("CountryCode = %q, want \"us\"", loc.CountryCode)
+	}
+	if loc.Country != "United States" {
+		t.Fatalf("Country = %q, want \"United States\"", loc.Country)
+	}
+}
+
+// TestConsensusCityAgreementWithRegionConfident is the happy-path complement
+// to TestConsensusCityAgreementNoRegionNotConfident: two sources agree on a
+// city and at least one of them supplied a Region, so CityConfident must
+// still be true and both City and Region populated.
+func TestConsensusCityAgreementWithRegionConfident(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "a", OK: true, CountryCode: "US", City: "Denver"},
+		{Name: "b", OK: true, CountryCode: "US", City: "denver ", Region: "Colorado"},
+	}
+	loc := consensus(ok)
+	if !loc.CityConfident {
+		t.Fatal("two sources agree on Denver and one supplied a Region; CityConfident must be true")
+	}
+	if got := loc.City; got != "Denver" && got != "denver" {
+		t.Fatalf("City = %q, want a Denver display value", got)
+	}
+	if loc.Region != "Colorado" {
+		t.Fatalf("Region = %q, want \"Colorado\"", loc.Region)
+	}
+}
+
 func TestConsensusFlagsOr(t *testing.T) {
 	ok := []SourceResult{
 		{Name: "a", OK: true, CountryCode: "US", Hosting: false, Proxy: false, Mobile: false},
