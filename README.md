@@ -52,9 +52,28 @@ any other client. `-operator-secret` must match `ingest_secret` in the server's
 `provider_egress.yml` vault resource.
 
 Run `./egress-prober -h` for the full flag list, including `-probe-timeout`
-(per-provider probe timeout) and `-interval 0` (run a single pass and exit,
-useful for driving the prober from an external cron/systemd timer instead of
-its own sleep loop).
+(per-provider probe timeout, must be positive) and `-interval 0` (run a
+single pass and exit, useful for driving the prober from an external
+cron/systemd timer instead of its own sleep loop; `-interval` must not be
+negative).
+
+Each pass enumerates providers broadly and stably: it fetches every
+location that currently has at least one provider from the operator's
+server, then asks for the providers at each of those locations and unions
+the results. This is deliberate — asking for only the server's own
+"best available" guess would enumerate exactly the providers the server's
+geo database *already* believes are in a given place, which is the inverse
+of what a location-correcting probe needs to cover.
+
+**Exit codes**, relevant when driving `-interval 0` from cron/systemd:
+the process exits non-zero if the provider list could not be fetched at
+all, or if a pass completed having submitted nothing while recording at
+least one failure (e.g. every probe failed the same way — a wrong
+`-platform-url`, a revoked jwt). A pass with nothing to do (no providers,
+no failures) still exits 0. In long-running mode (`-interval` > 0) neither
+condition stops the process — it logs and keeps retrying on the next
+interval, since a systemd-managed service should ride out a transient
+server blip rather than die.
 
 ### Certificate pinning
 
@@ -82,6 +101,15 @@ host (see the recipe in `geolocatePins()`'s doc comment).
 
 ### Design
 
-See the design spec:
-`docs/superpowers/specs/2026-07-24-provider-egress-geolocation-design.md`
-in the server repo.
+This tool geolocates a network provider by routing HTTPS geolocation
+lookups *through that provider's own tunnel*, rather than trusting the
+provider to self-report a location: the prober host never queries a
+geolocation api directly, only through a tunnel pinned to exactly one
+provider (see "Certificate pinning" above), so each lookup's response
+reflects that provider's actual egress point. Results from the three
+independent sources are reconciled into a consensus (see `geolocate/`) and
+submitted to the operator's server (see `ingest/`), which can then correct
+its own record of that provider's location. There is no separate design
+document in the server repo; this README plus the package doc comments in
+`geolocate/`, `providertunnel/`, `prober/`, and `ingest/` are the design
+reference.

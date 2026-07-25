@@ -8,6 +8,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -60,6 +61,29 @@ func main() {
 		os.Exit(2)
 	}
 
+	// M1: a negative -interval would otherwise fall straight into
+	// time.After, which treats a negative duration as "fire immediately" --
+	// degenerating the sleep loop into back-to-back passes with no pause
+	// between them and no indication why. Fail fast instead.
+	if *interval < 0 {
+		fmt.Fprintf(os.Stderr, "egress-prober: -interval must not be negative (got %s)\n\n", *interval)
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	// M5: -probe-timeout 0 disables BOTH the http.Client.Timeout and the
+	// manual TLS handshake timeout in providertunnel's DialTLSContext (see
+	// providertunnel/tunnel.go: `if timeout > 0`), since a zero
+	// time.Duration is the Go idiom for "no timeout" in both places. A
+	// negative value is nonsensical for either. Either way, a provider that
+	// simply never responds would hang a probe (and the goroutine slot it
+	// holds) forever instead of freeing up for the next pass.
+	if *probeTimeout <= 0 {
+		fmt.Fprintf(os.Stderr, "egress-prober: -probe-timeout must be positive (got %s)\n\n", *probeTimeout)
+		flag.Usage()
+		os.Exit(2)
+	}
+
 	clientId, err := parseByJwtClientId(*byJwt)
 	if err != nil {
 		log.Fatalf("parse by-jwt client id: %s", err)
@@ -107,14 +131,38 @@ func main() {
 		CacheTTL:    *cacheTTL,
 	}
 
+	// I3: a single-shot run (-interval 0) is the mode the README recommends
+	// for external cron/systemd scheduling, which decides success or
+	// failure purely from the exit code -- so this process must not report
+	// success (exit 0) when it accomplished nothing. Two cases are treated
+	// as failure below: the provider list could not be fetched at all, and
+	// a pass that ran but submitted nothing while recording failures (e.g.
+	// every probe hit the same wrong -platform-url, or the jwt was
+	// revoked -- a permanently broken configuration, not a fluke). A pass
+	// with zero providers to probe (submitted=0, failed=0) is NOT a
+	// failure -- there was simply nothing to do.
+	//
+	// The long-running loop (-interval > 0) deliberately does NOT exit on
+	// either condition: a systemd-managed process should keep retrying
+	// through a transient server blip rather than dying, but it does still
+	// log clearly so the failure is visible (e.g. via journalctl) even
+	// though the process itself stays up.
 	for {
 		providers, err := listProviders(ctx, *apiURL, *byJwt)
 		if err != nil {
 			log.Printf("list providers: %s", err)
+			if *interval == 0 {
+				log.Printf("egress-prober: single-shot pass could not fetch the provider list; exiting non-zero")
+				os.Exit(1)
+			}
 		} else {
 			sum := scheduler.Run(ctx, providers)
 			log.Printf("pass: attempted=%d submitted=%d skipped=%d failed=%d",
 				sum.Attempted, sum.Submitted, sum.Skipped, sum.Failed)
+			if *interval == 0 && sum.Submitted == 0 && 0 < sum.Failed {
+				log.Printf("egress-prober: single-shot pass submitted nothing and recorded %d failure(s); exiting non-zero", sum.Failed)
+				os.Exit(1)
+			}
 		}
 		if *interval == 0 {
 			return
@@ -196,23 +244,90 @@ func geolocatePins() map[string][]string {
 	}
 }
 
-// listProviders asks the operator's own server for current public providers.
-// The request/response shape mirrors the server's
-// model.FindProviders2Args/FindProviders2Result exactly
-// (model/network_client_location_model.go): Specs is a []*ProviderSpec, here
-// a single best-available spec; the response's Providers carry ClientId as
-// json "client_id".
+// findProvidersCountPerLocation is the count requested in each per-location
+// find-providers2 call. It is intentionally high: the server's selection
+// (model.FindProviders2) weighted-shuffles and then truncates to `count`
+// (`clientIds[:min(count, len(clientIds))]`), so a count well above any
+// single location's real provider population effectively returns all of
+// them, not a sample -- which is the whole point of I1 (a stable, complete
+// enumeration, not a moving subset).
+const findProvidersCountPerLocation = 5000
+
+// listProviders enumerates every provider client id the server currently
+// knows about, broadly and stably. This directly fixes I1: the previous
+// implementation asked for `{"best_available":true}`, which on the server
+// resolves to `countryCodeLocationIds()["us"]` (model.FindProviders2 in
+// model/network_client_location_model.go) -- so it only ever enumerated
+// providers the server's OWN geo database already believes are in the US.
+// That is backwards for a tool whose entire purpose is finding providers
+// whose location the database gets wrong. It was also
+// weighted-random-sampled and shuffled server-side, so successive passes
+// returned different subsets rather than a stable enumeration.
+//
+// The fix enumerates by location instead of by (wrong) assumption:
+//  1. GET /network/provider-locations -- no auth required
+//     (router.WrapNoAuth in the server's
+//     api/handlers/network_client_location_handlers.go) -- which returns
+//     every location, at every granularity (city/region/country) that
+//     currently has at least one provider (model.GetProviderLocations,
+//     filtered to locations present in loadLocationStables). Verified
+//     against the server source at api/api.go and
+//     model/network_client_location_model.go: the response is a
+//     model.FindLocationsResult, whose `locations` field is
+//     []*model.LocationResult with `location_id` (model.LocationResult).
+//  2. For each returned location, POST /network/find-providers2 with an
+//     explicit `{"specs":[{"location_id":"<id>"}],"count":<high>}` spec
+//     (model.FindProviders2Args / model.ProviderSpec), and union the
+//     `client_id`s (model.FindProvidersProvider) across all locations,
+//     de-duplicating. A single provider legitimately appears under more
+//     than one location (its city, region, and country entries each
+//     resolve back to it -- confirmed by how the server populates its
+//     per-location score cache in model.go's export path), so
+//     de-duplication here is expected, not defensive overkill.
+//
+// Resilient by design: if one location's find-providers2 call fails
+// (timeout, transient 5xx), it is logged and skipped rather than aborting
+// the whole pass -- a broad enumeration that misses one location out of
+// what can be hundreds is far more useful than a pass that produces
+// nothing because one of them hiccupped.
 func listProviders(ctx context.Context, apiURL string, byJwt string) ([]string, error) {
-	body := strings.NewReader(`{"specs":[{"best_available":true}],"count":1000,"rank_mode":"quality"}`)
-	url := strings.TrimRight(apiURL, "/") + "/network/find-providers2"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+
+	locationIds, err := listProviderLocationIds(ctx, httpClient, apiURL)
+	if err != nil {
+		return nil, fmt.Errorf("list provider locations: %w", err)
+	}
+
+	seen := make(map[string]struct{})
+	for _, locationId := range locationIds {
+		clientIds, err := findProvidersAtLocation(ctx, httpClient, apiURL, byJwt, locationId)
+		if err != nil {
+			log.Printf("egress-prober: find-providers2 for location %s: %s (skipping this location for this pass)", locationId, err)
+			continue
+		}
+		for _, id := range clientIds {
+			seen[id] = struct{}{}
+		}
+	}
+
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+// listProviderLocationIds calls GET /network/provider-locations and returns
+// the location_id of every location in the response. See listProviders for
+// the full rationale and the server-side source verified against.
+func listProviderLocationIds(ctx context.Context, client *http.Client, apiURL string) ([]string, error) {
+	url := strings.TrimRight(apiURL, "/") + "/network/provider-locations"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+byJwt)
 
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -221,6 +336,74 @@ func listProviders(ctx context.Context, apiURL string, byJwt string) ([]string, 
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
+
+	// Mirrors model.FindLocationsResult / model.LocationResult
+	// (model/network_client_location_model.go) exactly: only the fields
+	// this CLI actually needs are decoded.
+	var out struct {
+		Locations []struct {
+			LocationId string `json:"location_id"`
+		} `json:"locations"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+
+	ids := make([]string, 0, len(out.Locations))
+	for _, l := range out.Locations {
+		ids = append(ids, l.LocationId)
+	}
+	return ids, nil
+}
+
+// findProvidersAtLocation calls POST /network/find-providers2 with a
+// single explicit location_id spec and returns the client_id of every
+// provider returned for it. See listProviders for the full rationale and
+// the server-side source verified against.
+func findProvidersAtLocation(ctx context.Context, client *http.Client, apiURL string, byJwt string, locationId string) ([]string, error) {
+	// Mirrors model.FindProviders2Args / model.ProviderSpec
+	// (model/network_client_location_model.go) exactly: Specs is
+	// []*ProviderSpec, here a single spec with only LocationId set (json
+	// "location_id"); Count and RankMode (json "rank_mode") match the
+	// struct's json tags.
+	reqBody, err := json.Marshal(struct {
+		Specs    []map[string]string `json:"specs"`
+		Count    int                 `json:"count"`
+		RankMode string              `json:"rank_mode"`
+	}{
+		Specs:    []map[string]string{{"location_id": locationId}},
+		Count:    findProvidersCountPerLocation,
+		RankMode: "quality",
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	url := strings.TrimRight(apiURL, "/") + "/network/find-providers2"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// find-providers2 does not require auth (router.WrapWithInputNoAuth on
+	// the server), but the byJwt is sent anyway, matching the previous
+	// implementation and every other call this CLI makes -- harmless, and
+	// keeps this call consistent with the rest of the CLI's requests should
+	// that ever change.
+	req.Header.Set("Authorization", "Bearer "+byJwt)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+
+	// Mirrors model.FindProviders2Result / model.FindProvidersProvider
+	// exactly: only client_id is decoded.
 	var out struct {
 		Providers []struct {
 			ClientId string `json:"client_id"`
@@ -229,6 +412,7 @@ func listProviders(ctx context.Context, apiURL string, byJwt string) ([]string, 
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
 	}
+
 	ids := make([]string, 0, len(out.Providers))
 	for _, p := range out.Providers {
 		ids = append(ids, p.ClientId)

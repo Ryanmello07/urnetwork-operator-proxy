@@ -34,6 +34,21 @@ import (
 var (
 	testCACert *x509.Certificate
 	testCAKey  *ecdsa.PrivateKey
+
+	// attackerCACert/attackerCAKey model a SECOND CA that is also in the
+	// trust store -- exactly like the real world, where the system trust
+	// store contains hundreds of independent, unrelated CAs, and a leaf
+	// issued by ANY of them chains successfully. It exists only for
+	// TestCheckPinBypassViaDeadWeightIntermediate and
+	// TestCheckPinBypassViaDeadWeightIntermediate_FixedRejects below: those
+	// tests hold this "attacker" CA (standing in for some other publicly
+	// trusted CA an attacker can obtain a certificate from) and show that,
+	// under the pre-fix rawCerts-based check, it is sufficient to forge a
+	// pinned host's identity by padding the wire chain with an unrelated,
+	// legitimately pinned certificate that was never actually part of the
+	// validated path.
+	attackerCACert *x509.Certificate
+	attackerCAKey  *ecdsa.PrivateKey
 )
 
 // TestMain installs testCACert as a trusted root for this process by
@@ -54,13 +69,28 @@ func TestMain(m *testing.M) {
 	}
 	testCACert, testCAKey = cert, key
 
+	attCert, attKey, err := generateTestCA()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "generate attacker test CA:", err)
+		os.Exit(1)
+	}
+	attackerCACert, attackerCAKey = attCert, attKey
+
 	dir, err := os.MkdirTemp("", "providertunnel-test-ca")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "mkdir temp:", err)
 		os.Exit(1)
 	}
 	caPath := filepath.Join(dir, "ca.pem")
-	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	// Both CAs are concatenated into one PEM file: crypto/x509's SSL_CERT_FILE
+	// loader (root_unix.go) accepts a file containing multiple concatenated
+	// PEM blocks via CertPool.AppendCertsFromPEM, so this installs BOTH as
+	// independently trusted roots for this test binary -- modelling a real
+	// trust store, which trusts many unrelated CAs at once, not just the one
+	// this package's pins are meant to track.
+	var pemBytes []byte
+	pemBytes = append(pemBytes, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})...)
+	pemBytes = append(pemBytes, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: attCert.Raw})...)
 	if err := os.WriteFile(caPath, pemBytes, 0o600); err != nil {
 		fmt.Fprintln(os.Stderr, "write ca file:", err)
 		os.Exit(1)
@@ -116,6 +146,68 @@ func issueLeaf(t *testing.T, host string) (*x509.Certificate, *ecdsa.PrivateKey)
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, testCACert, &key.PublicKey, testCAKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert, key
+}
+
+// issueLeafSignedBy mints a certificate for host, signed directly by the
+// given CA cert/key, generalizing issueLeaf (which always signs with
+// testCACert) to any CA -- used by the C1 bypass tests below to mint a leaf
+// signed by attackerCACert instead.
+func issueLeafSignedBy(t *testing.T, host string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey) (*x509.Certificate, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: host},
+		DNSNames:     []string{host},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &key.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert, key
+}
+
+// issueIntermediateSignedBy mints an intermediate CA certificate signed by
+// the given parent CA cert/key. Used by the C1 bypass tests to build a
+// "legit" intermediate (signed by testCACert) that plays the role of a
+// real, publicly downloadable intermediate like a Let's Encrypt issuer:
+// something an attacker can freely obtain and append to a Certificate
+// message without ever holding its private key.
+func issueIntermediateSignedBy(t *testing.T, cn string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey) (*x509.Certificate, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &key.PublicKey, caKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,6 +290,40 @@ func startTLSTestServer(t *testing.T, cert *x509.Certificate, key *ecdsa.Private
 	tlsCert := tls.Certificate{
 		Certificate: [][]byte{cert.Raw},
 		PrivateKey:  key,
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})}
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+	return ln.Addr().String(), func() { _ = ln.Close() }
+}
+
+// startTLSTestServerChain is startTLSTestServer generalized to present an
+// arbitrary, caller-controlled Certificate message: chain[0] is the leaf
+// (served with leafKey) and any further entries are sent as-is, in order,
+// exactly as crypto/tls sends whatever is in tls.Certificate.Certificate on
+// the wire without validating that they actually form a path. This is what
+// lets the C1 bypass test below construct a real handshake where the
+// server pads its Certificate message with a certificate that plays no
+// role in the validated path -- modelling an attacker appending a
+// legitimate, publicly obtainable certificate as inert dead weight.
+func startTLSTestServerChain(t *testing.T, chain []*x509.Certificate, leafKey *ecdsa.PrivateKey) (addr string, cleanup func()) {
+	t.Helper()
+	raw := make([][]byte, len(chain))
+	for i, c := range chain {
+		raw[i] = c.Raw
+	}
+	tlsCert := tls.Certificate{
+		Certificate: raw,
+		PrivateKey:  leafKey,
 	}
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
@@ -385,6 +511,100 @@ func TestHTTPClientPortSuffixedPinKeyIsNormalized(t *testing.T) {
 			t.Fatal("FAIL-OPEN: a port-suffixed key must not let an unmatched pin through")
 		}
 	})
+}
+
+// TestCheckPinBypassViaDeadWeightIntermediate is the C1 teeth-check: it
+// reproduces, with a real TLS handshake, the exact bypass a reviewer
+// demonstrated -- a rawCerts-based pin check (matching against whatever the
+// PEER SENT) can be defeated by an attacker who holds a leaf for the
+// pinned host issued by ANY CA in the trust store, and who simply appends
+// the real, publicly downloadable pinned intermediate to the Certificate
+// message as inert dead weight.
+//
+// Setup, mirroring the reviewer's report:
+//   - attackerCACert is a second CA independently trusted alongside
+//     testCACert (installed by TestMain), standing in for "any CA in the
+//     system trust store" -- the attacker does not need to compromise the
+//     CA this host's real certificate happens to chain to, just obtain a
+//     certificate from SOME publicly trusted CA.
+//   - legitIntermediate is signed by testCACert and its SPKI is the ONLY
+//     configured pin for pinnedHost -- modelling pinning a real issuing
+//     intermediate (as cmd/egress-prober/main.go does for ip.pn,
+//     free.freeipapi.com, and ipinfo.io).
+//   - The attacker never holds legitIntermediate's private key and never
+//     needs to: their leaf is signed directly by attackerCACert, so the
+//     TLS handshake presents [attackerLeaf, legitIntermediate] and
+//     verifies successfully via the attacker's own path (attackerLeaf ->
+//     attackerCACert), with legitIntermediate contributing nothing to that
+//     path -- exactly the "dead weight" the reviewer's report describes.
+//
+// A pin check that scans rawCerts (the wire message the peer controls)
+// finds legitIntermediate's SPKI sitting there, unused, and wrongly
+// accepts. A pin check that scans verifiedChains (what crypto/tls actually
+// validated: attackerLeaf + attackerCACert) never sees legitIntermediate
+// at all and correctly rejects. THIS TEST MUST FAIL against the old
+// rawCerts-based checkPin and PASS against the verifiedChains-based fix --
+// see the task report for the before/after run showing exactly that.
+func TestCheckPinBypassViaDeadWeightIntermediate(t *testing.T) {
+	const pinnedHost = "pinned.example"
+
+	legitIntermediate, _ := issueIntermediateSignedBy(t, "legit test intermediate CA", testCACert, testCAKey)
+	attackerLeaf, attackerLeafKey := issueLeafSignedBy(t, pinnedHost, attackerCACert, attackerCAKey)
+
+	// Wire order matches a real handshake: leaf first, then whatever else
+	// the attacker chooses to append.
+	addr, cleanup := startTLSTestServerChain(t, []*x509.Certificate{attackerLeaf, legitIntermediate}, attackerLeafKey)
+	defer cleanup()
+
+	client := httpClientOverDialer(dialerToAddr(addr), map[string][]string{
+		pinnedHost: {SPKIPin(legitIntermediate)}, // ONLY the legit intermediate is pinned
+	}, 5*time.Second)
+
+	resp, err := client.Get("https://" + pinnedHost + "/json")
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("BYPASS: attacker-signed leaf + dead-weight legit intermediate was accepted for a pinned host; " +
+			"pin check must match against the VERIFIED chain, not whatever the peer merely sent in rawCerts")
+	}
+	if !errors.Is(err, ErrPinMismatch) {
+		t.Fatalf("err = %v, want it to wrap ErrPinMismatch", err)
+	}
+}
+
+// TestCheckPinAcceptsRotatedLeafThroughRealHandshake is the positive
+// counterpart to the bypass test above, exercised through the SAME real
+// handshake path (not just a direct checkPin/VerifyPeerCertificate call):
+// the leaf has rotated (its own pin is absent from the allowed set, as
+// happens routinely -- Let's Encrypt roughly every 90 days) but it is
+// properly, honestly chained through the pinned intermediate to a trusted
+// root. This must be ACCEPTED. Without this test, a fix that makes
+// checkPin match ONLY chain[0] (the leaf) of each verified chain -- rather
+// than every certificate in it -- would pass the bypass test above but
+// silently break the documented intermediate-rotation contract each time a
+// real leaf rotates, and nothing here would catch it.
+func TestCheckPinAcceptsRotatedLeafThroughRealHandshake(t *testing.T) {
+	const pinnedHost = "pinned.example"
+
+	legitIntermediate, legitIntermediateKey := issueIntermediateSignedBy(t, "legit test intermediate CA", testCACert, testCAKey)
+	rotatedLeaf, rotatedLeafKey := issueLeafSignedBy(t, pinnedHost, legitIntermediate, legitIntermediateKey)
+
+	// A real handshake presents the leaf and the intermediate that issued
+	// it, honestly chaining to testCACert (trusted via SSL_CERT_FILE).
+	addr, cleanup := startTLSTestServerChain(t, []*x509.Certificate{rotatedLeaf, legitIntermediate}, rotatedLeafKey)
+	defer cleanup()
+
+	client := httpClientOverDialer(dialerToAddr(addr), map[string][]string{
+		pinnedHost: {SPKIPin(legitIntermediate)}, // only the intermediate is pinned; the new leaf's pin is absent
+	}, 5*time.Second)
+
+	resp, err := client.Get("https://" + pinnedHost + "/json")
+	if err != nil {
+		t.Fatalf("get err = %v, want success: a properly chained rotated leaf under a pinned intermediate must be accepted", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
 }
 
 // TestOpenRejectsNilOrEmptyPins is the second half of FIX 1: Open itself

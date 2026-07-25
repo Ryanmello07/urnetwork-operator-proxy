@@ -72,18 +72,37 @@ func normalizePins(pins map[string][]string) map[string][]string {
 // PinVerifier and PinnedTLSConfig so there is exactly one place the pinning
 // logic lives.
 //
-// A match ANYWHERE in the presented chain is accepted, not just the leaf:
-// checkPin walks rawCerts (the leaf first, then whatever intermediates the
-// server sent) and accepts as soon as any certificate's SPKI pin is in the
-// host's allowed set. This is deliberate, not an oversight: the leaf
-// certificates for these hosts rotate routinely (Let's Encrypt roughly
-// every 90 days), and leaf-only pinning would turn every rotation into a
-// broken probe until someone manually re-captures and redeploys the new
-// leaf pin. Pinning the issuing intermediate as well means the pin survives
-// routine leaf rotation without any redeploy, while still rejecting a MITM
-// that presents a chain-valid certificate from a DIFFERENT issuer -- which
-// is the actual threat model here (an untrusted provider forging a
-// location by substituting its own certificate).
+// A match ANYWHERE in the VERIFIED chain is accepted, not just the leaf:
+// checkPin walks verifiedChains -- the certification path(s) crypto/tls
+// already validated against the trusted root pool -- and accepts as soon as
+// any certificate's SPKI pin is in the host's allowed set. This is
+// deliberate, not an oversight: the leaf certificates for these hosts
+// rotate routinely (Let's Encrypt roughly every 90 days), and leaf-only
+// pinning would turn every rotation into a broken probe until someone
+// manually re-captures and redeploys the new leaf pin. Pinning the issuing
+// intermediate as well means the pin survives routine leaf rotation without
+// any redeploy, while still rejecting a MITM that presents a chain-valid
+// certificate from a DIFFERENT issuer -- which is the actual threat model
+// here (an untrusted provider forging a location by substituting its own
+// certificate).
+//
+// checkPin matches against verifiedChains, NOT rawCerts, and this is
+// security-critical, not a style choice. rawCerts is whatever the peer
+// SENT: crypto/tls puts rawCerts[1:] into an intermediates pool for path
+// building and otherwise never inspects certificates the verified path
+// didn't need. That means an attacker holding a leaf for a pinned host
+// issued by ANY CA in the trust store can pad the Certificate message with
+// the real, publicly-downloadable pinned intermediate as inert dead
+// weight: chain verification succeeds via the attacker's own path (their
+// leaf straight to their own trusted root/intermediate), and a rawCerts-based
+// check would then find the legitimate intermediate's SPKI sitting
+// unused in rawCerts and accept -- a complete bypass. Matching against
+// verifiedChains closes this: it only ever contains the certificate(s) on
+// path(s) crypto/tls actually validated, so a pinned certificate the
+// attacker merely appended without it being part of that path cannot
+// satisfy the check. This is also what RFC 7469 (S2.6) requires: pins are
+// computed over the validated certification path, not the raw presented
+// message.
 //
 // The tradeoff: pinning an intermediate trusts that intermediate CA, not
 // just one specific certificate. Any certificate issued by that
@@ -93,12 +112,28 @@ func normalizePins(pins map[string][]string) map[string][]string {
 // the alternative (leaf-only) degrades this into a manual chore roughly
 // monthly across the three pinned hosts.
 //
-// A certificate in the chain that fails to parse is skipped rather than
-// aborting the whole check, so one malformed non-leaf certificate can't
-// mask a valid match elsewhere in the chain. If no certificate in the
-// chain matches (including if every certificate fails to parse), the check
-// still fails closed with ErrPinMismatch.
-func checkPin(normalized map[string][]string, host string, rawCerts [][]byte) error {
+// If no certificate in any verified chain matches, the check fails closed
+// with ErrPinMismatch.
+//
+// verifiedChains-empty fallback: when verifiedChains is empty, checkPin
+// falls back to scanning rawCerts (parsing each; a certificate that fails
+// to parse is skipped rather than aborting the whole check, so one
+// malformed entry can't mask a valid match elsewhere). This fallback is
+// safe in production and is NOT a reopening of the bypass above:
+// crypto/tls only ever calls VerifyPeerCertificate with an empty
+// verifiedChains when either (a) InsecureSkipVerify is true, which this
+// package never sets on any *tls.Config it builds (see PinnedTLSConfig /
+// PinnedTLSConfigForHost -- confirmed by reading
+// crypto/tls/handshake_client.go's verifyServerCertificate, which only
+// skips populating c.verifiedChains when config.InsecureSkipVerify is
+// true), or (b) normal chain verification failed, in which case the
+// handshake is already being aborted by crypto/tls before this callback's
+// return value is even consulted. So in every real handshake this package
+// drives, verifiedChains is non-empty by the time checkPin runs, and this
+// branch exists solely so this package's own tests can call
+// checkPin/VerifyPeerCertificate directly with rawCerts and no
+// verifiedChains, without standing up a full TLS handshake for every case.
+func checkPin(normalized map[string][]string, host string, rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 	if len(rawCerts) == 0 {
 		return ErrPinMismatch
 	}
@@ -106,6 +141,23 @@ func checkPin(normalized map[string][]string, host string, rawCerts [][]byte) er
 	if !pinned {
 		return nil
 	}
+
+	if len(verifiedChains) > 0 {
+		for _, chain := range verifiedChains {
+			for _, cert := range chain {
+				got := SPKIPin(cert)
+				for _, want := range allowed {
+					if got == want {
+						return nil
+					}
+				}
+			}
+		}
+		return ErrPinMismatch
+	}
+
+	// See the verifiedChains-empty fallback discussion above: reached only
+	// in tests that call the verifier directly with no verifiedChains.
 	for _, raw := range rawCerts {
 		cert, err := x509.ParseCertificate(raw)
 		if err != nil {
@@ -134,7 +186,7 @@ func PinVerifier(pins map[string][]string, host string) func(rawCerts [][]byte, 
 	normalized := normalizePins(pins)
 	host = normalizeHost(host)
 	return func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-		return checkPin(normalized, host, rawCerts)
+		return checkPin(normalized, host, rawCerts, verifiedChains)
 	}
 }
 
@@ -181,7 +233,7 @@ func PinnedTLSConfig(pins map[string][]string) *tls.Config {
 		if cfg.ServerName == "" {
 			return ErrPinHostUnknown
 		}
-		return checkPin(normalized, cfg.ServerName, rawCerts)
+		return checkPin(normalized, cfg.ServerName, rawCerts, verifiedChains)
 	}
 	return cfg
 }
