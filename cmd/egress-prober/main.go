@@ -136,18 +136,19 @@ func main() {
 // Each host lists two pins: the current leaf certificate's key, and the
 // issuing intermediate CA's key.
 //
-// IMPORTANT: providertunnel's checkPin (providertunnel/pinning.go) only
-// hashes and checks rawCerts[0] -- the leaf -- against the allowed list; it
-// never inspects the rest of the chain. That means the intermediate pin
-// below does NOT provide the rotation resilience a reader might expect from
-// "pin the CA too": it cannot match anything, because it is never compared
-// against anything but the leaf's own SPKI, which will never equal the
-// intermediate's SPKI. It is recorded here (a) because the brief asked for
-// it and (b) as a documented, ready-to-use value for the day
-// providertunnel's pin check is extended to walk the chain -- but today it
-// is inert. A leaf-key rotation WILL break probing for that host and
-// requires re-capturing and redeploying the leaf pin; see "Re-capturing"
-// below. Do not rely on the intermediate entry to survive a rotation.
+// providertunnel's checkPin (providertunnel/pinning.go) accepts a match
+// against ANY certificate in the presented chain, not just the leaf. That
+// means the intermediate pin below DOES provide rotation resilience: when a
+// host's leaf certificate rotates (routine -- Let's Encrypt roughly every 90
+// days, Google Trust Services on its own schedule), the new leaf is still
+// signed by the same intermediate, so its SPKI still matches the
+// intermediate pin and probing keeps working with no redeploy needed. The
+// tradeoff is that pinning an intermediate trusts that whole CA for this
+// host, not one specific certificate -- any certificate that CA issues for
+// this host will pass. If a host's probing DOES start failing with a
+// pin-mismatch error, that means the issuing intermediate itself changed
+// (e.g. the CA rotated its intermediate, or the host switched CAs), and
+// both pins should be re-captured and redeployed; see "Re-capturing" below.
 //
 // Captured 2026-07-25 from this sandbox, all three hosts reachable:
 //

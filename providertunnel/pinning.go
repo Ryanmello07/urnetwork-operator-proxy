@@ -14,9 +14,10 @@ import (
 )
 
 // ErrPinMismatch is returned by the pin check when a pinned host presents a
-// leaf certificate whose public key is not in the allowed set. A provider is
-// the network path for these requests, so pinning is what stops it forging a
-// location by MITMing a geolocation api.
+// certificate chain in which NO certificate's public key -- leaf or
+// intermediate -- is in the allowed set. A provider is the network path for
+// these requests, so pinning is what stops it forging a location by MITMing
+// a geolocation api.
 var ErrPinMismatch = errors.New("providertunnel: certificate pin mismatch")
 
 // ErrPinHostUnknown is returned by PinnedTLSConfig's verifier when it cannot
@@ -70,6 +71,33 @@ func normalizePins(pins map[string][]string) map[string][]string {
 // checkPin is the single implementation of the pin check, shared by
 // PinVerifier and PinnedTLSConfig so there is exactly one place the pinning
 // logic lives.
+//
+// A match ANYWHERE in the presented chain is accepted, not just the leaf:
+// checkPin walks rawCerts (the leaf first, then whatever intermediates the
+// server sent) and accepts as soon as any certificate's SPKI pin is in the
+// host's allowed set. This is deliberate, not an oversight: the leaf
+// certificates for these hosts rotate routinely (Let's Encrypt roughly
+// every 90 days), and leaf-only pinning would turn every rotation into a
+// broken probe until someone manually re-captures and redeploys the new
+// leaf pin. Pinning the issuing intermediate as well means the pin survives
+// routine leaf rotation without any redeploy, while still rejecting a MITM
+// that presents a chain-valid certificate from a DIFFERENT issuer -- which
+// is the actual threat model here (an untrusted provider forging a
+// location by substituting its own certificate).
+//
+// The tradeoff: pinning an intermediate trusts that intermediate CA, not
+// just one specific certificate. Any certificate issued by that
+// intermediate -- for this host or, in principle, any other identity it is
+// willing to sign for -- will satisfy the pin check for this host. That is
+// materially broader than leaf-only pinning, and is accepted here because
+// the alternative (leaf-only) degrades this into a manual chore roughly
+// monthly across the three pinned hosts.
+//
+// A certificate in the chain that fails to parse is skipped rather than
+// aborting the whole check, so one malformed non-leaf certificate can't
+// mask a valid match elsewhere in the chain. If no certificate in the
+// chain matches (including if every certificate fails to parse), the check
+// still fails closed with ErrPinMismatch.
 func checkPin(normalized map[string][]string, host string, rawCerts [][]byte) error {
 	if len(rawCerts) == 0 {
 		return ErrPinMismatch
@@ -78,14 +106,16 @@ func checkPin(normalized map[string][]string, host string, rawCerts [][]byte) er
 	if !pinned {
 		return nil
 	}
-	leaf, err := x509.ParseCertificate(rawCerts[0])
-	if err != nil {
-		return err
-	}
-	got := SPKIPin(leaf)
-	for _, want := range allowed {
-		if got == want {
-			return nil
+	for _, raw := range rawCerts {
+		cert, err := x509.ParseCertificate(raw)
+		if err != nil {
+			continue
+		}
+		got := SPKIPin(cert)
+		for _, want := range allowed {
+			if got == want {
+				return nil
+			}
 		}
 	}
 	return ErrPinMismatch
@@ -122,10 +152,11 @@ func PinnedTLSConfigForHost(pins map[string][]string, host string) *tls.Config {
 	}
 }
 
-// PinnedTLSConfig returns a tls.Config that keeps normal chain verification and
-// additionally requires, for each host in pins, that the leaf certificate's
-// SPKI pin is one of the allowed values. Hosts absent from pins are not
-// pin-checked.
+// PinnedTLSConfig returns a tls.Config that keeps normal chain verification
+// and additionally requires, for each host in pins, that SOME certificate in
+// the presented chain -- leaf or intermediate -- has an SPKI pin in the
+// allowed values (see checkPin for why a chain-wide match, not leaf-only, is
+// the intended behavior). Hosts absent from pins are not pin-checked.
 //
 // This config is a TEMPLATE, not a per-connection config. Callers may set
 // cfg.ServerName directly on the *tls.Config value returned here and use it

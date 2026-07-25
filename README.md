@@ -66,16 +66,19 @@ how to re-capture them. This is a closed allowlist enforced by the
 open at all, and any https host reached through a tunnel that isn't one of
 these three is refused outright.
 
-Each host's entry lists a leaf pin and an intermediate-CA pin, but
-`providertunnel`'s pin check only ever compares the presented leaf
-certificate's key against the allowed list — it does not walk the rest of
-the chain, so the intermediate entry cannot currently protect against a leaf
-rotation despite the name "backup". In practice: if probing for a host
-starts failing with a pin-mismatch error, that host's leaf certificate has
-rotated, and the fix is to re-capture and redeploy **the leaf pin** for that
-host (see the recipe in `geolocatePins()`'s doc comment). The intermediate
-pin is recorded for when/if chain-aware pinning is added; it is not a
-functioning safety net today.
+Each host's entry lists a leaf pin and an intermediate-CA pin, and
+`providertunnel`'s pin check accepts a match against **either** — it walks
+every certificate in the presented chain (leaf and any intermediates) and
+accepts as soon as one matches an allowed pin. That makes the intermediate
+entry a real safety net: a routine leaf-certificate rotation (Let's Encrypt
+roughly every 90 days) still chains to the same intermediate, so the
+intermediate pin keeps matching and probing keeps working with no redeploy.
+The tradeoff is that pinning an intermediate trusts that CA, not one
+specific certificate, for that host. In practice: if probing for a host
+starts failing with a pin-mismatch error, that means the *issuing
+intermediate* changed (the CA rotated it, or the host switched CAs
+entirely), and the fix is to re-capture and redeploy **both pins** for that
+host (see the recipe in `geolocatePins()`'s doc comment).
 
 ### Design
 

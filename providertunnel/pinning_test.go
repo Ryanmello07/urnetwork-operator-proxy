@@ -36,6 +36,142 @@ func selfSigned(t *testing.T, host string) (*x509.Certificate, *ecdsa.PrivateKey
 	return cert, key
 }
 
+// selfSignedCA generates a minimal self-signed CA certificate, for building
+// a multi-certificate chain in tests below. It follows the same pattern as
+// generateTestCA in tunnel_test.go, but lives here (rather than being
+// shared) because these tests never install it as a trusted root -- checkPin
+// parses and pins raw certificates directly, it does not perform chain
+// verification, so there is no need for the CA to be trusted by the process.
+func selfSignedCA(t *testing.T, cn string) (*x509.Certificate, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert, key
+}
+
+// issueChain builds a three-certificate chain -- root CA, an intermediate
+// CA signed by the root, and a leaf for host signed by the intermediate --
+// and returns the leaf and intermediate (the two certificates a real TLS
+// handshake would present via rawCerts; the root is not sent on the wire
+// and is not returned). This models the shape of the chains
+// cmd/egress-prober/main.go actually pins against: a leaf issued by a named
+// intermediate (e.g. "Let's Encrypt YE2"), not a bare self-signed leaf.
+func issueChain(t *testing.T, host string) (leaf, intermediate *x509.Certificate) {
+	t.Helper()
+	rootCert, rootKey := selfSignedCA(t, "test root CA")
+
+	intKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{CommonName: "test intermediate CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	intDER, err := x509.CreateCertificate(rand.Reader, intTmpl, rootCert, &intKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intCert, err := x509.ParseCertificate(intDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject:      pkix.Name{CommonName: host},
+		DNSNames:     []string{host},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, intCert, &leafKey.PublicKey, intKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafCert, err := x509.ParseCertificate(leafDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return leafCert, intCert
+}
+
+// TestPinnedTLSConfigAcceptsIntermediateMatchOnLeafRotation is the rotation
+// scenario this task exists to fix: the LEAF's pin is absent from the
+// allowed set (as happens the moment a host rotates its leaf certificate --
+// routine, roughly every 90 days), but the INTERMEDIATE that issued it is
+// still pinned. checkPin must walk the whole presented chain, not just
+// rawCerts[0], and accept on the intermediate match. Against the old
+// leaf-only implementation this fails, because rawCerts[0] (the leaf) never
+// matches the pinned intermediate SPKI.
+func TestPinnedTLSConfigAcceptsIntermediateMatchOnLeafRotation(t *testing.T) {
+	const host = "pinned.example"
+	leaf, intermediate := issueChain(t, host)
+
+	cfg := PinnedTLSConfig(map[string][]string{
+		host: {SPKIPin(intermediate)}, // only the intermediate is pinned
+	})
+	cfg.ServerName = host
+
+	// rawCerts as a real handshake presents them: leaf first, then the
+	// intermediate(s) the server sent.
+	err := cfg.VerifyPeerCertificate([][]byte{leaf.Raw, intermediate.Raw}, nil)
+	if err != nil {
+		t.Fatalf("a pinned intermediate must accept a chain whose leaf rotated, got %v", err)
+	}
+}
+
+// TestPinnedTLSConfigRejectsWhenNeitherLeafNorIntermediateMatch is the
+// negative counterpart: when NO certificate anywhere in the presented chain
+// -- leaf or intermediate -- has a pin in the allowed set, the check must
+// still fail closed with ErrPinMismatch, exactly as it did before chain-wide
+// matching was added. This guards against a chain-wide implementation that
+// accidentally accepts anything once it starts iterating past rawCerts[0].
+func TestPinnedTLSConfigRejectsWhenNeitherLeafNorIntermediateMatch(t *testing.T) {
+	const host = "pinned.example"
+	leaf, intermediate := issueChain(t, host)
+
+	cfg := PinnedTLSConfig(map[string][]string{
+		host: {"not-a-real-pin-for-this-chain"},
+	})
+	cfg.ServerName = host
+
+	err := cfg.VerifyPeerCertificate([][]byte{leaf.Raw, intermediate.Raw}, nil)
+	if err != ErrPinMismatch {
+		t.Fatalf("err = %v, want ErrPinMismatch when neither leaf nor intermediate matches", err)
+	}
+}
+
 func TestSPKIPinStableAndDistinct(t *testing.T) {
 	a, _ := selfSigned(t, "a.example")
 	b, _ := selfSigned(t, "b.example")
