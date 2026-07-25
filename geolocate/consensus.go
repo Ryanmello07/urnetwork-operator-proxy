@@ -12,12 +12,20 @@ func normalizeCity(city string) string {
 
 // SourcePriority ranks the free geolocation sources by trustworthiness, most
 // trusted first. Lower value = more trusted. It is keyed by the exact
-// SourceResult.Name values the sources set (wired up in a later task).
+// SourceResult.Name values the sources in sources.go set.
 //
 // consensus uses this ordering to break exact vote-count ties: when two
 // candidate answers (country codes or cities) receive the same number of
 // votes, the answer contributed by the more trusted source wins, instead of
 // an arbitrary lexicographically-smaller string winning by coincidence.
+//
+// With the current 3-source table, a qualifying tie is unreachable in
+// production: breaking a tie AND clearing the confidence threshold
+// (MinSources == 2) requires a 2-2 split, i.e. 4 votes, but only 3 sources
+// run. (This is why the tie-break tests synthesize a 4-element slice with a
+// duplicated source name — a shape locate() cannot actually produce today.)
+// The comparator is kept correct and exercised anyway because it starts
+// mattering the moment a 4th source is added.
 var SourcePriority = map[string]int{
 	"ip.pn":     0,
 	"freeipapi": 1,
@@ -130,6 +138,11 @@ func consensus(ok []SourceResult) ConsensusLocation {
 	}
 
 	// asn: plurality over non-zero ASNs (a single vote is enough; it's a bonus signal).
+	// Tie-break note: on an exact vote-count tie this picks the numerically
+	// smaller ASN (map iteration order plus "a < bestASN" below), not the
+	// most-trusted source as country/city do via SourcePriority. This
+	// deviates from the design spec's "0 if none/tie" wording; documenting
+	// the deviation here rather than changing established behavior.
 	asnCounts := map[int]int{}
 	asnOrg := map[int]string{}
 	for _, r := range ok {

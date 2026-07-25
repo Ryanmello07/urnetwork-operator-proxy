@@ -48,6 +48,41 @@ func TestLocateAllAgree(t *testing.T) {
 	if len(loc.Sources) != 3 {
 		t.Fatalf("expected 3 source records, got %d", len(loc.Sources))
 	}
+	if loc.ProbedAt.IsZero() {
+		t.Fatal("ProbedAt must be set to a non-zero time; a zero value maps to B's observed_at and gets the submission rejected")
+	}
+	wantNames := map[string]bool{"ip.pn": true, "freeipapi": true, "ipinfo": true}
+	seenNames := map[string]bool{}
+	for _, s := range loc.Sources {
+		if !s.OK {
+			continue
+		}
+		if s.Name == "" {
+			t.Fatalf("successful SourceResult has empty Name: %+v", s)
+		}
+		if !wantNames[s.Name] {
+			t.Fatalf("successful SourceResult has unexpected Name %q: %+v", s.Name, s)
+		}
+		seenNames[s.Name] = true
+	}
+	for name := range wantNames {
+		if !seenNames[name] {
+			t.Fatalf("expected a successful source named %q, none found in %+v", name, loc.Sources)
+		}
+	}
+}
+
+func TestLocateNilClientReturnsError(t *testing.T) {
+	srcs := []source{
+		{Name: "ip.pn", URL: "http://127.0.0.1:0/json", Parse: parseIpPn},
+	}
+	loc, err := locate(context.Background(), nil, srcs)
+	if err != ErrNilClient {
+		t.Fatalf("err = %v, want ErrNilClient", err)
+	}
+	if loc != nil {
+		t.Fatalf("expected nil result on nil client, got %+v", loc)
+	}
 }
 
 func TestLocateQuorumFail(t *testing.T) {
