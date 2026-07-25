@@ -56,9 +56,15 @@ type SourceResult struct {
 
 // ConsensusLocation is the cross-checked result across sources.
 type ConsensusLocation struct {
-	CountryCode      string // lowercased alpha-2; "" when no country majority
-	Country          string
-	CountryConfident bool // true iff >= MinSources agreed on CountryCode
+	CountryCode string // lowercased alpha-2; "" when the country is not confident
+	Country     string
+	// CountryConfident is true only when the country record is complete and
+	// usable: >= MinSources agreed on the code, the code is alpha-2, and a
+	// name was resolved for it (from a source, or from the ISO-3166-1 table).
+	// An agreed-upon code that cannot be named (XK, A1, ...) or is not
+	// alpha-2 degrades to false with CountryCode and Country left empty,
+	// because the server rejects both shapes and the rejection is not cached.
+	CountryConfident bool
 
 	City          string // set only when >= 2 sources agree on the normalized city
 	Region        string
@@ -82,8 +88,9 @@ type ConsensusLocation struct {
 //
 // A non-nil, non-error result is not automatically usable: ErrNoConsensus
 // only covers the quorum failure (fewer than MinSources sources responded).
-// If quorum is met but the responding sources disagree, Locate returns
-// (result, nil) with CountryConfident == false and an empty CountryCode.
+// If quorum is met but the responding sources disagree -- or they agree on a
+// code that is not alpha-2 or cannot be named -- Locate returns (result, nil)
+// with CountryConfident == false and an empty CountryCode.
 // Callers MUST check CountryConfident before treating the returned location
 // as authoritative; a nil error alone does not mean the location is trustworthy.
 func Locate(ctx context.Context, client *http.Client) (*ConsensusLocation, error) {

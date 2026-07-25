@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -177,6 +178,7 @@ func TestSubmitRefusesMissingProbedAt(t *testing.T) {
 	c := &Client{ServerURL: srv.URL, OperatorSecret: "s", HTTP: srv.Client()}
 	err := c.Submit(context.Background(), "019f8835-158d-6fd8-e9dd-fd0e4c6d6792", &geolocate.ConsensusLocation{
 		CountryCode:      "us",
+		Country:          "United States",
 		CountryConfident: true,
 		// ProbedAt intentionally left zero.
 	})
@@ -196,9 +198,78 @@ func TestSubmitSurfacesRejection(t *testing.T) {
 
 	c := &Client{ServerURL: srv.URL, OperatorSecret: "s", HTTP: srv.Client()}
 	err := c.Submit(context.Background(), "019f8835-158d-6fd8-e9dd-fd0e4c6d6792", &geolocate.ConsensusLocation{
-		CountryCode: "us", CountryConfident: true, ProbedAt: time.Now().UTC(),
+		CountryCode: "us", Country: "United States", CountryConfident: true, ProbedAt: time.Now().UTC(),
 	})
 	if err == nil {
 		t.Fatal("a 400 must surface as an error")
+	}
+}
+
+// TestSubmitRefusesIncompleteCountry is the last-gate half of the F2 fix.
+// geolocate's consensus no longer produces these shapes, but Submit is the
+// boundary that owns the wire contract, and the cost of letting one through
+// is not a single failed POST: the scheduler caches successes only, so a
+// server rejection ("Country code must be alpha-2." / "Missing country.")
+// makes the provider re-probe and re-fail on every pass, forever. Both shapes
+// must be refused locally, without touching the network.
+func TestSubmitRefusesIncompleteCountry(t *testing.T) {
+	cases := []struct {
+		name string
+		loc  *geolocate.ConsensusLocation
+	}{
+		{
+			name: "empty country name",
+			loc: &geolocate.ConsensusLocation{
+				CountryCode:      "xk", // Kosovo: real, two characters, absent from ISO 3166-1
+				CountryConfident: true,
+				ProbedAt:         time.Now().UTC(),
+			},
+		},
+		{
+			name: "whitespace-only country name",
+			loc: &geolocate.ConsensusLocation{
+				CountryCode:      "us",
+				Country:          "   ",
+				CountryConfident: true,
+				ProbedAt:         time.Now().UTC(),
+			},
+		},
+		{
+			name: "non alpha-2 country code",
+			loc: &geolocate.ConsensusLocation{
+				CountryCode:      "usa",
+				Country:          "United States",
+				CountryConfident: true,
+				ProbedAt:         time.Now().UTC(),
+			},
+		},
+		{
+			name: "empty country code",
+			loc: &geolocate.ConsensusLocation{
+				CountryCode:      "",
+				Country:          "United States",
+				CountryConfident: true,
+				ProbedAt:         time.Now().UTC(),
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+			}))
+			defer srv.Close()
+
+			c := &Client{ServerURL: srv.URL, OperatorSecret: "s", HTTP: srv.Client()}
+			err := c.Submit(context.Background(), "019f8835-158d-6fd8-e9dd-fd0e4c6d6792", tc.loc)
+			if !errors.Is(err, ErrIncompleteCountry) {
+				t.Fatalf("err = %v, want it to wrap ErrIncompleteCountry", err)
+			}
+			if called {
+				t.Fatal("must not reach the server at all: a doomed POST here is retried on every pass forever")
+			}
+		})
 	}
 }

@@ -151,25 +151,53 @@ func TestConsensusCountryNameSourceWinsOverTable(t *testing.T) {
 	}
 }
 
-// TestConsensusCountryNameUnknownCodeStaysEmpty verifies the fallback
-// degrades safely for a code outside the table: Country must stay empty,
-// never a placeholder like the raw code or "Unknown". An empty Country
-// preserves today's safe behavior (the server rejects it) instead of the
-// server permanently storing a fabricated name.
-func TestConsensusCountryNameUnknownCodeStaysEmpty(t *testing.T) {
+// TestConsensusUnknownCountryCodeDegradesToNotConfident is the country
+// analogue of TestConsensusCityAgreementNoRegionNotConfident, and replaces an
+// earlier test that asserted the broken behavior (CountryConfident==true with
+// an empty Country).
+//
+// A code outside the ISO-3166-1 table -- XK (Kosovo, user-assigned) and the
+// MaxMind-lineage A1/A2/AP are all real codes free geolocation APIs emit --
+// resolves to no name, and no name may be fabricated from the code. But
+// "confident" must then mean confident about a record the server will accept:
+// the server rejects an empty country with "Missing country.", the rejection
+// is not cached by the scheduler, and the provider is therefore re-probed and
+// re-rejected on every pass forever. CountryConfident must mean "I have a
+// complete, usable country record", so an unnameable code degrades to
+// not-confident instead of producing a doomed submission.
+func TestConsensusUnknownCountryCodeDegradesToNotConfident(t *testing.T) {
 	ok := []SourceResult{
-		{Name: "ipinfo", OK: true, CountryCode: "ZZ"},
-		{Name: "freeipapi", OK: true, CountryCode: "ZZ"},
+		{Name: "ipinfo", OK: true, CountryCode: "XK"},
+		{Name: "freeipapi", OK: true, CountryCode: "XK"},
 	}
 	loc := consensus(ok)
-	if !loc.CountryConfident {
-		t.Fatal("expected CountryConfident with 2 agreeing sources")
-	}
-	if loc.CountryCode != "zz" {
-		t.Fatalf("CountryCode = %q, want \"zz\"", loc.CountryCode)
+	if loc.CountryConfident {
+		t.Fatal("a country code with no resolvable name must not be country-confident: the server rejects it with \"Missing country.\" and the failure is never cached, so the provider retries forever")
 	}
 	if loc.Country != "" {
-		t.Fatalf("Country = %q, want empty for an unknown code with no source name (no placeholder)", loc.Country)
+		t.Fatalf("Country = %q, want empty: a name must never be fabricated from the code", loc.Country)
+	}
+	if loc.CountryCode != "" {
+		t.Fatalf("CountryCode = %q, want empty when the result is not country-confident", loc.CountryCode)
+	}
+}
+
+// TestConsensusNonAlpha2CountryCodeDegradesToNotConfident covers the second
+// server rejection reachable from consensus: normalizeCountry lowercases and
+// trims but never validates length, so two sources reporting "USA" used to
+// yield CountryCode "usa" with CountryConfident true -- a guaranteed 400
+// ("Country code must be alpha-2."), on every pass, forever.
+func TestConsensusNonAlpha2CountryCodeDegradesToNotConfident(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "ipinfo", OK: true, CountryCode: "USA", Country: "United States"},
+		{Name: "freeipapi", OK: true, CountryCode: "USA", Country: "United States"},
+	}
+	loc := consensus(ok)
+	if loc.CountryConfident {
+		t.Fatal("a non-alpha-2 country code must not be country-confident: the server rejects it with \"Country code must be alpha-2.\"")
+	}
+	if loc.CountryCode != "" {
+		t.Fatalf("CountryCode = %q, want empty when the result is not country-confident", loc.CountryCode)
 	}
 }
 

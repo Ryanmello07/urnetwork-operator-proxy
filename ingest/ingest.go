@@ -20,6 +20,17 @@ import (
 // than recording a guess.
 var ErrNotConfident = errors.New("ingest: result is not country-confident")
 
+// ErrIncompleteCountry is returned when a country-confident result does not
+// carry a complete, usable country record: the code must be alpha-2 and the
+// name must be non-empty, or the server rejects the POST outright ("Country
+// code must be alpha-2." / "Missing country."). geolocate's consensus already
+// degrades such a result to not-country-confident; this is the last gate
+// before the wire, and it matters because the scheduler caches successes
+// only -- a rejected submission is retried on every pass, forever, so a
+// doomed POST is not a one-off cost. Failing locally turns that permanent
+// loop into a clean skip.
+var ErrIncompleteCountry = errors.New("ingest: country-confident result needs an alpha-2 code and a non-empty country name")
+
 // ErrRejected is returned when the server rejects a submission.
 var ErrRejected = errors.New("ingest: server rejected the submission")
 
@@ -29,6 +40,23 @@ var ErrRejected = errors.New("ingest: server rejected the submission")
 // since the server's monotonic upsert would then reject later genuine
 // probes and its expiry sweep would never remove it.
 var ErrMissingProbedAt = errors.New("ingest: loc.ProbedAt is zero")
+
+// isAlpha2 reports whether code is exactly two ASCII letters, the shape the
+// server requires of country_code.
+func isAlpha2(code string) bool {
+	if len(code) != 2 {
+		return false
+	}
+	for i := 0; i < len(code); i++ {
+		c := code[i]
+		if c < 'a' || 'z' < c {
+			if c < 'A' || 'Z' < c {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 // Client posts probed locations to the server's operator ingest endpoint.
 type Client struct {
@@ -59,13 +87,18 @@ type submitBody struct {
 //
 // Submit refuses to contact the server at all when loc is not
 // CountryConfident: the server prefers a stored submission over its own geo
-// database, so a low-confidence guess must never be recorded.
+// database, so a low-confidence guess must never be recorded. It likewise
+// refuses a country-confident result whose country record is incomplete (see
+// ErrIncompleteCountry), which the server would reject anyway.
 func (c *Client) Submit(ctx context.Context, providerClientId string, loc *geolocate.ConsensusLocation) error {
 	if loc == nil || !loc.CountryConfident {
 		return ErrNotConfident
 	}
 	if loc.ProbedAt.IsZero() {
 		return ErrMissingProbedAt
+	}
+	if !isAlpha2(loc.CountryCode) || strings.TrimSpace(loc.Country) == "" {
+		return fmt.Errorf("%w: code=%q name=%q", ErrIncompleteCountry, loc.CountryCode, loc.Country)
 	}
 	body := submitBody{
 		ClientId:         providerClientId,

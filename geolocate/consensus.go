@@ -10,6 +10,25 @@ func normalizeCity(city string) string {
 	return strings.ToLower(strings.TrimSpace(city))
 }
 
+// isAlpha2 reports whether code is exactly two ASCII letters, the shape the
+// server requires of country_code. It is deliberately ASCII-only: ISO-3166-1
+// alpha-2 codes are ASCII by definition, and a non-ASCII two-rune string is a
+// source returning something that is not a country code at all.
+func isAlpha2(code string) bool {
+	if len(code) != 2 {
+		return false
+	}
+	for i := 0; i < len(code); i++ {
+		c := code[i]
+		if c < 'a' || 'z' < c {
+			if c < 'A' || 'Z' < c {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // SourcePriority ranks the free geolocation sources by trustworthiness, most
 // trusted first. Lower value = more trusted. It is keyed by the exact
 // SourceResult.Name values the sources in sources.go set.
@@ -88,9 +107,8 @@ func consensus(ok []SourceResult) ConsensusLocation {
 		}
 	}
 	if bestCountryN >= MinSources {
-		loc.CountryCode = bestCountry
-		loc.Country = countryName[bestCountry]
-		if loc.Country == "" {
+		name := countryName[bestCountry]
+		if name == "" {
 			// No source supplied a human-readable name for the winning code
 			// (e.g. ipinfo-only quorum: it returns a code but never a name).
 			// Fall back to the ISO-3166-1 table so a confident country isn't
@@ -100,9 +118,26 @@ func consensus(ok []SourceResult) ConsensusLocation {
 			// to "" for a code outside the table, which is the correct,
 			// non-corrupting behavior: leave Country empty rather than
 			// invent a placeholder.
-			loc.Country = countryNameForCode(bestCountry)
+			name = countryNameForCode(bestCountry)
 		}
-		loc.CountryConfident = true
+		// CountryConfident means "I have a complete, usable country record",
+		// exactly as CityConfident means it for the city fields: agreement
+		// alone is not enough. The server rejects a submission whose country
+		// code is not alpha-2 ("Country code must be alpha-2.") or whose
+		// country name is empty ("Missing country."), and neither rejection
+		// is cached by the scheduler -- so a provider that produces one is
+		// re-probed and re-rejected on every pass, forever, burning a tunnel
+		// and three lookups each time. Both shapes are reachable: XK (Kosovo,
+		// user-assigned) and the MaxMind-lineage A1/A2/AP are two characters
+		// but absent from the ISO table, and normalizeCountry never validates
+		// length, so two sources reporting "USA" would otherwise sail through.
+		// Degrade to not-country-confident (and leave the fields empty, as
+		// the no-majority path does) rather than emit a doomed submission.
+		if isAlpha2(bestCountry) && name != "" {
+			loc.CountryCode = bestCountry
+			loc.Country = name
+			loc.CountryConfident = true
+		}
 	}
 
 	// city: set only if >= 2 sources agree on the normalized city.
