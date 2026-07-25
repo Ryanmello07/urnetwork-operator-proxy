@@ -40,6 +40,52 @@ type Config struct {
 // that later from a skewed geolocation result.
 var ErrPinsRequired = errors.New("providertunnel: Config.Pins must not be empty; a tunnel with no pins cannot safely carry a geolocation probe")
 
+// createTun builds the gvisor tun Open routes through. It is a var, and takes
+// the resolver settings explicitly rather than reaching for them itself, so a
+// test can observe exactly what Open asks for -- see
+// TestOpenUsesInTunnelOnlyDnsResolution. Reverting to
+// connect.CreateTunWithDefaults (the off-tunnel-DNS default, see
+// inTunnelOnlyDnsResolverSettings) would bypass this seam entirely and fail
+// that test rather than silently reintroducing the leak.
+var createTun = func(ctx context.Context, resolver *connect.DnsResolverSettings) (*connect.Tun, error) {
+	return connect.CreateTunWithResolver(ctx, connect.DefaultTunSettings(), resolver)
+}
+
+// inTunnelOnlyDnsResolverSettings returns DNS resolver settings under which
+// every name the tunnel resolves is resolved THROUGH the tunnel, encrypted.
+//
+// This exists because connect.CreateTunWithDefaults (and CreateTun, which
+// passes a nil resolver) inherits connect.DefaultDnsResolverSettings, whose
+// EnableLocalDns is true: when in-tunnel DoH produces nothing within its
+// budget -- a flaky provider, a provider that blocks 1.1.1.1:443, or simply a
+// tunnel that has not finished coming up -- DohCache.resolve falls back to a
+// plaintext port-53 query issued from the HOST's dialer. The TCP connection
+// that follows still egresses through the tunnel, so the geolocation verdict
+// stays correct, but the prober's own server IP has just asked a public
+// resolver, in the clear, for "ipinfo.io". This operator tool must never emit
+// a packet to (or about) a geolocation endpoint from its own address, so it
+// fails closed instead: a probe that cannot resolve in-tunnel fails and is
+// retried on the next pass.
+//
+// This mirrors connect's own DefaultUpgradeMuxSettings
+// (connect/ip_mux_upgrade.go), which disables the same toggles for the same
+// reason ("would resolve off-tunnel or in the clear"). Every Enable* toggle
+// other than EnableRemoteDoh is left false, and the Local* server lists are
+// left empty so that even a future connect default or an accidental toggle
+// flip has no host-side resolver to reach for. RemoteDns* IS carried: it is
+// the one permitted plaintext use, resolving a hostname-form DoH server
+// through the tunnel, and it stays inside the tunnel (see DohCache.resolve).
+func inTunnelOnlyDnsResolverSettings() *connect.DnsResolverSettings {
+	base := connect.DefaultDnsResolverSettings()
+	return &connect.DnsResolverSettings{
+		EnableRemoteDoh:   true,
+		RemoteDohUrlsIpv4: base.RemoteDohUrlsIpv4,
+		RemoteDohUrlsIpv6: base.RemoteDohUrlsIpv6,
+		RemoteDnsIpv4:     base.RemoteDnsIpv4,
+		RemoteDnsIpv6:     base.RemoteDnsIpv6,
+	}
+}
+
 // Tunnel is a live data path pinned to exactly one provider. Every connection
 // dialed through it egresses from that provider.
 type Tunnel struct {
@@ -81,7 +127,7 @@ func Open(ctx context.Context, cfg Config, providerClientId connect.Id) (*Tunnel
 		connect.DefaultApiMultiClientGeneratorSettings(),
 	)
 
-	tun, err := connect.CreateTunWithDefaults(ctx)
+	tun, err := createTun(ctx, inTunnelOnlyDnsResolverSettings())
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("create tun: %w", err)

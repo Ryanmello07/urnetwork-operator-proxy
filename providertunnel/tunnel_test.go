@@ -16,7 +16,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -720,4 +722,91 @@ func TestOpenCloseGoroutineLifecycle(t *testing.T) {
 		runtime.Gosched()
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// assertInTunnelOnlyResolver asserts that s permits exactly one resolution
+// path -- remote DoH, dialed through the tun -- and no host-side or cleartext
+// path of any kind.
+//
+// It walks the struct with reflection rather than checking the four toggles by
+// name on purpose: connect owns DnsResolverSettings, and a future sibling
+// toggle added there (a new Enable*, or a new Local* server list) would default
+// to the zero value in the literal this package builds but would otherwise go
+// unasserted. Reflecting over every field makes "everything off except
+// EnableRemoteDoh" the property under test, not a snapshot of today's fields.
+func assertInTunnelOnlyResolver(t *testing.T, s *connect.DnsResolverSettings) {
+	t.Helper()
+	if s == nil {
+		t.Fatal("resolver settings are nil, so connect's defaults apply: EnableLocalDns is true there, which resolves the geolocation hostnames off-tunnel in plaintext from the operator's own IP")
+	}
+
+	v := reflect.ValueOf(*s)
+	typ := v.Type()
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		switch {
+		case field.Type.Kind() == reflect.Bool:
+			// EnableRemoteDoh is the single permitted path: encrypted, and
+			// dialed through the tun. Every other toggle (EnableLocalDoh,
+			// EnableLocalDns, EnableRemoteDns, or any future sibling) either
+			// uses the host's dialer or sends the query in the clear.
+			want := field.Name == "EnableRemoteDoh"
+			if got := v.Field(i).Bool(); got != want {
+				t.Errorf("%s = %v, want %v: only in-tunnel encrypted resolution may be enabled", field.Name, got, want)
+			}
+		case field.Type.Kind() == reflect.Slice && strings.HasPrefix(field.Name, "Local"):
+			// Belt and braces: with no host-side servers configured, even a
+			// toggle flipped by a future connect default has nothing to dial.
+			if n := v.Field(i).Len(); n != 0 {
+				t.Errorf("%s has %d entry/entries, want none: no host-side resolver may be reachable from this tunnel", field.Name, n)
+			}
+		}
+	}
+
+	if len(s.RemoteDohUrlsIpv4) == 0 {
+		t.Error("RemoteDohUrlsIpv4 is empty: in-tunnel DoH would have no server to query, so no name could ever resolve")
+	}
+	if len(s.RemoteDnsIpv4) == 0 {
+		t.Error("RemoteDnsIpv4 is empty: a hostname-form DoH server name could not be resolved through the tunnel")
+	}
+}
+
+// TestInTunnelOnlyDnsResolverSettings pins the resolver literal itself.
+func TestInTunnelOnlyDnsResolverSettings(t *testing.T) {
+	assertInTunnelOnlyResolver(t, inTunnelOnlyDnsResolverSettings())
+}
+
+// TestOpenUsesInTunnelOnlyDnsResolution is the regression test for the
+// off-tunnel plaintext DNS leak: Open used to call
+// connect.CreateTunWithDefaults, which inherits EnableLocalDns: true, so a
+// failed in-tunnel DoH lookup silently fell back to a cleartext port-53 query
+// for "ipinfo.io" (etc.) issued from the operator's own IP. The TCP that
+// followed still went through the tunnel, so no existing test could see it --
+// the location stayed correct and nothing was logged.
+//
+// This asserts on the real Open path, not just on the settings constructor: if
+// Open is ever changed back to CreateTunWithDefaults/CreateTun (or to any
+// other constructor that does not go through the createTun seam), nothing is
+// captured here and the test fails.
+func TestOpenUsesInTunnelOnlyDnsResolution(t *testing.T) {
+	var captured *connect.DnsResolverSettings
+	var called bool
+	orig := createTun
+	createTun = func(ctx context.Context, resolver *connect.DnsResolverSettings) (*connect.Tun, error) {
+		called = true
+		captured = resolver
+		return orig(ctx, resolver)
+	}
+	defer func() { createTun = orig }()
+
+	tunnel, err := Open(context.Background(), dummyOpenConfig(), connect.NewId())
+	if err != nil {
+		t.Fatalf("Open err = %v", err)
+	}
+	defer tunnel.Close()
+
+	if !called {
+		t.Fatal("Open built its tun without going through createTun; it can no longer be proven that off-tunnel DNS resolution is disabled")
+	}
+	assertInTunnelOnlyResolver(t, captured)
 }
