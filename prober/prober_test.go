@@ -4,18 +4,25 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync"
 	"testing"
 
 	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
 )
 
+// stubSubmitter is shared by prober_test.go (single-goroutine callers) and
+// schedule_test.go (concurrent callers via Scheduler.Run), so its fields must
+// be safe for concurrent access.
 type stubSubmitter struct {
+	mu    sync.Mutex
 	calls int
 	last  *geolocate.ConsensusLocation
 	err   error
 }
 
 func (s *stubSubmitter) Submit(ctx context.Context, id string, loc *geolocate.ConsensusLocation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.calls++
 	s.last = loc
 	return s.err
