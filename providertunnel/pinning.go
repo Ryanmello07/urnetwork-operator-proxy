@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"errors"
+	"net"
 	"strings"
 )
 
@@ -38,12 +39,30 @@ func SPKIPin(cert *x509.Certificate) string {
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
-// normalizePins lowercases pin map keys once so lookups are case-insensitive
-// without repeated allocation per verification call.
+// normalizeHost lowercases host and strips a trailing ":port" suffix, if
+// present, so a pin map key mistakenly written as "ipinfo.io:443" and a
+// dialed address of "ipinfo.io:443" both normalize to "ipinfo.io" and match
+// each other. net.SplitHostPort is used rather than a manual strings.Cut on
+// ":" because it correctly rejects inputs that merely contain a colon but
+// are not actually host:port (e.g. leaves a bare hostname alone), so a
+// non-host:port string just falls through unchanged.
+func normalizeHost(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return strings.ToLower(host)
+}
+
+// normalizePins normalizes pin map keys once (case and any stray :port
+// suffix) so lookups are consistent without repeated normalization per
+// verification call. This is the single place map keys are normalized;
+// checkPin, PinVerifier, and the tunnel-layer allowlist check all normalize
+// the host they look up the same way via normalizeHost, so a pin map key
+// and a dialed host always compare on equal footing.
 func normalizePins(pins map[string][]string) map[string][]string {
 	normalized := make(map[string][]string, len(pins))
 	for host, allowed := range pins {
-		normalized[strings.ToLower(host)] = allowed
+		normalized[normalizeHost(host)] = allowed
 	}
 	return normalized
 }
@@ -55,7 +74,7 @@ func checkPin(normalized map[string][]string, host string, rawCerts [][]byte) er
 	if len(rawCerts) == 0 {
 		return ErrPinMismatch
 	}
-	allowed, pinned := normalized[strings.ToLower(host)]
+	allowed, pinned := normalized[normalizeHost(host)]
 	if !pinned {
 		return nil
 	}
@@ -83,7 +102,7 @@ func checkPin(normalized map[string][]string, host string, rawCerts [][]byte) er
 // directly.
 func PinVerifier(pins map[string][]string, host string) func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 	normalized := normalizePins(pins)
-	host = strings.ToLower(host)
+	host = normalizeHost(host)
 	return func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 		return checkPin(normalized, host, rawCerts)
 	}
