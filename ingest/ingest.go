@@ -23,6 +23,13 @@ var ErrNotConfident = errors.New("ingest: result is not country-confident")
 // ErrRejected is returned when the server rejects a submission.
 var ErrRejected = errors.New("ingest: server rejected the submission")
 
+// ErrMissingProbedAt is returned when loc.ProbedAt is zero. Submit never
+// fabricates an "observed now" timestamp: doing so would defeat the
+// server's age check and could permanently pin a stale or wrong location,
+// since the server's monotonic upsert would then reject later genuine
+// probes and its expiry sweep would never remove it.
+var ErrMissingProbedAt = errors.New("ingest: loc.ProbedAt is zero")
+
 // Client posts probed locations to the server's operator ingest endpoint.
 type Client struct {
 	ServerURL      string
@@ -57,6 +64,9 @@ func (c *Client) Submit(ctx context.Context, providerClientId string, loc *geolo
 	if loc == nil || !loc.CountryConfident {
 		return ErrNotConfident
 	}
+	if loc.ProbedAt.IsZero() {
+		return ErrMissingProbedAt
+	}
 	body := submitBody{
 		ClientId:         providerClientId,
 		CountryCode:      loc.CountryCode,
@@ -73,9 +83,6 @@ func (c *Client) Submit(ctx context.Context, providerClientId string, loc *geolo
 	if loc.CityConfident {
 		body.City = loc.City
 		body.Region = loc.Region
-	}
-	if body.ObservedAt.IsZero() {
-		body.ObservedAt = time.Now().UTC()
 	}
 
 	buf, err := json.Marshal(body)
