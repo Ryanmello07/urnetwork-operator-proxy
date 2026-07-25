@@ -24,15 +24,15 @@ var sources = []source{
 
 func parseIpPn(b []byte) (SourceResult, error) {
 	var v struct {
-		Status      string `json:"status"`
-		Country     string `json:"country"`
-		CountryCode string `json:"countryCode"`
-		City        string `json:"city"`
-		RegionName  string `json:"regionName"`
-		ASN         int    `json:"asn"`
-		Mobile      bool   `json:"mobile"`
-		Proxy       bool   `json:"proxy"`
-		Hosting     bool   `json:"hosting"`
+		Status      string          `json:"status"`
+		Country     string          `json:"country"`
+		CountryCode string          `json:"countryCode"`
+		City        string          `json:"city"`
+		RegionName  string          `json:"regionName"`
+		ASN         json.RawMessage `json:"asn"`
+		Mobile      bool            `json:"mobile"`
+		Proxy       bool            `json:"proxy"`
+		Hosting     bool            `json:"hosting"`
 	}
 	if err := json.Unmarshal(b, &v); err != nil {
 		return SourceResult{}, err
@@ -45,7 +45,7 @@ func parseIpPn(b []byte) (SourceResult, error) {
 		Country:     v.Country,
 		City:        v.City,
 		Region:      v.RegionName,
-		ASN:         v.ASN,
+		ASN:         parseASNValue(v.ASN),
 		Mobile:      v.Mobile,
 		Proxy:       v.Proxy,
 		Hosting:     v.Hosting,
@@ -54,30 +54,47 @@ func parseIpPn(b []byte) (SourceResult, error) {
 
 func parseFreeIpApi(b []byte) (SourceResult, error) {
 	var v struct {
-		CountryName string `json:"countryName"`
-		CountryCode string `json:"countryCode"`
-		CityName    string `json:"cityName"`
-		RegionName  string `json:"regionName"`
-		ASN         string `json:"asn"`
-		IsProxy     bool   `json:"isProxy"`
+		CountryName string          `json:"countryName"`
+		CountryCode string          `json:"countryCode"`
+		CityName    string          `json:"cityName"`
+		RegionName  string          `json:"regionName"`
+		ASN         json.RawMessage `json:"asn"`
+		IsProxy     bool            `json:"isProxy"`
 	}
 	if err := json.Unmarshal(b, &v); err != nil {
 		return SourceResult{}, err
-	}
-	asn := 0
-	if s := strings.TrimPrefix(strings.TrimSpace(v.ASN), "AS"); s != "" {
-		if n, err := strconv.Atoi(s); err == nil {
-			asn = n
-		}
 	}
 	return SourceResult{
 		CountryCode: v.CountryCode,
 		Country:     v.CountryName,
 		City:        v.CityName,
 		Region:      v.RegionName,
-		ASN:         asn,
+		ASN:         parseASNValue(v.ASN),
 		Proxy:       v.IsProxy,
 	}, nil
+}
+
+// parseASNValue tolerantly extracts an ASN integer from a raw JSON value that
+// these free APIs are known to represent inconsistently: a bare JSON number
+// (401486), a quoted number ("401486"), or a quoted "AS"-prefixed form
+// ("AS401486"). Any other shape (null, absent, object, array, garbage)
+// degrades to 0 rather than failing the whole payload's parse.
+func parseASNValue(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return n
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		s = strings.TrimPrefix(strings.TrimSpace(s), "AS")
+		if n, err := strconv.Atoi(s); err == nil {
+			return n
+		}
+	}
+	return 0
 }
 
 func parseIpInfo(b []byte) (SourceResult, error) {

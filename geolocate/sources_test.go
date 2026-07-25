@@ -46,22 +46,113 @@ func TestParseIpInfo(t *testing.T) {
 }
 
 func TestParseASNOrg(t *testing.T) {
-	asn, org := parseASNOrg("AS401486 RAVNIX LLC")
-	if asn != 401486 || org != "RAVNIX LLC" {
-		t.Fatalf("parseASNOrg = (%d, %q)", asn, org)
+	cases := []struct {
+		name    string
+		org     string
+		wantASN int
+		wantOrg string
+	}{
+		{"exact AS+space+name", "AS401486 RAVNIX LLC", 401486, "RAVNIX LLC"},
+		{"bare org no AS prefix", "RAVNIX LLC", 0, "RAVNIX LLC"},
+		{"org merely starts with letters AS", "ASIA PACIFIC NETWORK INFORMATION CENTRE", 0, "ASIA PACIFIC NETWORK INFORMATION CENTRE"},
+		{"AS number with no name", "AS401486", 401486, ""},
+		{"empty string", "", 0, ""},
 	}
-	if a, o := parseASNOrg(""); a != 0 || o != "" {
-		t.Fatalf("empty org = (%d, %q)", a, o)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			asn, org := parseASNOrg(c.org)
+			if asn != c.wantASN || org != c.wantOrg {
+				t.Fatalf("parseASNOrg(%q) = (%d, %q), want (%d, %q)", c.org, asn, org, c.wantASN, c.wantOrg)
+			}
+		})
+	}
+}
+
+func TestParseIpPnASNTypeTolerance(t *testing.T) {
+	cases := []struct {
+		name    string
+		asnJSON string
+		wantASN int
+	}{
+		{"raw number", `401486`, 401486},
+		{"quoted number", `"401486"`, 401486},
+		{"quoted AS-prefixed", `"AS401486"`, 401486},
+		{"null", `null`, 0},
+		{"garbage object", `{"foo":"bar"}`, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b := []byte(`{"status":"success","country":"United States","countryCode":"US","city":"Fairfax","regionName":"","asn":` + c.asnJSON + `,"mobile":false,"proxy":false,"hosting":false}`)
+			r, err := parseIpPn(b)
+			if err != nil {
+				t.Fatalf("parseIpPn err = %v", err)
+			}
+			if r.CountryCode != "US" || r.Country != "United States" || r.City != "Fairfax" {
+				t.Fatalf("parseIpPn = %+v", r)
+			}
+			if r.ASN != c.wantASN {
+				t.Fatalf("parseIpPn ASN = %d, want %d", r.ASN, c.wantASN)
+			}
+		})
+	}
+}
+
+func TestParseFreeIpApiASNTypeTolerance(t *testing.T) {
+	cases := []struct {
+		name    string
+		asnJSON string
+		wantASN int
+	}{
+		{"quoted AS-prefixed", `"AS401486"`, 401486},
+		{"raw number", `401486`, 401486},
+		{"quoted number", `"401486"`, 401486},
+		{"null", `null`, 0},
+		{"garbage array", `[1,2,3]`, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b := []byte(`{"ipVersion":6,"countryName":"United States","countryCode":"US","cityName":"Denver (North Capitol Hill)","regionName":"Colorado","asn":` + c.asnJSON + `,"isProxy":false}`)
+			r, err := parseFreeIpApi(b)
+			if err != nil {
+				t.Fatalf("parseFreeIpApi err = %v", err)
+			}
+			if r.CountryCode != "US" || r.Country != "United States" || r.City != "Denver (North Capitol Hill)" || r.Region != "Colorado" {
+				t.Fatalf("parseFreeIpApi = %+v", r)
+			}
+			if r.ASN != c.wantASN {
+				t.Fatalf("parseFreeIpApi ASN = %d, want %d", r.ASN, c.wantASN)
+			}
+		})
 	}
 }
 
 func TestSourcesTable(t *testing.T) {
-	if len(sources) != 3 {
-		t.Fatalf("len(sources) = %d, want 3", len(sources))
+	wantNames := []string{"ip.pn", "freeipapi", "ipinfo"}
+	if len(sources) != len(wantNames) {
+		t.Fatalf("len(sources) = %d, want %d", len(sources), len(wantNames))
+	}
+	for i, s := range sources {
+		if s.Name != wantNames[i] {
+			t.Fatalf("sources[%d].Name = %q, want %q", i, s.Name, wantNames[i])
+		}
+		if s.URL == "" {
+			t.Fatalf("sources[%d] (%s) has empty URL", i, s.Name)
+		}
+		if s.Parse == nil {
+			t.Fatalf("sources[%d] (%s) has nil Parse", i, s.Name)
+		}
+	}
+
+	// The consensus tie-break in consensus.go is keyed on these exact Name
+	// strings via SourcePriority. If the two tables drift apart, tie-breaking
+	// silently degrades to the unknown-source fallback rank with no other
+	// test failure, so assert the tables stay in lockstep here.
+	if len(sources) != len(SourcePriority) {
+		t.Fatalf("len(sources) = %d, len(SourcePriority) = %d; tables have drifted apart", len(sources), len(SourcePriority))
 	}
 	for _, s := range sources {
-		if s.Name == "" || s.URL == "" || s.Parse == nil {
-			t.Fatalf("incomplete source %+v", s)
+		if _, ok := SourcePriority[s.Name]; !ok {
+			t.Fatalf("source %q has no entry in SourcePriority (consensus.go); tables have drifted apart", s.Name)
 		}
 	}
 }
