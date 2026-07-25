@@ -65,6 +65,57 @@ func sourceRank(name string) int {
 	return unknownSourceRank
 }
 
+// displayField picks the human-readable rendering of a winning candidate --
+// the country name, the city's display casing, the region name -- from
+// whichever contributing source is most trusted.
+//
+// It exists because these three fields used to resolve by three different and
+// mutually inconsistent rules: country name and region were last-writer-wins
+// while city display was first-writer-wins, so which rendering survived
+// depended on nothing but a source's position in the results slice. With
+// ip.pn reporting Region "Colorado" and ipinfo reporting "CO", ipinfo's "CO"
+// won purely because it sorts later in `sources` -- the least-trusted source's
+// rendering beating the most-trusted one's. That is not cosmetic: the server
+// canonicalizes location_name permanently (model.CreateLocation dedupes and
+// stores it), so a bad pick is durable.
+//
+// All three now use the same SourcePriority order that already decides the
+// verdict, so the winning code/city and the words shown for it come from the
+// same ranking. Ties keep the first offer, which makes the result independent
+// of map iteration order.
+type displayField struct {
+	value map[string]string
+	rank  map[string]int
+}
+
+func newDisplayField() displayField {
+	return displayField{
+		value: map[string]string{},
+		rank:  map[string]int{},
+	}
+}
+
+// offer records v as the rendering for candidate c if it is non-empty and
+// comes from a strictly more trusted source than the rendering already held.
+// Empty values are never recorded: a source that omitted the field cannot
+// blank out one that supplied it, however trusted it is.
+func (d displayField) offer(c string, v string, rank int) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return
+	}
+	if held, ok := d.rank[c]; ok && rank >= held {
+		return
+	}
+	d.value[c] = v
+	d.rank[c] = rank
+}
+
+// get returns the rendering held for c, or "" if no source supplied one.
+func (d displayField) get(c string) string {
+	return d.value[c]
+}
+
 // consensus computes a ConsensusLocation from successful source results.
 // Callers pass only results with OK == true. It does not enforce the quorum
 // (Locate does that before calling); with a single result it simply yields a
@@ -76,7 +127,7 @@ func consensus(ok []SourceResult) ConsensusLocation {
 	// Ties in vote count are broken by the most-trusted contributing source
 	// (SourcePriority), falling back to lexicographic order only if ranks also tie.
 	countryCounts := map[string]int{}
-	countryName := map[string]string{}
+	countryName := newDisplayField()
 	countryRank := map[string]int{}
 	countryHasRank := map[string]bool{}
 	for _, r := range ok {
@@ -85,9 +136,7 @@ func consensus(ok []SourceResult) ConsensusLocation {
 			continue
 		}
 		countryCounts[c]++
-		if r.Country != "" {
-			countryName[c] = r.Country
-		}
+		countryName.offer(c, r.Country, sourceRank(r.Name))
 		rank := sourceRank(r.Name)
 		if !countryHasRank[c] || rank < countryRank[c] {
 			countryRank[c] = rank
@@ -107,7 +156,7 @@ func consensus(ok []SourceResult) ConsensusLocation {
 		}
 	}
 	if bestCountryN >= MinSources {
-		name := countryName[bestCountry]
+		name := countryName.get(bestCountry)
 		if name == "" {
 			// No source supplied a human-readable name for the winning code
 			// (e.g. ipinfo-only quorum: it returns a code but never a name).
@@ -144,8 +193,8 @@ func consensus(ok []SourceResult) ConsensusLocation {
 	// Same tie-break as country: most-trusted contributing source first,
 	// lexicographic order only as a last-resort tiebreaker.
 	cityCounts := map[string]int{}
-	cityDisplay := map[string]string{}
-	cityRegion := map[string]string{}
+	cityDisplay := newDisplayField()
+	cityRegion := newDisplayField()
 	cityRank := map[string]int{}
 	cityHasRank := map[string]bool{}
 	for _, r := range ok {
@@ -154,12 +203,8 @@ func consensus(ok []SourceResult) ConsensusLocation {
 			continue
 		}
 		cityCounts[c]++
-		if _, seen := cityDisplay[c]; !seen {
-			cityDisplay[c] = strings.TrimSpace(r.City)
-		}
-		if r.Region != "" {
-			cityRegion[c] = r.Region
-		}
+		cityDisplay.offer(c, r.City, sourceRank(r.Name))
+		cityRegion.offer(c, r.Region, sourceRank(r.Name))
 		rank := sourceRank(r.Name)
 		if !cityHasRank[c] || rank < cityRank[c] {
 			cityRank[c] = rank
@@ -185,9 +230,9 @@ func consensus(ok []SourceResult) ConsensusLocation {
 	// one (never fabricated), so when no agreeing source named a region,
 	// degrade cleanly to country granularity instead of submitting an
 	// incomplete record: leave City/Region empty and CityConfident false.
-	if bestCityN >= 2 && cityRegion[bestCity] != "" {
-		loc.City = cityDisplay[bestCity]
-		loc.Region = cityRegion[bestCity]
+	if bestCityN >= 2 && cityRegion.get(bestCity) != "" {
+		loc.City = cityDisplay.get(bestCity)
+		loc.Region = cityRegion.get(bestCity)
 		loc.CityConfident = true
 	}
 

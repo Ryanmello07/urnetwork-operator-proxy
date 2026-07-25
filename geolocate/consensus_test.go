@@ -273,3 +273,66 @@ func TestConsensusFlagsOr(t *testing.T) {
 		t.Fatal("Mobile must remain false")
 	}
 }
+
+// TestConsensusDisplayFieldsPreferHigherPrioritySource is the regression test
+// for the inconsistent display-field rules: country name and region were
+// last-writer-wins while the city's display casing was first-writer-wins, so
+// which rendering survived depended only on a source's index in the results
+// slice. Here every lower-priority source is deliberately placed FIRST and
+// offers a worse rendering of the same agreed value: the abbreviation "CO"
+// for the region, a shouted city name, and a long-form country name. Under
+// either of the old rules at least one of the three assertions below fails.
+//
+// It matters beyond cosmetics because the server canonicalizes location_name
+// permanently, so "CO" would be stored durably in place of "Colorado".
+func TestConsensusDisplayFieldsPreferHigherPrioritySource(t *testing.T) {
+	// ip.pn (rank 0) is bracketed by lower-priority sources so that BOTH old
+	// rules pick wrong: ipinfo is first (beating first-writer-wins on the
+	// city display) and freeipapi is last (beating last-writer-wins on the
+	// country name and the region).
+	ok := []SourceResult{
+		{Name: "ipinfo", OK: true, CountryCode: "US", City: "DENVER", Region: "CO"},
+		{Name: "ip.pn", OK: true, CountryCode: "US", Country: "United States", City: "Denver", Region: "Colorado"},
+		{Name: "freeipapi", OK: true, CountryCode: "US", Country: "United States of America", City: "denver", Region: "Colo."},
+	}
+	loc := consensus(ok)
+
+	if !loc.CountryConfident {
+		t.Fatal("three sources agree on US; CountryConfident must be true")
+	}
+	if loc.Country != "United States" {
+		t.Errorf("Country = %q, want \"United States\" from ip.pn (rank 0), not a later, less-trusted source's rendering", loc.Country)
+	}
+	if !loc.CityConfident {
+		t.Fatal("three sources agree on Denver; CityConfident must be true")
+	}
+	if loc.City != "Denver" {
+		t.Errorf("City = %q, want \"Denver\" from ip.pn (rank 0), not a lower-priority source's casing", loc.City)
+	}
+	if loc.Region != "Colorado" {
+		t.Errorf("Region = %q, want \"Colorado\" from ip.pn (rank 0); the server canonicalizes this name permanently, so an abbreviation from a less-trusted source must not win on slice order", loc.Region)
+	}
+}
+
+// TestConsensusDisplayFieldsIgnoreEmptyFromTrustedSource is the complement:
+// priority decides between renderings that exist, but a more-trusted source
+// that omitted the field entirely must not blank out a rendering a
+// less-trusted source did supply. ip.pn (rank 0) here names neither the
+// country nor the region.
+func TestConsensusDisplayFieldsIgnoreEmptyFromTrustedSource(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "ip.pn", OK: true, CountryCode: "US", City: "Denver"},
+		{Name: "freeipapi", OK: true, CountryCode: "US", Country: "United States of America", City: "Denver", Region: "Colorado"},
+	}
+	loc := consensus(ok)
+
+	if loc.Country != "United States of America" {
+		t.Errorf("Country = %q, want freeipapi's name: the higher-priority source supplied none", loc.Country)
+	}
+	if !loc.CityConfident {
+		t.Fatal("two sources agree on Denver and one supplied a Region; CityConfident must be true")
+	}
+	if loc.Region != "Colorado" {
+		t.Errorf("Region = %q, want \"Colorado\": the higher-priority source supplied no region", loc.Region)
+	}
+}
