@@ -90,6 +90,18 @@ func consensus(ok []SourceResult) ConsensusLocation {
 	if bestCountryN >= MinSources {
 		loc.CountryCode = bestCountry
 		loc.Country = countryName[bestCountry]
+		if loc.Country == "" {
+			// No source supplied a human-readable name for the winning code
+			// (e.g. ipinfo-only quorum: it returns a code but never a name).
+			// Fall back to the ISO-3166-1 table so a confident country isn't
+			// submitted with an empty name, which the server rejects. A
+			// source-supplied name above always takes priority; this only
+			// fires when none was given. countryNameForCode itself degrades
+			// to "" for a code outside the table, which is the correct,
+			// non-corrupting behavior: leave Country empty rather than
+			// invent a placeholder.
+			loc.Country = countryNameForCode(bestCountry)
+		}
 		loc.CountryConfident = true
 	}
 

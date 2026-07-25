@@ -109,6 +109,70 @@ func TestConsensusCityTieBrokenBySourcePriority(t *testing.T) {
 	}
 }
 
+// TestConsensusCountryNameFallbackFromTable is the teeth-check for the
+// ipinfo-name gap: ipinfo returns a country code but never a name (see
+// parseIpInfo in sources.go). A quorum consisting only of sources that
+// likewise contributed no name (simulated here as "ipinfo" plus another
+// nameless source) must not surface CountryConfident==true with an empty
+// Country -- the server rejects that with "Missing country." Country must
+// be backfilled from the ISO-3166-1 table.
+func TestConsensusCountryNameFallbackFromTable(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "ipinfo", OK: true, CountryCode: "DE"},
+		{Name: "freeipapi", OK: true, CountryCode: "DE"}, // no Country set, simulating a nameless response
+	}
+	loc := consensus(ok)
+	if !loc.CountryConfident {
+		t.Fatal("expected CountryConfident with 2 agreeing sources")
+	}
+	if loc.CountryCode != "de" {
+		t.Fatalf("CountryCode = %q, want \"de\"", loc.CountryCode)
+	}
+	if loc.Country != "Germany" {
+		t.Fatalf("Country = %q, want \"Germany\" (backfilled from the ISO table)", loc.Country)
+	}
+}
+
+// TestConsensusCountryNameSourceWinsOverTable verifies the table is only a
+// fallback: when a source does supply a name, that name wins even if it
+// differs from the table's value (e.g. a source using the official long
+// form where the table uses the common short form).
+func TestConsensusCountryNameSourceWinsOverTable(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "ip.pn", OK: true, CountryCode: "US", Country: "United States of America"},
+		{Name: "freeipapi", OK: true, CountryCode: "US", Country: "United States of America"},
+	}
+	loc := consensus(ok)
+	if !loc.CountryConfident {
+		t.Fatal("expected CountryConfident with 2 agreeing sources")
+	}
+	if loc.Country != "United States of America" {
+		t.Fatalf("Country = %q, want the source-supplied name to win over the table's \"United States\"", loc.Country)
+	}
+}
+
+// TestConsensusCountryNameUnknownCodeStaysEmpty verifies the fallback
+// degrades safely for a code outside the table: Country must stay empty,
+// never a placeholder like the raw code or "Unknown". An empty Country
+// preserves today's safe behavior (the server rejects it) instead of the
+// server permanently storing a fabricated name.
+func TestConsensusCountryNameUnknownCodeStaysEmpty(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "ipinfo", OK: true, CountryCode: "ZZ"},
+		{Name: "freeipapi", OK: true, CountryCode: "ZZ"},
+	}
+	loc := consensus(ok)
+	if !loc.CountryConfident {
+		t.Fatal("expected CountryConfident with 2 agreeing sources")
+	}
+	if loc.CountryCode != "zz" {
+		t.Fatalf("CountryCode = %q, want \"zz\"", loc.CountryCode)
+	}
+	if loc.Country != "" {
+		t.Fatalf("Country = %q, want empty for an unknown code with no source name (no placeholder)", loc.Country)
+	}
+}
+
 func TestConsensusFlagsOr(t *testing.T) {
 	ok := []SourceResult{
 		{Name: "a", OK: true, CountryCode: "US", Hosting: false, Proxy: false, Mobile: false},
