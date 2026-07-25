@@ -22,8 +22,18 @@ const MinSources = 2
 // MaxResponseBytes caps a single source's response body.
 const MaxResponseBytes = 64 * 1024
 
-// PerSourceTimeout bounds each individual source request. It is a var so tests
+// PerSourceTimeout is the default bound on each individual source request,
+// used when LocateOptions.PerSourceTimeout is not set. It is a var so tests
 // can lower it.
+//
+// Production sets it explicitly instead (see LocateOptions): this default is
+// tight for the way the prober actually runs. Every probe uses a COLD tunnel
+// -- providertunnel.Open returns before the multiclient has reached the
+// platform, and the tunnel is closed again after each provider, so nothing is
+// warm and nothing is reused -- and within this budget a source must complete
+// session establishment, an in-tunnel DoH resolution (itself a TCP+TLS+h2
+// setup), and then TCP+TLS to the geolocation host. connect's own defaults
+// budget 30s for the dial alone.
 var PerSourceTimeout = 5 * time.Second
 
 // ErrNoConsensus is returned by Locate when fewer than MinSources sources
@@ -94,20 +104,48 @@ type ConsensusLocation struct {
 // Callers MUST check CountryConfident before treating the returned location
 // as authoritative; a nil error alone does not mean the location is trustworthy.
 func Locate(ctx context.Context, client *http.Client) (*ConsensusLocation, error) {
-	return locate(ctx, client, sources)
+	return locate(ctx, client, sources, LocateOptions{})
 }
 
-func locate(ctx context.Context, client *http.Client, srcs []source) (*ConsensusLocation, error) {
+// LocateOptions tunes a single Locate call. The zero value reproduces Locate's
+// behavior exactly, so it is always safe to pass.
+type LocateOptions struct {
+	// PerSourceTimeout bounds each individual source request. Zero or
+	// negative means "use the package default", PerSourceTimeout.
+	//
+	// This is what lets the operator's -probe-timeout actually govern a
+	// probe: without it, every source fetch was independently capped at the
+	// 5s package default no matter how large a probe timeout was configured,
+	// so the CLI's only latency knob could not raise the deadline that
+	// matters on a cold tunnel.
+	PerSourceTimeout time.Duration
+}
+
+// LocateWithOptions is Locate with per-call tuning. See LocateOptions.
+func LocateWithOptions(ctx context.Context, client *http.Client, opts LocateOptions) (*ConsensusLocation, error) {
+	return locate(ctx, client, sources, opts)
+}
+
+// perSourceTimeout resolves the effective per-source bound for this call.
+func (o LocateOptions) perSourceTimeout() time.Duration {
+	if 0 < o.PerSourceTimeout {
+		return o.PerSourceTimeout
+	}
+	return PerSourceTimeout
+}
+
+func locate(ctx context.Context, client *http.Client, srcs []source, opts LocateOptions) (*ConsensusLocation, error) {
 	if client == nil {
 		return nil, ErrNilClient
 	}
+	perSource := opts.perSourceTimeout()
 	results := make([]SourceResult, len(srcs))
 	var wg sync.WaitGroup
 	for i := range srcs {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			results[i] = fetchSource(ctx, client, srcs[i])
+			results[i] = fetchSource(ctx, client, srcs[i], perSource)
 		}(i)
 	}
 	wg.Wait()
@@ -127,9 +165,9 @@ func locate(ctx context.Context, client *http.Client, srcs []source) (*Consensus
 	return &loc, nil
 }
 
-func fetchSource(ctx context.Context, client *http.Client, s source) SourceResult {
+func fetchSource(ctx context.Context, client *http.Client, s source, perSourceTimeout time.Duration) SourceResult {
 	r := SourceResult{Name: s.Name}
-	ctx, cancel := context.WithTimeout(ctx, PerSourceTimeout)
+	ctx, cancel := context.WithTimeout(ctx, perSourceTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.URL, nil)

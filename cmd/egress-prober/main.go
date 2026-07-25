@@ -135,7 +135,19 @@ func main() {
 			}
 			return t.HTTPClient(*probeTimeout), t.Close, nil
 		},
-		Locate: geolocate.Locate,
+		// -probe-timeout must govern the per-source deadline too, not just
+		// the http.Client's overall timeout. geolocate caps each source fetch
+		// independently, and until this was wired the cap was always the 5s
+		// package default, so raising -probe-timeout could not extend the
+		// deadline that actually matters. Every probe runs over a cold tunnel
+		// -- no warm-up, closed again after each provider -- so that one
+		// budget has to cover session establishment, an in-tunnel DoH
+		// resolution, and two TLS handshakes.
+		Locate: func(ctx context.Context, client *http.Client) (*geolocate.ConsensusLocation, error) {
+			return geolocate.LocateWithOptions(ctx, client, geolocate.LocateOptions{
+				PerSourceTimeout: *probeTimeout,
+			})
+		},
 		Submit: submitter,
 	}
 
