@@ -34,13 +34,27 @@ import (
 func main() {
 	apiURL := flag.String("api-url", "", "operator server api url, e.g. https://api.example.net (required)")
 	platformURL := flag.String("platform-url", "", "operator platform websocket url, e.g. wss://connect.example.net (required)")
-	byJwt := flag.String("by-jwt", os.Getenv("UR_PROBER_BY_JWT"), "the prober's network client jwt (or UR_PROBER_BY_JWT) (required)")
-	operatorSecret := flag.String("operator-secret", os.Getenv("UR_OPERATOR_SECRET"), "ingest secret, must match ingest_secret in provider_egress.yml (or UR_OPERATOR_SECRET) (required)")
+	// The two secret flags MUST declare an empty default and read their env
+	// var only after Parse (see envFallback below). Passing os.Getenv(...) as
+	// the flag default instead makes flag.PrintDefaults render the live secret
+	// as `(default "...")`, so every flag.Usage() call -- any missing required
+	// flag, any parse error, and plain -h, which an operator runs routinely --
+	// echoes both secrets verbatim to stderr, into journald or a CI log. That
+	// would invert the README's own advice, which presents these env vars as
+	// the way to keep secrets out of logs and ps.
+	byJwt := flag.String("by-jwt", "", "the prober's network client jwt; prefer the UR_PROBER_BY_JWT env var, which keeps it out of ps (required)")
+	operatorSecret := flag.String("operator-secret", "", "ingest secret, must match ingest_secret in provider_egress.yml; prefer the UR_OPERATOR_SECRET env var, which keeps it out of ps (required)")
 	concurrency := flag.Int("concurrency", 4, "max simultaneous provider tunnels")
 	cacheTTL := flag.Duration("cache-ttl", 24*time.Hour, "do not re-probe a provider within this window")
 	interval := flag.Duration("interval", time.Hour, "sleep between passes; 0 runs a single pass and exits")
-	probeTimeout := flag.Duration("probe-timeout", 60*time.Second, "per-provider probe timeout")
+	probeTimeout := flag.Duration("probe-timeout", 60*time.Second, "per-provider probe timeout, and the per-source deadline within a probe")
 	flag.Parse()
+
+	// Env fallback, applied only after parsing so the secret is never a flag
+	// default and can never be rendered by flag.Usage(). An explicit flag
+	// still wins, matching the previous precedence.
+	envFallback(byJwt, "UR_PROBER_BY_JWT")
+	envFallback(operatorSecret, "UR_OPERATOR_SECRET")
 
 	var missing []string
 	if *apiURL == "" {
@@ -172,6 +186,15 @@ func main() {
 			return
 		case <-time.After(*interval):
 		}
+	}
+}
+
+// envFallback fills *value from the named environment variable when the flag
+// was not given. Reading the environment here, rather than through the flag's
+// default, is what keeps the value out of flag.Usage() output.
+func envFallback(value *string, envName string) {
+	if *value == "" {
+		*value = os.Getenv(envName)
 	}
 }
 
