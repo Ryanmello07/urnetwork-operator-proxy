@@ -39,6 +39,6 @@ require (
 	src.agwa.name/tlshacks v0.0.3 // indirect
 )
 
-replace github.com/urnetwork/connect => /root/urnetwork/connect
+replace github.com/urnetwork/connect => ../connect
 
-replace github.com/urnetwork/glog => /root/urnetwork/glog
+replace github.com/urnetwork/glog => ../glog
