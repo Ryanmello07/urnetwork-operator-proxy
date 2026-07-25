@@ -10,6 +10,34 @@ func normalizeCity(city string) string {
 	return strings.ToLower(strings.TrimSpace(city))
 }
 
+// SourcePriority ranks the free geolocation sources by trustworthiness, most
+// trusted first. Lower value = more trusted. It is keyed by the exact
+// SourceResult.Name values the sources set (wired up in a later task).
+//
+// consensus uses this ordering to break exact vote-count ties: when two
+// candidate answers (country codes or cities) receive the same number of
+// votes, the answer contributed by the more trusted source wins, instead of
+// an arbitrary lexicographically-smaller string winning by coincidence.
+var SourcePriority = map[string]int{
+	"ip.pn":     0,
+	"freeipapi": 1,
+	"ipinfo":    2,
+}
+
+// unknownSourceRank is the rank assigned to a source name absent from
+// SourcePriority. It is deliberately larger than any real entry so unknown
+// sources always lose a tie-break against a known source.
+const unknownSourceRank = 1 << 30
+
+// sourceRank returns name's trust rank (lower = more trusted). Unknown or
+// empty names get unknownSourceRank so they always lose ties.
+func sourceRank(name string) int {
+	if rank, ok := SourcePriority[name]; ok {
+		return rank
+	}
+	return unknownSourceRank
+}
+
 // consensus computes a ConsensusLocation from successful source results.
 // Callers pass only results with OK == true. It does not enforce the quorum
 // (Locate does that before calling); with a single result it simply yields a
@@ -18,8 +46,12 @@ func consensus(ok []SourceResult) ConsensusLocation {
 	var loc ConsensusLocation
 
 	// country: plurality over non-empty normalized codes; confident only at >= MinSources.
+	// Ties in vote count are broken by the most-trusted contributing source
+	// (SourcePriority), falling back to lexicographic order only if ranks also tie.
 	countryCounts := map[string]int{}
 	countryName := map[string]string{}
+	countryRank := map[string]int{}
+	countryHasRank := map[string]bool{}
 	for _, r := range ok {
 		c := normalizeCountry(r.CountryCode)
 		if c == "" {
@@ -29,11 +61,22 @@ func consensus(ok []SourceResult) ConsensusLocation {
 		if r.Country != "" {
 			countryName[c] = r.Country
 		}
+		rank := sourceRank(r.Name)
+		if !countryHasRank[c] || rank < countryRank[c] {
+			countryRank[c] = rank
+			countryHasRank[c] = true
+		}
 	}
-	bestCountry, bestCountryN := "", 0
+	bestCountry, bestCountryN, bestCountryRank := "", 0, 0
 	for c, n := range countryCounts {
-		if n > bestCountryN || (n == bestCountryN && c < bestCountry) {
-			bestCountry, bestCountryN = c, n
+		rank := countryRank[c]
+		switch {
+		case n > bestCountryN:
+			bestCountry, bestCountryN, bestCountryRank = c, n, rank
+		case n == bestCountryN && rank < bestCountryRank:
+			bestCountry, bestCountryRank = c, rank
+		case n == bestCountryN && rank == bestCountryRank && c < bestCountry:
+			bestCountry = c
 		}
 	}
 	if bestCountryN >= MinSources {
@@ -43,9 +86,13 @@ func consensus(ok []SourceResult) ConsensusLocation {
 	}
 
 	// city: set only if >= 2 sources agree on the normalized city.
+	// Same tie-break as country: most-trusted contributing source first,
+	// lexicographic order only as a last-resort tiebreaker.
 	cityCounts := map[string]int{}
 	cityDisplay := map[string]string{}
 	cityRegion := map[string]string{}
+	cityRank := map[string]int{}
+	cityHasRank := map[string]bool{}
 	for _, r := range ok {
 		c := normalizeCity(r.City)
 		if c == "" {
@@ -58,11 +105,22 @@ func consensus(ok []SourceResult) ConsensusLocation {
 		if r.Region != "" {
 			cityRegion[c] = r.Region
 		}
+		rank := sourceRank(r.Name)
+		if !cityHasRank[c] || rank < cityRank[c] {
+			cityRank[c] = rank
+			cityHasRank[c] = true
+		}
 	}
-	bestCity, bestCityN := "", 0
+	bestCity, bestCityN, bestCityRank := "", 0, 0
 	for c, n := range cityCounts {
-		if n > bestCityN || (n == bestCityN && c < bestCity) {
-			bestCity, bestCityN = c, n
+		rank := cityRank[c]
+		switch {
+		case n > bestCityN:
+			bestCity, bestCityN, bestCityRank = c, n, rank
+		case n == bestCityN && rank < bestCityRank:
+			bestCity, bestCityRank = c, rank
+		case n == bestCityN && rank == bestCityRank && c < bestCity:
+			bestCity = c
 		}
 	}
 	if bestCityN >= 2 {

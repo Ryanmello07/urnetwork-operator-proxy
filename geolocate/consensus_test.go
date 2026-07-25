@@ -61,6 +61,54 @@ func TestConsensusCountryDisagreementNotConfident(t *testing.T) {
 	}
 }
 
+// TestConsensusCountryTieBrokenBySourcePriority exercises a genuine 2-vs-2
+// tie (both sides clear MinSources) where the lexicographically larger code
+// ("us") comes from the higher-priority sources (ip.pn, ipinfo) and the
+// lexicographically smaller code ("ca") comes from a lower-priority source
+// (freeipapi) plus a repeated ipinfo vote. Under the old buggy tie-break
+// (n == bestN && c < best), "ca" would win purely because it sorts before
+// "us". The fix requires the higher-priority source's answer to win instead.
+func TestConsensusCountryTieBrokenBySourcePriority(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "ip.pn", OK: true, CountryCode: "US", Country: "United States"},
+		{Name: "ipinfo", OK: true, CountryCode: "US", Country: "United States"},
+		{Name: "freeipapi", OK: true, CountryCode: "CA", Country: "Canada"},
+		{Name: "ipinfo", OK: true, CountryCode: "CA", Country: "Canada"},
+	}
+	loc := consensus(ok)
+	if !loc.CountryConfident {
+		t.Fatal("2-vs-2 tie with both sides >= MinSources must still be confident")
+	}
+	if loc.CountryCode != "us" {
+		t.Fatalf("CountryCode = %q, want \"us\" (ip.pn is highest-priority source and voted US)", loc.CountryCode)
+	}
+	if loc.Country != "United States" {
+		t.Fatalf("Country = %q, want \"United States\"", loc.Country)
+	}
+}
+
+// TestConsensusCityTieBrokenBySourcePriority is the city analogue of
+// TestConsensusCountryTieBrokenBySourcePriority: a 2-vs-2 tie where the
+// lexicographically larger city ("denver") is backed by the highest-priority
+// source (ip.pn) while the lexicographically smaller city ("chicago") is
+// backed only by lower-priority sources. The old lexicographic tie-break
+// would pick "chicago"; the fix must pick "denver".
+func TestConsensusCityTieBrokenBySourcePriority(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "ip.pn", OK: true, CountryCode: "US", City: "Denver", Region: "Colorado"},
+		{Name: "ipinfo", OK: true, CountryCode: "US", City: "Denver", Region: "Colorado"},
+		{Name: "freeipapi", OK: true, CountryCode: "US", City: "Chicago", Region: "Illinois"},
+		{Name: "ipinfo", OK: true, CountryCode: "US", City: "Chicago", Region: "Illinois"},
+	}
+	loc := consensus(ok)
+	if !loc.CityConfident {
+		t.Fatal("2-vs-2 city tie with both sides >= 2 must still be confident")
+	}
+	if loc.City != "Denver" {
+		t.Fatalf("City = %q, want \"Denver\" (ip.pn is highest-priority source and voted Denver)", loc.City)
+	}
+}
+
 func TestConsensusFlagsOr(t *testing.T) {
 	ok := []SourceResult{
 		{Name: "a", OK: true, CountryCode: "US", Hosting: false, Proxy: false, Mobile: false},
