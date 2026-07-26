@@ -58,11 +58,17 @@ func isAlpha2(code string) bool {
 	return true
 }
 
-// Client posts probed locations to the server's operator ingest endpoint.
+// Client talks to the server's operator endpoints: it posts probed locations,
+// reports probe attempts, and asks which providers are due. All three
+// authenticate with the same X-UR-Operator-Secret header -- one secret, one
+// mechanism, one thing for a deployment to get right.
 type Client struct {
 	ServerURL      string
 	OperatorSecret string
 	HTTP           *http.Client
+	// DueURL overrides the due endpoint derived from ServerURL. Empty means
+	// "<ServerURL>/network/provider-egress-due".
+	DueURL string
 }
 
 type submitBody struct {
