@@ -49,7 +49,13 @@ const (
 	// sources did -- but the provider still has no location, so the attempt
 	// must count.
 	FailureNotConfident = "not_confident"
-	// FailureSubmit: the location was good and the server would not take it.
+	// FailureSubmit: the location was country-confident and submitting it
+	// still failed. Usually the server would not take it (a rejection, a 5xx,
+	// a dead connection), but not always: the submitter also refuses some
+	// results locally, before any request is made -- ingest.ErrMissingProbedAt
+	// and ingest.ErrIncompleteCountry are pre-flight rejections in which the
+	// server is never contacted. Either way the provider has no recorded
+	// location, which is what this class reports.
 	FailureSubmit = "submit_failed"
 )
 
