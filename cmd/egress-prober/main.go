@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -47,11 +48,13 @@ func main() {
 	byJwt := flag.String("by-jwt", "", "the prober's network client jwt; prefer the UR_PROBER_BY_JWT env var, which keeps it out of ps (required)")
 	operatorSecret := flag.String("operator-secret", "", "ingest secret, must match ingest_secret in provider_egress.yml; prefer the UR_OPERATOR_SECRET env var, which keeps it out of ps (required)")
 	concurrency := flag.Int("concurrency", 4, "max simultaneous provider tunnels")
-	cacheTTL := flag.Duration("cache-ttl", 24*time.Hour, "do not re-probe a provider within this window")
+	cacheTTL := flag.Duration("cache-ttl", 24*time.Hour, "do not re-probe a provider within this window. Only applies to the enumeration fallback used against a server with no due endpoint; when the server supplies the due list it owns the schedule")
 	interval := flag.Duration("interval", time.Hour, "sleep between passes; 0 runs a single pass and exits")
 	probeTimeout := flag.Duration("probe-timeout", 60*time.Second, "per-provider probe timeout, and the per-source deadline within a probe")
 	skipConfinementCheck := flag.Bool("skip-confinement-check", false, "DANGEROUS: start even if this host can reach a geolocation api directly. Only for a one-shot manual probe on a host you know is not the operator's; a direct lookup records the OPERATOR's location for the provider and exposes the operator's address to the api")
 	confinementTimeout := flag.Duration("confinement-timeout", 3*time.Second, "per-address deadline for the startup confinement self-check; a timeout counts as blocked")
+	dueURL := flag.String("due-url", "", "url of the server's due-provider endpoint; empty derives <api-url>/network/provider-egress-due")
+	dueLimit := flag.Int("due-limit", 100, "how many due providers to ask the server for per pass; the server clamps this to its own maximum (500)")
 	flag.Parse()
 
 	// Env fallback, applied only after parsing so the secret is never a flag
@@ -102,6 +105,15 @@ func main() {
 		os.Exit(2)
 	}
 
+	// The server answers 400 to a non-positive limit rather than clamping it:
+	// limit=0 would come back as an empty list, indistinguishable from
+	// "nothing is due". Fail here instead of once per pass.
+	if *dueLimit < 1 {
+		fmt.Fprintf(os.Stderr, "egress-prober: -due-limit must be positive (got %d)\n\n", *dueLimit)
+		flag.Usage()
+		os.Exit(2)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -132,45 +144,14 @@ func main() {
 		Version:           "0.0.0",
 	}
 
-	submitter := &ingest.Client{
+	operator := &ingest.Client{
 		ServerURL:      *apiURL,
 		OperatorSecret: *operatorSecret,
+		DueURL:         *dueURL,
 		HTTP:           &http.Client{Timeout: 30 * time.Second},
 	}
 
-	p := &prober.Prober{
-		Open: func(ctx context.Context, providerClientId string) (*http.Client, func() error, error) {
-			id, err := connect.ParseId(providerClientId)
-			if err != nil {
-				return nil, nil, err
-			}
-			t, err := providertunnel.Open(ctx, tunnelCfg, id)
-			if err != nil {
-				return nil, nil, err
-			}
-			return t.HTTPClient(*probeTimeout), t.Close, nil
-		},
-		// -probe-timeout must govern the per-source deadline too, not just
-		// the http.Client's overall timeout. geolocate caps each source fetch
-		// independently, and until this was wired the cap was always the 5s
-		// package default, so raising -probe-timeout could not extend the
-		// deadline that actually matters. Every probe runs over a cold tunnel
-		// -- no warm-up, closed again after each provider -- so that one
-		// budget has to cover session establishment, an in-tunnel DoH
-		// resolution, and two TLS handshakes.
-		Locate: func(ctx context.Context, client *http.Client) (*geolocate.ConsensusLocation, error) {
-			return geolocate.LocateWithOptions(ctx, client, geolocate.LocateOptions{
-				PerSourceTimeout: *probeTimeout,
-			})
-		},
-		Submit: submitter,
-	}
-
-	scheduler := &prober.Scheduler{
-		Prober:      p,
-		Concurrency: *concurrency,
-		CacheTTL:    *cacheTTL,
-	}
+	dueScheduler, enumScheduler := newSchedulers(newProber(tunnelCfg, *probeTimeout, operator), *concurrency, *cacheTTL)
 
 	// I3: a single-shot run (-interval 0) is the mode the README recommends
 	// for external cron/systemd scheduling, which decides success or
@@ -189,17 +170,21 @@ func main() {
 	// log clearly so the failure is visible (e.g. via journalctl) even
 	// though the process itself stays up.
 	for {
-		providers, err := listProviders(ctx, *apiURL, *byJwt)
+		providers, serverDriven, err := selectProviders(ctx, operator, *dueLimit, *apiURL, *byJwt)
 		if err != nil {
-			log.Printf("list providers: %s", err)
+			log.Printf("select providers: %s", err)
 			if *interval == 0 {
 				log.Printf("egress-prober: single-shot pass could not fetch the provider list; exiting non-zero")
 				os.Exit(1)
 			}
 		} else {
+			scheduler := enumScheduler
+			if serverDriven {
+				scheduler = dueScheduler
+			}
 			sum := scheduler.Run(ctx, providers)
-			log.Printf("pass: attempted=%d submitted=%d skipped=%d failed=%d",
-				sum.Attempted, sum.Submitted, sum.Skipped, sum.Failed)
+			log.Printf("pass: server_driven=%t attempted=%d submitted=%d skipped=%d failed=%d",
+				serverDriven, sum.Attempted, sum.Submitted, sum.Skipped, sum.Failed)
 			if *interval == 0 && sum.Submitted == 0 && 0 < sum.Failed {
 				log.Printf("egress-prober: single-shot pass submitted nothing and recorded %d failure(s); exiting non-zero", sum.Failed)
 				os.Exit(1)
@@ -213,6 +198,101 @@ func main() {
 			return
 		case <-time.After(*interval):
 		}
+	}
+}
+
+// newProber wires the production prober: a tunnel per provider, the
+// geolocation consensus through it, submission and attempt reporting to the
+// operator's server.
+//
+// Attempts is not optional in production. The server defers a provider from
+// the due queue when a probe was recently ATTEMPTED, not only when one
+// succeeded, so a prober that does not report leaves every unprobeable
+// provider at the head of the queue forever -- see prober.ProbeOne.
+func newProber(tunnelCfg providertunnel.Config, probeTimeout time.Duration, operator *ingest.Client) *prober.Prober {
+	return &prober.Prober{
+		Open: func(ctx context.Context, providerClientId string) (*http.Client, func() error, error) {
+			id, err := connect.ParseId(providerClientId)
+			if err != nil {
+				return nil, nil, err
+			}
+			t, err := providertunnel.Open(ctx, tunnelCfg, id)
+			if err != nil {
+				return nil, nil, err
+			}
+			return t.HTTPClient(probeTimeout), t.Close, nil
+		},
+		// -probe-timeout must govern the per-source deadline too, not just
+		// the http.Client's overall timeout. geolocate caps each source fetch
+		// independently, and until this was wired the cap was always the 5s
+		// package default, so raising -probe-timeout could not extend the
+		// deadline that actually matters. Every probe runs over a cold tunnel
+		// -- no warm-up, closed again after each provider -- so that one
+		// budget has to cover session establishment, an in-tunnel DoH
+		// resolution, and two TLS handshakes.
+		Locate: func(ctx context.Context, client *http.Client) (*geolocate.ConsensusLocation, error) {
+			return geolocate.LocateWithOptions(ctx, client, geolocate.LocateOptions{
+				PerSourceTimeout: probeTimeout,
+			})
+		},
+		Submit:   operator,
+		Attempts: operator,
+	}
+}
+
+// newSchedulers returns the scheduler for a server-driven pass and the one for
+// the enumeration fallback.
+//
+// They are separate because the two passes have different schedules and must
+// not share a cache. When the server picks the batch it owns the schedule --
+// observed_at and attempt_at in its database, which survive a prober restart --
+// so re-filtering that batch through an in-memory ttl would drop providers the
+// server just said were due, with the two schedules disagreeing and no way to
+// tell which won. The fallback pass has no server-side schedule behind it, so
+// it keeps the -cache-ttl behaviour exactly as before.
+func newSchedulers(p *prober.Prober, concurrency int, cacheTTL time.Duration) (dueScheduler *prober.Scheduler, enumScheduler *prober.Scheduler) {
+	return &prober.Scheduler{
+			Prober:      p,
+			Concurrency: concurrency,
+			CacheTTL:    0,
+		}, &prober.Scheduler{
+			Prober:      p,
+			Concurrency: concurrency,
+			CacheTTL:    cacheTTL,
+		}
+}
+
+// dueLister is the server's due-provider endpoint, injected so selectProviders
+// is testable without one.
+type dueLister interface {
+	Due(ctx context.Context, limit int) ([]string, error)
+}
+
+// selectProviders returns the providers to probe this pass, and whether the
+// server chose them.
+//
+// The server's due list is authoritative when it answers: it is computed from
+// observed_at and attempt_at in the database, so it survives a prober restart
+// and does not re-probe the whole population after one.
+//
+// Exactly one error falls back to enumerating the population locally: 404,
+// meaning the server has not deployed the endpoint. Everything else surfaces.
+// A 401 in particular must NOT fall back -- that is a wrong operator secret,
+// and quietly degrading to enumeration would produce a full-looking pass whose
+// every submission is rejected by that same secret, hiding the actual fault.
+func selectProviders(ctx context.Context, due dueLister, limit int, apiURL string, byJwt string) ([]string, bool, error) {
+	ids, err := due.Due(ctx, limit)
+	switch {
+	case err == nil:
+		return ids, true, nil
+	case errors.Is(err, ingest.ErrDueUnsupported):
+		log.Printf("egress-prober: the server has no %s endpoint; falling back to enumerating every provider (upgrade the server to let it schedule probes)", "/network/provider-egress-due")
+		ids, err := listProviders(ctx, apiURL, byJwt)
+		return ids, false, err
+	case errors.Is(err, ingest.ErrUnauthorized):
+		return nil, false, fmt.Errorf("the server rejected the operator secret; check -operator-secret against ingest_secret in the server's provider_egress.yml: %w", err)
+	default:
+		return nil, false, err
 	}
 }
 

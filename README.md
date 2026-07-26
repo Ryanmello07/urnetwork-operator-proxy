@@ -13,6 +13,8 @@ a consensus, and submits the result to the operator's server.
 
 - The prober host never queries a geolocation api directly — every lookup
   egresses through a provider, so the api reports *that provider's* location.
+  The prober refuses to start unless it has verified it *cannot* reach those
+  apis directly (see "Confinement" below).
 - The lookups are TLS-pinned, so a provider on the path cannot forge a location.
 - Country is the trusted output. City is recorded only when at least two sources
   agree (free sources disagree on city often), otherwise the location is
@@ -57,13 +59,69 @@ single pass and exit, useful for driving the prober from an external
 cron/systemd timer instead of its own sleep loop; `-interval` must not be
 negative).
 
-Each pass enumerates providers broadly and stably: it fetches every
-location that currently has at least one provider from the operator's
-server, then asks for the providers at each of those locations and unions
-the results. This is deliberate — asking for only the server's own
-"best available" guess would enumerate exactly the providers the server's
-geo database *already* believes are in a given place, which is the inverse
-of what a location-correcting probe needs to cover.
+### Confinement (required)
+
+The prober **refuses to start** unless it is confined: at startup it attempts a
+direct TCP connection to every geolocation endpoint and exits non-zero if any of
+them accepts one.
+
+The confinement itself is supplied by the deployment, not by this process —
+under Docker Compose a restricted network, otherwise a systemd unit with
+
+```ini
+IPAddressDeny=any
+IPAddressAllow=<the operator's api/platform addresses>
+```
+
+Both mechanisms are outside this process and neither is portably inspectable, so
+the prober tests the *property* instead of the mechanism: if a direct connection
+succeeds, the confinement is missing and the prober will not run. Without it, a
+probe that fails to tunnel would fall back to the host's own egress and record
+**the operator's** location for that provider — and hand the operator's address
+to three third-party APIs. The addresses tested are derived from
+`geolocate.SourceHosts()`, so there is no second endpoint list to drift.
+
+Under a working deny-all confinement, DNS is blocked too; unresolvable hosts are
+tested by name rather than dropped, so the check never quietly shrinks to
+nothing.
+
+`-skip-confinement-check` disables it. It defaults to **false**, logs two
+`WARNING` lines when set, and exists only for an operator running a one-shot
+manual probe from a host that is not the operator's. Do not set it in a
+deployment.
+
+### Which providers get probed
+
+When the server implements `GET /network/provider-egress-due`, it chooses: those
+whose stored egress location has gone stale, those never probed, and those not
+attempted within its backoff, oldest first. That schedule lives in the database,
+so it survives a prober restart instead of re-probing the whole population after
+one. `-due-limit` (default 100, server-clamped to 500) sizes the batch;
+`-due-url` overrides the derived endpoint.
+
+The prober reports **every attempt** back to
+`POST /network/provider-egress-attempt`, success or failure, with a short failure
+class (`tunnel_failed`, `no_consensus`, `locate_failed`, `not_confident`,
+`submit_failed`). This is load-bearing, not telemetry: the server defers a
+provider from the due queue when a probe was recently *attempted*, and a
+provider that can never be probed successfully never gets a location row — so
+without the report it sorts to the head of the queue on every poll forever and
+starves every healthy provider, silently, because the endpoint keeps returning a
+full plausible batch.
+
+If the due endpoint returns **404** the server has not deployed it, and the
+prober falls back to enumerating providers itself (below) with the `-cache-ttl`
+in-memory window applied, exactly as before. A **401** does *not* fall back: that
+is a wrong `-operator-secret`, and degrading quietly would produce a
+full-looking pass whose every submission the same secret rejects.
+
+The enumeration fallback is broad and stable: it fetches every location that
+currently has at least one provider from the operator's server, then asks for
+the providers at each of those locations and unions the results. This is
+deliberate — asking for only the server's own "best available" guess would
+enumerate exactly the providers the server's geo database *already* believes are
+in a given place, which is the inverse of what a location-correcting probe needs
+to cover.
 
 **Exit codes**, relevant when driving `-interval 0` from cron/systemd:
 the process exits non-zero if the provider list could not be fetched at
