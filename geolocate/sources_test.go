@@ -1,6 +1,9 @@
 package geolocate
 
-import "testing"
+import (
+	"net/url"
+	"testing"
+)
 
 func TestParseIpPn(t *testing.T) {
 	b := []byte(`{"query":"74.50.11.113","status":"success","country":"United States","countryCode":"US","city":"Fairfax","regionName":"","asn":401486,"mobile":false,"proxy":false,"hosting":false}`)
@@ -154,5 +157,42 @@ func TestSourcesTable(t *testing.T) {
 		if _, ok := SourcePriority[s.Name]; !ok {
 			t.Fatalf("source %q has no entry in SourcePriority (consensus.go); tables have drifted apart", s.Name)
 		}
+	}
+}
+
+// TestSourceHostsCoversEverySource is an anti-drift test. SourceHosts is what
+// the confinement self-check probes: if a source is added to the table above
+// and its host does not come out of SourceHosts, the check silently stops
+// covering a real geolocation endpoint while still reporting success.
+func TestSourceHostsCoversEverySource(t *testing.T) {
+	hosts := SourceHosts()
+	if len(hosts) == 0 {
+		t.Fatal("SourceHosts is empty; the confinement check would have nothing to test")
+	}
+	for _, s := range sources {
+		u, err := url.Parse(s.URL)
+		if err != nil {
+			t.Fatalf("source %q has an unparseable URL %q: %s", s.Name, s.URL, err)
+		}
+		found := false
+		for _, h := range hosts {
+			if h == u.Hostname() {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("source %q (%s) has no host in SourceHosts %v; the confinement check would not cover it", s.Name, s.URL, hosts)
+		}
+	}
+	seen := map[string]bool{}
+	for _, h := range hosts {
+		if h == "" {
+			t.Fatalf("SourceHosts contains an empty host: %v", hosts)
+		}
+		if seen[h] {
+			t.Fatalf("SourceHosts contains %q twice: %v", h, hosts)
+		}
+		seen[h] = true
 	}
 }
