@@ -336,3 +336,117 @@ func TestConsensusDisplayFieldsIgnoreEmptyFromTrustedSource(t *testing.T) {
 		t.Errorf("Region = %q, want \"Colorado\": the higher-priority source supplied no region", loc.Region)
 	}
 }
+
+// TestConsensusCityAgreementAcrossNameVariants is the regression test for the
+// real German probe that motivated the place-name matcher: ip.pn returned no
+// city at all, freeipapi returned "Frankfurt am Main (Innenstadt I)" (city
+// plus city district) and ipinfo returned "Frankfurt am Main". Two sources
+// agreed on Frankfurt in substance, but exact normalized string matching saw
+// two different cities, so the whole city result -- and the region with it --
+// was discarded and the provider fell back to country granularity.
+//
+// The two variants must now agree, and the canonical name must be the
+// SHORTEST variant the agreeing sources support: "Frankfurt am Main", not the
+// district-qualified form only one source asserted.
+func TestConsensusCityAgreementAcrossNameVariants(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "ip.pn", OK: true, CountryCode: "DE", Country: "Germany"},
+		{Name: "freeipapi", OK: true, CountryCode: "DE", Country: "Germany", City: "Frankfurt am Main (Innenstadt I)", Region: "Hesse"},
+		{Name: "ipinfo", OK: true, CountryCode: "DE", City: "Frankfurt am Main", Region: "Hesse"},
+	}
+	loc := consensus(ok)
+	if !loc.CityConfident {
+		t.Fatal("freeipapi and ipinfo both report Frankfurt am Main (one with a district suffix); CityConfident must be true")
+	}
+	if loc.City != "Frankfurt am Main" {
+		t.Fatalf("City = %q, want \"Frankfurt am Main\" (the shortest variant both sources support)", loc.City)
+	}
+	if loc.Region != "Hesse" {
+		t.Fatalf("Region = %q, want \"Hesse\"", loc.Region)
+	}
+	if !loc.CountryConfident || loc.CountryCode != "de" {
+		t.Fatalf("CountryConfident = %v, CountryCode = %q, want true / \"de\"", loc.CountryConfident, loc.CountryCode)
+	}
+}
+
+// TestConsensusCityCanonicalNameIsShortestVariant pins the canonical-name
+// rule against the source-priority rule that decides everything else: the
+// SHORTEST agreeing variant wins even when it comes from the LEAST trusted
+// source. The shortest variant is exactly the assertion every agreeing source
+// supports; ip.pn's "Frankfurt am Main" adds specificity that ipinfo never
+// confirmed, and the server stores the submitted name permanently.
+func TestConsensusCityCanonicalNameIsShortestVariant(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "ip.pn", OK: true, CountryCode: "DE", Country: "Germany", City: "Frankfurt am Main", Region: "Hesse"},
+		{Name: "ipinfo", OK: true, CountryCode: "DE", City: "Frankfurt", Region: "Hesse"},
+	}
+	loc := consensus(ok)
+	if !loc.CityConfident {
+		t.Fatal("\"Frankfurt\" and \"Frankfurt am Main\" agree; CityConfident must be true")
+	}
+	if loc.City != "Frankfurt" {
+		t.Fatalf("City = %q, want \"Frankfurt\": the shortest variant wins over the more-trusted source's longer one", loc.City)
+	}
+}
+
+// TestConsensusCityCanonicalNamePreservesDiacritics pins that the display
+// name comes from a source's original string and not from the normalized
+// match tokens. Accent folding exists only to make "Logroño" and "logrono"
+// agree; the stored name must still be "Logroño". Token count ties fall back
+// to SourcePriority, so ip.pn's rendering wins here.
+func TestConsensusCityCanonicalNamePreservesDiacritics(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "freeipapi", OK: true, CountryCode: "ES", Country: "Spain", City: "logrono", Region: "La Rioja"},
+		{Name: "ip.pn", OK: true, CountryCode: "ES", Country: "Spain", City: "Logroño", Region: "La Rioja"},
+	}
+	loc := consensus(ok)
+	if !loc.CityConfident {
+		t.Fatal("\"logrono\" and \"Logroño\" are the same city after accent folding; CityConfident must be true")
+	}
+	if loc.City != "Logroño" {
+		t.Fatalf("City = %q, want \"Logroño\": the display name is rendered from the original string, never from the folded tokens", loc.City)
+	}
+}
+
+// TestConsensusRegionVariantsMerge exercises the matcher on the region, the
+// reason it is applied there too: CityConfident requires a non-empty region,
+// so region renderings that only differ by a parenthetical must resolve to
+// the shortest form rather than storing one source's qualifier.
+func TestConsensusRegionVariantsMerge(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "freeipapi", OK: true, CountryCode: "DE", Country: "Germany", City: "Frankfurt am Main", Region: "Hesse (HE)"},
+		{Name: "ipinfo", OK: true, CountryCode: "DE", City: "Frankfurt am Main", Region: "Hesse"},
+	}
+	loc := consensus(ok)
+	if !loc.CityConfident {
+		t.Fatal("both sources report Frankfurt am Main with a region; CityConfident must be true")
+	}
+	if loc.Region != "Hesse" {
+		t.Fatalf("Region = %q, want \"Hesse\": the parenthetical qualifier is not part of the corroborated name", loc.Region)
+	}
+}
+
+// TestConsensusEmptyCitiesDoNotAgree is the safety complement of the wider
+// matching rule: two sources that both reported no city have NOT agreed on a
+// city. If an empty name matched an empty name, two silent sources would
+// clear the >= 2 threshold and produce CityConfident with an empty City --
+// a submission the server rejects, uncached, forever.
+func TestConsensusEmptyCitiesDoNotAgree(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "ip.pn", OK: true, CountryCode: "DE", Country: "Germany", Region: "Hesse"},
+		{Name: "ipinfo", OK: true, CountryCode: "DE", Region: "Hesse"},
+	}
+	loc := consensus(ok)
+	if loc.CityConfident {
+		t.Fatal("neither source named a city; CityConfident must be false")
+	}
+	if loc.City != "" {
+		t.Fatalf("City = %q, want empty", loc.City)
+	}
+	if loc.Region != "" {
+		t.Fatalf("Region = %q, want empty when there is no agreed city", loc.Region)
+	}
+	if !loc.CountryConfident {
+		t.Fatal("the country result must be unaffected")
+	}
+}

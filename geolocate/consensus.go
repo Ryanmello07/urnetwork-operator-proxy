@@ -6,10 +6,6 @@ func normalizeCountry(code string) string {
 	return strings.ToLower(strings.TrimSpace(code))
 }
 
-func normalizeCity(city string) string {
-	return strings.ToLower(strings.TrimSpace(city))
-}
-
 // isAlpha2 reports whether code is exactly two ASCII letters, the shape the
 // server requires of country_code. It is deliberately ASCII-only: ISO-3166-1
 // alpha-2 codes are ASCII by definition, and a non-ASCII two-rune string is a
@@ -116,6 +112,85 @@ func (d displayField) get(c string) string {
 	return d.value[c]
 }
 
+// agreeOnPlace groups the results whose place name (selected by get) agree
+// with each other under the placename.go matcher, and returns the largest
+// such group -- the set of sources that corroborate one place.
+//
+// Every member of the returned group matches every other member PAIRWISE,
+// which matters because the match relation is not transitive: "Frankfurt"
+// matches "Frankfurt am Main" and "Frankfurt Oder", but those two do not
+// match each other. Pairwise-matching is equivalent to the group forming a
+// chain under the token-prefix order, and a set of token sequences is a chain
+// exactly when all of them are prefixes of the longest one -- so building the
+// candidate group around each result in turn (everything that prefixes it)
+// enumerates every maximal group, in O(n^2) over at most a handful of
+// sources.
+//
+// Results with no tokens (empty or punctuation-only names) never join a
+// group: a source that named no place cannot corroborate one that did.
+//
+// Ties are broken the same way the rest of consensus breaks them -- by
+// SourcePriority, most-trusted contributing source first -- and finally by
+// position, so the result never depends on map iteration order.
+func agreeOnPlace(ok []SourceResult, get func(SourceResult) string) []SourceResult {
+	tokens := make([][]string, len(ok))
+	for i, r := range ok {
+		tokens[i] = PlaceTokens(get(r))
+	}
+
+	var best []SourceResult
+	bestRank := 0
+	for i := range ok {
+		if len(tokens[i]) == 0 {
+			continue
+		}
+		var group []SourceResult
+		rank := unknownSourceRank
+		for j := range ok {
+			if tokensPrefixOrEqual(tokens[j], tokens[i]) {
+				group = append(group, ok[j])
+				if r := sourceRank(ok[j].Name); r < rank {
+					rank = r
+				}
+			}
+		}
+		if len(best) < len(group) || (len(best) == len(group) && rank < bestRank) {
+			best, bestRank = group, rank
+		}
+	}
+	return best
+}
+
+// canonicalPlace renders the display name for a group returned by
+// agreeOnPlace: the SHORTEST variant in the group, by token count.
+//
+// The shortest variant is exactly the assertion every source in the group
+// supports -- "Frankfurt am Main" when one source said that and another said
+// "Frankfurt am Main (Innenstadt I)". Picking a longer one would publish a
+// specificity that not every agreeing source confirmed, and the server
+// canonicalizes and permanently stores the name it is given. Ties in token
+// count are broken by SourcePriority, consistent with how the other display
+// fields resolve, and then by position for determinism.
+//
+// The name is rendered from the winning source's ORIGINAL string (via
+// PlaceDisplay, which only drops parentheticals and collapses whitespace),
+// never from the normalized tokens, so casing and diacritics survive:
+// "Logroño", not "logrono".
+func canonicalPlace(group []SourceResult, get func(SourceResult) string) string {
+	best, bestN, bestRank := "", 0, 0
+	for _, r := range group {
+		n := len(PlaceTokens(get(r)))
+		if n == 0 {
+			continue
+		}
+		rank := sourceRank(r.Name)
+		if best == "" || n < bestN || (n == bestN && rank < bestRank) {
+			best, bestN, bestRank = PlaceDisplay(get(r)), n, rank
+		}
+	}
+	return best
+}
+
 // consensus computes a ConsensusLocation from successful source results.
 // Callers pass only results with OK == true. It does not enforce the quorum
 // (Locate does that before calling); with a single result it simply yields a
@@ -189,40 +264,11 @@ func consensus(ok []SourceResult) ConsensusLocation {
 		}
 	}
 
-	// city: set only if >= 2 sources agree on the normalized city.
-	// Same tie-break as country: most-trusted contributing source first,
-	// lexicographic order only as a last-resort tiebreaker.
-	cityCounts := map[string]int{}
-	cityDisplay := newDisplayField()
-	cityRegion := newDisplayField()
-	cityRank := map[string]int{}
-	cityHasRank := map[string]bool{}
-	for _, r := range ok {
-		c := normalizeCity(r.City)
-		if c == "" {
-			continue
-		}
-		cityCounts[c]++
-		cityDisplay.offer(c, r.City, sourceRank(r.Name))
-		cityRegion.offer(c, r.Region, sourceRank(r.Name))
-		rank := sourceRank(r.Name)
-		if !cityHasRank[c] || rank < cityRank[c] {
-			cityRank[c] = rank
-			cityHasRank[c] = true
-		}
-	}
-	bestCity, bestCityN, bestCityRank := "", 0, 0
-	for c, n := range cityCounts {
-		rank := cityRank[c]
-		switch {
-		case n > bestCityN:
-			bestCity, bestCityN, bestCityRank = c, n, rank
-		case n == bestCityN && rank < bestCityRank:
-			bestCity, bestCityRank = c, rank
-		case n == bestCityN && rank == bestCityRank && c < bestCity:
-			bestCity = c
-		}
-	}
+	// city: set only if >= 2 sources agree on the city, where "agree" is the
+	// place-name match of placename.go (equal, or one a token-prefix of the
+	// other) rather than exact normalized string equality. The threshold is
+	// unchanged; only the definition of agreement is wider.
+	agreeing := agreeOnPlace(ok, func(r SourceResult) string { return r.City })
 	// CityConfident requires both city agreement AND a resolved Region: the
 	// server rejects any city-confident submission with an empty region,
 	// and that rejection kills the whole POST -- including a perfectly good
@@ -230,10 +276,22 @@ func consensus(ok []SourceResult) ConsensusLocation {
 	// one (never fabricated), so when no agreeing source named a region,
 	// degrade cleanly to country granularity instead of submitting an
 	// incomplete record: leave City/Region empty and CityConfident false.
-	if bestCityN >= 2 && cityRegion.get(bestCity) != "" {
-		loc.City = cityDisplay.get(bestCity)
-		loc.Region = cityRegion.get(bestCity)
-		loc.CityConfident = true
+	if len(agreeing) >= 2 {
+		// The region is resolved among the agreeing sources only, and with
+		// the same matcher: it is the same class of problem as the city
+		// ("Hesse" vs "Hesse " vs "Hesse (HE)"), and since CityConfident
+		// requires a non-empty region, region variants that failed to merge
+		// would keep discarding city results even after the city itself
+		// started matching. Unlike the city there is no >= 2 threshold --
+		// the region has never been voted on, it is carried from whichever
+		// agreeing source supplied one -- so a lone region still wins.
+		regionGet := func(r SourceResult) string { return r.Region }
+		region := canonicalPlace(agreeOnPlace(agreeing, regionGet), regionGet)
+		if region != "" {
+			loc.City = canonicalPlace(agreeing, func(r SourceResult) string { return r.City })
+			loc.Region = region
+			loc.CityConfident = true
+		}
 	}
 
 	// asn: plurality over non-zero ASNs (a single vote is enough; it's a bonus signal).
