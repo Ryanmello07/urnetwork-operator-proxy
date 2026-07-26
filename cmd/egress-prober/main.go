@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -25,6 +26,7 @@ import (
 	gojwt "github.com/golang-jwt/jwt/v5"
 	"github.com/urnetwork/connect"
 
+	"github.com/urnetwork/urnetwork-operator-proxy/confinement"
 	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
 	"github.com/urnetwork/urnetwork-operator-proxy/ingest"
 	"github.com/urnetwork/urnetwork-operator-proxy/prober"
@@ -48,6 +50,8 @@ func main() {
 	cacheTTL := flag.Duration("cache-ttl", 24*time.Hour, "do not re-probe a provider within this window")
 	interval := flag.Duration("interval", time.Hour, "sleep between passes; 0 runs a single pass and exits")
 	probeTimeout := flag.Duration("probe-timeout", 60*time.Second, "per-provider probe timeout, and the per-source deadline within a probe")
+	skipConfinementCheck := flag.Bool("skip-confinement-check", false, "DANGEROUS: start even if this host can reach a geolocation api directly. Only for a one-shot manual probe on a host you know is not the operator's; a direct lookup records the OPERATOR's location for the provider and exposes the operator's address to the api")
+	confinementTimeout := flag.Duration("confinement-timeout", 3*time.Second, "per-address deadline for the startup confinement self-check; a timeout counts as blocked")
 	flag.Parse()
 
 	// Env fallback, applied only after parsing so the secret is never a flag
@@ -98,13 +102,24 @@ func main() {
 		os.Exit(2)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// The confinement self-check runs before anything else touches the
+	// network. See checkConfinement.
+	if *skipConfinementCheck {
+		log.Printf("egress-prober: WARNING -skip-confinement-check is set: the startup confinement self-check is DISABLED.")
+		log.Printf("egress-prober: WARNING if this host can reach a geolocation api directly, a probe that fails to tunnel records the OPERATOR's own location for the provider and exposes the operator's address to third-party apis. Do not set this on the operator's deployment.")
+	} else if err := checkConfinement(ctx, (&net.Dialer{}).DialContext, net.DefaultResolver.LookupHost, *confinementTimeout); err != nil {
+		log.Printf("egress-prober: confinement self-check failed: %s", err)
+		log.Printf("egress-prober: this process must not be able to reach a geolocation api except through a provider tunnel. Confine it (a restricted docker network, or systemd IPAddressDeny=any with IPAddressAllow for the operator server only) and start it again.")
+		os.Exit(1)
+	}
+
 	clientId, err := parseByJwtClientId(*byJwt)
 	if err != nil {
 		log.Fatalf("parse by-jwt client id: %s", err)
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	tunnelCfg := providertunnel.Config{
 		ApiURL:            *apiURL,
@@ -199,6 +214,59 @@ func main() {
 		case <-time.After(*interval):
 		}
 	}
+}
+
+// confinementPort is the port the self-check dials. Every geolocate source is
+// https, and https is the only thing a geolocation lookup from this process
+// would ever be.
+const confinementPort = "443"
+
+// checkConfinement refuses to let the prober start unless a direct connection
+// to every geolocation endpoint fails.
+//
+// The prober's whole guarantee is that a geolocation api only ever sees a
+// provider's address, never the operator's. That is enforced OUTSIDE this
+// process, because the beta deployment runs docker compose and the mainstream
+// deployment does not use docker at all: a restricted docker network there,
+// systemd IPAddressDeny=any plus a narrow IPAddressAllow here. Neither
+// mechanism is inspectable portably, and creating a namespace for itself would
+// need CAP_NET_ADMIN on a component that runs completely unprivileged today.
+//
+// So the check tests the property rather than the mechanism. If a direct
+// connection succeeds, the confinement is absent and the prober exits: it does
+// not "try anyway", because the failure mode of trying is silent and
+// irreversible -- a probe that could not tunnel would record the OPERATOR's
+// location for that provider, and the operator's address would be handed to
+// three third-party apis.
+//
+// The addresses come from geolocate.SourceHosts, resolved here at startup, so
+// the repo holds exactly one endpoint list. A hand-maintained second copy
+// would drift on the first endpoint change and the check would keep passing
+// while no longer covering a real endpoint.
+//
+// This does not replace the Go-level fail-closed behaviour (lookups only ever
+// run on a tunnel-bound http.Client; providertunnel refuses any host outside
+// the pin allowlist). It is the outer layer that backs it.
+func checkConfinement(ctx context.Context, dial confinement.DialFunc, lookup confinement.LookupFunc, timeout time.Duration) error {
+	hosts := geolocate.SourceHosts()
+
+	// Resolution is bounded by the same budget as a dial: under a real
+	// deny-all confinement dns is blocked too, and an unbounded lookup would
+	// hang startup. Unresolvable hosts are kept as names by Addresses, so a
+	// blocked resolver shrinks the check's precision but never disables it.
+	resolveCtx, cancel := context.WithTimeout(ctx, timeout)
+	addrs, err := confinement.Addresses(resolveCtx, lookup, hosts, confinementPort)
+	cancel()
+	if err != nil {
+		return err
+	}
+
+	log.Printf("egress-prober: confinement self-check: %d geolocation host(s) -> %d address(es): %s", len(hosts), len(addrs), strings.Join(addrs, " "))
+	if err := confinement.Verify(ctx, dial, addrs, timeout); err != nil {
+		return err
+	}
+	log.Printf("egress-prober: confinement self-check passed: no geolocation address is directly reachable")
+	return nil
 }
 
 // envFallback fills *value from the named environment variable when the flag
