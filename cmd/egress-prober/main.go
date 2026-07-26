@@ -52,7 +52,9 @@ func main() {
 	interval := flag.Duration("interval", time.Hour, "sleep between passes; 0 runs a single pass and exits")
 	probeTimeout := flag.Duration("probe-timeout", 60*time.Second, "per-provider probe timeout, and the per-source deadline within a probe")
 	skipConfinementCheck := flag.Bool("skip-confinement-check", false, "DANGEROUS: start even if this host can reach a geolocation api directly. Only for a one-shot manual probe on a host you know is not the operator's; a direct lookup records the OPERATOR's location for the provider and exposes the operator's address to the api")
-	confinementTimeout := flag.Duration("confinement-timeout", 3*time.Second, "per-address deadline for the startup confinement self-check; a timeout counts as blocked")
+	confinementTimeout := flag.Duration("confinement-timeout", 3*time.Second, "per-address deadline for the startup confinement self-check; a timeout counts as blocked. Must be at least "+confinement.MinTimeout.String())
+	var confinementAddrs addressList
+	flag.Var(&confinementAddrs, "confinement-address", "ip:port the confinement self-check should dial instead of resolving the geolocation hosts; repeatable. For a jail where dns is legitimately blocked: supply every geolocation endpoint's address here and the check stays real. The host part must be an ip literal, not a name")
 	dueURL := flag.String("due-url", "", "url of the server's due-provider endpoint; empty derives <api-url>/network/provider-egress-due")
 	dueLimit := flag.Int("due-limit", 100, "how many due providers to ask the server for per pass; the server clamps this to its own maximum (500)")
 	flag.Parse()
@@ -105,6 +107,21 @@ func main() {
 		os.Exit(2)
 	}
 
+	// A tiny -confinement-timeout turns the self-check off while it keeps
+	// logging success, which is worse than turning it off honestly. The dial
+	// budget has to be long enough that a failure means "the packet did not get
+	// through"; below that every dial fails on the clock instead, every address
+	// looks blocked whether or not it is, and the check reports a pass having
+	// tested nothing. Observed on one unconfined host in the same second:
+	// -confinement-timeout 10ms correctly reported "not confined", 1ms reported
+	// "passed". Rejecting <= 0 was never enough -- the same reasoning applies to
+	// any value too short to complete a connection.
+	if *confinementTimeout < confinement.MinTimeout {
+		fmt.Fprintf(os.Stderr, "egress-prober: -confinement-timeout must be at least %s (got %s): a shorter deadline expires before a direct connection could complete, so every geolocation address would look blocked whether or not it is and the self-check would report a pass having tested nothing\n\n", confinement.MinTimeout, *confinementTimeout)
+		flag.Usage()
+		os.Exit(2)
+	}
+
 	// The server answers 400 to a non-positive limit rather than clamping it:
 	// limit=0 would come back as an empty list, indistinguishable from
 	// "nothing is due". Fail here instead of once per pass.
@@ -122,9 +139,14 @@ func main() {
 	if *skipConfinementCheck {
 		log.Printf("egress-prober: WARNING -skip-confinement-check is set: the startup confinement self-check is DISABLED.")
 		log.Printf("egress-prober: WARNING if this host can reach a geolocation api directly, a probe that fails to tunnel records the OPERATOR's own location for the provider and exposes the operator's address to third-party apis. Do not set this on the operator's deployment.")
-	} else if err := checkConfinement(ctx, (&net.Dialer{}).DialContext, net.DefaultResolver.LookupHost, *confinementTimeout); err != nil {
+	} else if err := checkConfinement(ctx, (&net.Dialer{}).DialContext, net.DefaultResolver.LookupHost, confinementAddrs, *confinementTimeout); err != nil {
 		log.Printf("egress-prober: confinement self-check failed: %s", err)
-		log.Printf("egress-prober: this process must not be able to reach a geolocation api except through a provider tunnel. Confine it (a restricted docker network, or systemd IPAddressDeny=any with IPAddressAllow for the operator server only) and start it again.")
+		// ErrNoEvidence is not a claim that this host is unconfined -- it is
+		// the check saying it could not find out -- so the "go and confine it"
+		// advice would be misleading. Its own message carries the two remedies.
+		if !errors.Is(err, confinement.ErrNoEvidence) {
+			log.Printf("egress-prober: this process must not be able to reach a geolocation api except through a provider tunnel. Confine it (a restricted docker network, or systemd IPAddressDeny=any with IPAddressAllow for the operator server only) and start it again.")
+		}
 		os.Exit(1)
 	}
 
@@ -301,6 +323,32 @@ func selectProviders(ctx context.Context, due dueLister, limit int, apiURL strin
 // would ever be.
 const confinementPort = "443"
 
+// addressList collects the repeatable -confinement-address flag.
+//
+// Each value must be "ip:port" with a literal address, not a name. A name here
+// would defeat the flag's entire purpose: it exists for the deployment where
+// dns is blocked, so a name could not be resolved at dial time either and the
+// check would be back to dialing something guaranteed to fail at resolution --
+// no evidence, reported as a pass.
+type addressList []string
+
+func (a *addressList) String() string { return strings.Join(*a, " ") }
+
+func (a *addressList) Set(v string) error {
+	host, port, err := net.SplitHostPort(v)
+	if err != nil {
+		return fmt.Errorf("%q is not host:port: %w", v, err)
+	}
+	if net.ParseIP(host) == nil {
+		return fmt.Errorf("%q: the host part must be an ip literal, not a name -- this flag exists for a jail where dns is blocked, and a name could not be resolved at dial time either", v)
+	}
+	if port == "" {
+		return fmt.Errorf("%q: a port is required", v)
+	}
+	*a = append(*a, v)
+	return nil
+}
+
 // checkConfinement refuses to let the prober start unless a direct connection
 // to every geolocation endpoint fails.
 //
@@ -327,25 +375,58 @@ const confinementPort = "443"
 // This does not replace the Go-level fail-closed behaviour (lookups only ever
 // run on a tunnel-bound http.Client; providertunnel refuses any host outside
 // the pin allowlist). It is the outer layer that backs it.
-func checkConfinement(ctx context.Context, dial confinement.DialFunc, lookup confinement.LookupFunc, timeout time.Duration) error {
+//
+// Inability to verify is not evidence of confinement. Every outcome in which
+// the check could not obtain real evidence is a refusal to start, never a
+// pass: no resolvable host (confinement.ErrNoEvidence), a timeout too short to
+// mean anything (confinement.ErrInvalidTimeout, rejected at flag validation),
+// an empty endpoint list. Hosts that fail to resolve are NOT dialed by name --
+// that dial fails at resolution and proves nothing -- and when only some of
+// them resolve, the shortfall is logged as a WARNING so a degraded check never
+// reads like a complete one.
+func checkConfinement(ctx context.Context, dial confinement.DialFunc, lookup confinement.LookupFunc, explicitAddrs []string, timeout time.Duration) error {
 	hosts := geolocate.SourceHosts()
 
-	// Resolution is bounded by the same budget as a dial: under a real
-	// deny-all confinement dns is blocked too, and an unbounded lookup would
-	// hang startup. Unresolvable hosts are kept as names by Addresses, so a
-	// blocked resolver shrinks the check's precision but never disables it.
-	resolveCtx, cancel := context.WithTimeout(ctx, timeout)
-	addrs, err := confinement.Addresses(resolveCtx, lookup, hosts, confinementPort)
-	cancel()
-	if err != nil {
-		return err
+	var addrs, unresolved []string
+	if len(explicitAddrs) > 0 {
+		// The escape hatch for a jail where dns legitimately cannot work.
+		// Resolution is skipped entirely and exactly these addresses are
+		// dialed, which keeps a real check available there instead of pushing
+		// the operator towards -skip-confinement-check, which is no check at
+		// all. Keeping them in sync with the geolocation endpoints is the
+		// operator's job, so the endpoint list is logged alongside them.
+		addrs = explicitAddrs
+		log.Printf("egress-prober: confinement self-check: dialing the %d address(es) given with -confinement-address, skipping resolution: %s (geolocation hosts: %s -- keep these addresses current with that list)",
+			len(addrs), strings.Join(addrs, " "), strings.Join(hosts, " "))
+	} else {
+		// Resolution is bounded by the same budget as a dial: under a real
+		// deny-all confinement dns is blocked too, and an unbounded lookup
+		// would hang startup.
+		resolveCtx, cancel := context.WithTimeout(ctx, timeout)
+		var err error
+		addrs, unresolved, err = confinement.Addresses(resolveCtx, lookup, hosts, confinementPort)
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		log.Printf("egress-prober: confinement self-check: %d geolocation host(s) -> %d address(es): %s", len(hosts), len(addrs), strings.Join(addrs, " "))
+		if 0 < len(unresolved) && 0 < len(addrs) {
+			log.Printf("egress-prober: WARNING confinement self-check is DEGRADED: %d of %d geolocation host(s) could not be resolved and were NOT tested: %s. Whether this host can reach them directly is unknown. Allow dns resolution for the prober, or pass -confinement-address <ip:port> for each of them.",
+				len(unresolved), len(hosts), strings.Join(unresolved, " "))
+		}
 	}
 
-	log.Printf("egress-prober: confinement self-check: %d geolocation host(s) -> %d address(es): %s", len(hosts), len(addrs), strings.Join(addrs, " "))
-	if err := confinement.Verify(ctx, dial, addrs, timeout); err != nil {
+	if err := confinement.Verify(ctx, dial, addrs, unresolved, timeout); err != nil {
+		if errors.Is(err, confinement.ErrNoEvidence) {
+			// The vacuous pass this replaced: with dns blocked, every host fell
+			// back to a bare name, every dial failed at resolution, and the
+			// check reported success without having tested one address.
+			return fmt.Errorf("%w -- allow dns resolution for the prober, or pass -confinement-address <ip:port> once per geolocation endpoint (%s) so the check dials them directly", err, strings.Join(hosts, " "))
+		}
 		return err
 	}
-	log.Printf("egress-prober: confinement self-check passed: no geolocation address is directly reachable")
+	log.Printf("egress-prober: confinement self-check passed: %d address(es) tested, none directly reachable", len(addrs))
 	return nil
 }
 

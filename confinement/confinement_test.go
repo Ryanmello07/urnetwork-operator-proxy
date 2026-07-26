@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -14,6 +15,12 @@ func dialRefused(ctx context.Context, network, addr string) (net.Conn, error) {
 	return nil, errors.New("connect: network is unreachable")
 }
 
+// lookupFails is a resolver that cannot answer, which is what a deny-all
+// confinement looks like from inside: dns to a public resolver is blocked too.
+func lookupFails(ctx context.Context, host string) ([]string, error) {
+	return nil, errors.New("lookup " + host + ": no such host")
+}
+
 func TestVerifyFailsWhenDirectConnectionSucceeds(t *testing.T) {
 	// a dialer that connects means nothing is stopping the prober reaching a
 	// geolocation api directly -- the confinement is absent and the whole
@@ -22,7 +29,7 @@ func TestVerifyFailsWhenDirectConnectionSucceeds(t *testing.T) {
 		c1, _ := net.Pipe()
 		return c1, nil
 	}
-	err := Verify(context.Background(), dial, []string{"34.117.59.81:443"}, time.Second)
+	err := Verify(context.Background(), dial, []string{"34.117.59.81:443"}, nil, time.Second)
 	if err == nil {
 		t.Fatal("Verify returned nil when a direct connection succeeded; it must refuse to run")
 	}
@@ -32,15 +39,41 @@ func TestVerifyFailsWhenDirectConnectionSucceeds(t *testing.T) {
 }
 
 func TestVerifyPassesWhenDirectConnectionRefused(t *testing.T) {
-	if err := Verify(context.Background(), dialRefused, []string{"34.117.59.81:443"}, time.Second); err != nil {
+	if err := Verify(context.Background(), dialRefused, []string{"34.117.59.81:443"}, nil, time.Second); err != nil {
 		t.Fatalf("Verify errored when the connection was refused: %s", err)
+	}
+}
+
+// TestVerifyTreatsADialTimeoutAsConfined pins the reading the whole check
+// depends on: a dropped packet is what a deny rule looks like from inside, so
+// a dial that runs out its budget without answering counts as REFUSED, not as
+// an inconclusive plumbing error and certainly not as a reachable address.
+// Nothing asserted this, and resolving it the other way would break the check
+// in the dangerous direction on the single most common shape of a real
+// firewall.
+func TestVerifyTreatsADialTimeoutAsConfined(t *testing.T) {
+	var timedOut int
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		<-ctx.Done() // the packet went nowhere, exactly as a DROP rule does
+		timedOut++
+		return nil, ctx.Err()
+	}
+	start := time.Now()
+	if err := Verify(context.Background(), dial, []string{"1.1.1.1:443"}, nil, MinTimeout); err != nil {
+		t.Fatalf("Verify error = %v, want nil: a dial that timed out is a blocked dial, which is the healthy outcome", err)
+	}
+	if timedOut != 1 {
+		t.Fatalf("the dialer was called %d time(s), want 1", timedOut)
+	}
+	if elapsed := time.Since(start); elapsed < MinTimeout {
+		t.Fatalf("Verify returned after %s, less than the %s budget; the dial was not actually allowed to time out", elapsed, MinTimeout)
 	}
 }
 
 func TestVerifyRequiresAtLeastOneAddress(t *testing.T) {
 	// an empty address list would vacuously "pass" and silently disable the
 	// entire check
-	if err := Verify(context.Background(), dialRefused, nil, time.Second); err == nil {
+	if err := Verify(context.Background(), dialRefused, nil, nil, time.Second); err == nil {
 		t.Fatal("Verify accepted an empty address list; that would disable the check")
 	}
 }
@@ -59,7 +92,7 @@ func TestVerifyChecksEveryAddress(t *testing.T) {
 		}
 		return nil, errors.New("connect: network is unreachable")
 	}
-	err := Verify(context.Background(), dial, []string{"1.1.1.1:443", "2.2.2.2:443"}, time.Second)
+	err := Verify(context.Background(), dial, []string{"1.1.1.1:443", "2.2.2.2:443"}, nil, time.Second)
 	if !errors.Is(err, ErrNotConfined) {
 		t.Fatalf("Verify error = %v, want ErrNotConfined; the second address accepted a direct connection", err)
 	}
@@ -76,7 +109,7 @@ func TestVerifyClosesTheConnectionItOpened(t *testing.T) {
 	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return c1, nil
 	}
-	if err := Verify(context.Background(), dial, []string{"1.1.1.1:443"}, time.Second); err == nil {
+	if err := Verify(context.Background(), dial, []string{"1.1.1.1:443"}, nil, time.Second); err == nil {
 		t.Fatal("Verify must refuse when a direct connection succeeded")
 	}
 	// the peer end of a closed pipe reports io.ErrClosedPipe rather than blocking
@@ -93,15 +126,101 @@ func TestVerifyClosesTheConnectionItOpened(t *testing.T) {
 // list, reached by a different route.
 func TestVerifyRejectsNonPositiveTimeout(t *testing.T) {
 	for _, timeout := range []time.Duration{0, -time.Second} {
-		if err := Verify(context.Background(), dialRefused, []string{"1.1.1.1:443"}, timeout); err == nil {
+		if err := Verify(context.Background(), dialRefused, []string{"1.1.1.1:443"}, nil, timeout); err == nil {
 			t.Fatalf("Verify accepted timeout=%s; an expired context makes every dial fail and the check vacuous", timeout)
 		}
 	}
 }
 
+// TestVerifyRejectsATimeoutBelowTheFloor is the same defect as a zero timeout
+// with a positive number in front of it, and it was the live hole: on one
+// unconfined host, in the same second, -confinement-timeout 10ms reported "not
+// confined" and 1ms reported "passed". Any budget too short for a connection
+// to have completed makes every dial fail on the clock rather than on a deny
+// rule, so the check reports success having tested nothing. Nothing below
+// MinTimeout is evidence.
+func TestVerifyRejectsATimeoutBelowTheFloor(t *testing.T) {
+	for _, timeout := range []time.Duration{time.Nanosecond, time.Millisecond, 10 * time.Millisecond, MinTimeout - time.Nanosecond} {
+		err := Verify(context.Background(), dialRefused, []string{"1.1.1.1:443"}, nil, timeout)
+		if err == nil {
+			t.Fatalf("Verify accepted timeout=%s; a dial that expires before a connection could complete proves nothing about confinement", timeout)
+		}
+		if !errors.Is(err, ErrInvalidTimeout) {
+			t.Fatalf("Verify(timeout=%s) error = %v, want ErrInvalidTimeout", timeout, err)
+		}
+	}
+	if err := Verify(context.Background(), dialRefused, []string{"1.1.1.1:443"}, nil, MinTimeout); err != nil {
+		t.Fatalf("Verify rejected the floor value %s itself: %s", MinTimeout, err)
+	}
+}
+
 func TestVerifyRequiresADialer(t *testing.T) {
-	if err := Verify(context.Background(), nil, []string{"1.1.1.1:443"}, time.Second); err == nil {
+	if err := Verify(context.Background(), nil, []string{"1.1.1.1:443"}, nil, time.Second); err == nil {
 		t.Fatal("Verify accepted a nil dialer")
+	}
+}
+
+// TestVerifyErrorsWhenNoHostResolved states the fail-closed rule directly:
+// inability to verify is not evidence of confinement. When every host failed to
+// resolve there is nothing to dial, so the check obtained no evidence at all --
+// and the deployment where that happens (deny-all with dns blocked, or a
+// compose stack started before its resolver settles) is exactly the one where a
+// false "passed" lets the prober record every provider at the operator's own
+// location. It must refuse to start, with an error distinguishable from
+// ErrNotConfined: this does not say the host is unconfined, it says the check
+// cannot tell.
+func TestVerifyErrorsWhenNoHostResolved(t *testing.T) {
+	hosts := []string{"ip.pn", "free.freeipapi.com", "ipinfo.io"}
+	addrs, unresolved, err := Addresses(context.Background(), lookupFails, hosts, "443")
+	if err != nil {
+		t.Fatalf("Addresses: %s", err)
+	}
+	if len(addrs) != 0 {
+		t.Fatalf("Addresses = %v, want nothing dialable when not one host resolved", addrs)
+	}
+	if len(unresolved) != len(hosts) {
+		t.Fatalf("unresolved = %v, want all %d hosts", unresolved, len(hosts))
+	}
+
+	err = Verify(context.Background(), dialRefused, addrs, unresolved, time.Second)
+	if err == nil {
+		t.Fatal("Verify returned nil although not one host resolved; the check tested nothing and must refuse to run rather than report a pass")
+	}
+	if !errors.Is(err, ErrNoEvidence) {
+		t.Fatalf("Verify error = %v, want ErrNoEvidence", err)
+	}
+	if errors.Is(err, ErrNotConfined) {
+		t.Fatalf("Verify error = %v, want ErrNoEvidence to stay distinguishable from ErrNotConfined: nothing was learned about whether this host is confined", err)
+	}
+	// the operator has to be told what to do about it
+	for _, want := range []string{"dns", "explicitly"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Verify error %q does not mention %q; the message must name both remedies", err, want)
+		}
+	}
+	// and which hosts were the problem
+	for _, host := range hosts {
+		if !strings.Contains(err.Error(), host) {
+			t.Errorf("Verify error %q does not name the unresolved host %q", err, host)
+		}
+	}
+}
+
+// TestVerifyStillChecksTheAddressesItHasWhenSomeHostsFailed: a partly working
+// resolver must not empty the check. What did resolve is still tested.
+func TestVerifyStillChecksTheAddressesItHasWhenSomeHostsFailed(t *testing.T) {
+	var dialed []string
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialed = append(dialed, addr)
+		c1, _ := net.Pipe()
+		return c1, nil
+	}
+	err := Verify(context.Background(), dial, []string{"1.1.1.1:443"}, []string{"b.example"}, time.Second)
+	if !errors.Is(err, ErrNotConfined) {
+		t.Fatalf("Verify error = %v, want ErrNotConfined; the one resolved address accepted a connection", err)
+	}
+	if len(dialed) != 1 || dialed[0] != "1.1.1.1:443" {
+		t.Fatalf("dialed %v, want only the resolved address", dialed)
 	}
 }
 
@@ -115,9 +234,12 @@ func TestAddressesResolvesEveryHost(t *testing.T) {
 		}
 		return nil, errors.New("no such host")
 	}
-	got, err := Addresses(context.Background(), lookup, []string{"a.example", "b.example"}, "443")
+	got, unresolved, err := Addresses(context.Background(), lookup, []string{"a.example", "b.example"}, "443")
 	if err != nil {
 		t.Fatalf("Addresses: %s", err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unresolved = %v, want none", unresolved)
 	}
 	want := []string{"1.1.1.1:443", "[2606:4700::1111]:443", "2.2.2.2:443"}
 	if len(got) != len(want) {
@@ -137,7 +259,7 @@ func TestAddressesDeduplicates(t *testing.T) {
 	lookup := func(ctx context.Context, host string) ([]string, error) {
 		return []string{"1.1.1.1"}, nil
 	}
-	got, err := Addresses(context.Background(), lookup, []string{"a.example", "b.example"}, "443")
+	got, _, err := Addresses(context.Background(), lookup, []string{"a.example", "b.example"}, "443")
 	if err != nil {
 		t.Fatalf("Addresses: %s", err)
 	}
@@ -146,48 +268,65 @@ func TestAddressesDeduplicates(t *testing.T) {
 	}
 }
 
-// TestAddressesFallsBackToTheHostnameWhenLookupFails is the bootstrap case, and
-// the reason resolution failure must not be fatal: under a real deny-all
-// confinement, dns to a public resolver is itself blocked, so resolving the
-// geolocation hosts fails. Dropping the host would shrink the address list --
-// and if every host failed, empty it, which Verify rejects, so the prober
-// would refuse to start precisely when it is correctly confined. Keeping the
-// hostname preserves the check: dialing it still has to fail, whether at
-// resolution or at connect.
-func TestAddressesFallsBackToTheHostnameWhenLookupFails(t *testing.T) {
+// TestAddressesNeverEmitsAnUnresolvedHostname is the defect this package was
+// shipping. A bare "ipinfo.io:443" handed to the production dialer resolves
+// through the very resolver that just failed, so the dial is guaranteed to fail
+// at resolution and carries no signal whatsoever about confinement -- yet it
+// counted as an address that "refused a direct connection". The host must be
+// reported as unresolved instead, so the caller can warn or refuse.
+func TestAddressesNeverEmitsAnUnresolvedHostname(t *testing.T) {
 	lookup := func(ctx context.Context, host string) ([]string, error) {
 		if host == "a.example" {
 			return []string{"1.1.1.1"}, nil
 		}
 		return nil, errors.New("lookup b.example: server misbehaving")
 	}
-	got, err := Addresses(context.Background(), lookup, []string{"a.example", "b.example"}, "443")
+	got, unresolved, err := Addresses(context.Background(), lookup, []string{"a.example", "b.example"}, "443")
 	if err != nil {
 		t.Fatalf("Addresses: %s", err)
 	}
-	want := map[string]bool{"1.1.1.1:443": true, "b.example:443": true}
-	if len(got) != 2 {
-		t.Fatalf("Addresses = %v, want one entry per host (%v)", got, want)
+	if len(got) != 1 || got[0] != "1.1.1.1:443" {
+		t.Fatalf("Addresses = %v, want exactly the resolved [1.1.1.1:443] and no hostname placeholder", got)
 	}
-	for _, addr := range got {
-		if !want[addr] {
-			t.Fatalf("Addresses = %v, want %v", got, want)
-		}
+	if len(unresolved) != 1 || unresolved[0] != "b.example" {
+		t.Fatalf("unresolved = %v, want [b.example]", unresolved)
 	}
 }
 
-// TestAddressesFallsBackWhenLookupReturnsNothing: a resolver that answers with
-// an empty record set is the same situation as one that errors.
-func TestAddressesFallsBackWhenLookupReturnsNothing(t *testing.T) {
+// TestAddressesTreatsAnEmptyRecordSetAsUnresolved: a resolver that answers with
+// no records is the same situation as one that errors.
+func TestAddressesTreatsAnEmptyRecordSetAsUnresolved(t *testing.T) {
 	lookup := func(ctx context.Context, host string) ([]string, error) {
 		return nil, nil
 	}
-	got, err := Addresses(context.Background(), lookup, []string{"a.example"}, "443")
+	got, unresolved, err := Addresses(context.Background(), lookup, []string{"a.example"}, "443")
 	if err != nil {
 		t.Fatalf("Addresses: %s", err)
 	}
-	if len(got) != 1 || got[0] != "a.example:443" {
-		t.Fatalf("Addresses = %v, want exactly [a.example:443]", got)
+	if len(got) != 0 {
+		t.Fatalf("Addresses = %v, want nothing dialable", got)
+	}
+	if len(unresolved) != 1 || unresolved[0] != "a.example" {
+		t.Fatalf("unresolved = %v, want [a.example]", unresolved)
+	}
+}
+
+// TestAddressesRejectsANonIpRecord: a resolver answering with a name rather
+// than an address would reintroduce the defect one level down -- the "address"
+// would just be re-resolved at dial time.
+func TestAddressesRejectsANonIpRecord(t *testing.T) {
+	lookup := func(ctx context.Context, host string) ([]string, error) {
+		return []string{"cdn.example"}, nil
+	}
+	got, unresolved, err := Addresses(context.Background(), lookup, []string{"a.example"}, "443")
+	if err != nil {
+		t.Fatalf("Addresses: %s", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("Addresses = %v, want nothing: %q is not an ip literal", got, "cdn.example")
+	}
+	if len(unresolved) != 1 || unresolved[0] != "a.example" {
+		t.Fatalf("unresolved = %v, want [a.example]", unresolved)
 	}
 }
 
@@ -195,7 +334,22 @@ func TestAddressesRequiresAtLeastOneHost(t *testing.T) {
 	lookup := func(ctx context.Context, host string) ([]string, error) {
 		return []string{"1.1.1.1"}, nil
 	}
-	if _, err := Addresses(context.Background(), lookup, nil, "443"); err == nil {
+	if _, _, err := Addresses(context.Background(), lookup, nil, "443"); err == nil {
 		t.Fatal("Addresses accepted an empty host list; the check must not be reducible to nothing")
+	}
+}
+
+// TestAddressesRequiresALookup: Verify refuses a nil dialer rather than
+// substituting a default one, and Addresses must take the same posture. In the
+// one package whose job is failing closed, quietly resolving through a resolver
+// the caller never passed is exactly the kind of assumption this package exists
+// to remove.
+func TestAddressesRequiresALookup(t *testing.T) {
+	_, _, err := Addresses(context.Background(), nil, []string{"a.example"}, "443")
+	if err == nil {
+		t.Fatal("Addresses accepted a nil lookup and silently substituted the real resolver")
+	}
+	if !errors.Is(err, ErrNoLookup) {
+		t.Fatalf("Addresses error = %v, want ErrNoLookup", err)
 	}
 }

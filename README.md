@@ -81,9 +81,28 @@ probe that fails to tunnel would fall back to the host's own egress and record
 to three third-party APIs. The addresses tested are derived from
 `geolocate.SourceHosts()`, so there is no second endpoint list to drift.
 
-Under a working deny-all confinement, DNS is blocked too; unresolvable hosts are
-tested by name rather than dropped, so the check never quietly shrinks to
-nothing.
+**Inability to verify is not evidence of confinement.** The check only reports a
+pass when it obtained real evidence, and refuses to start otherwise:
+
+- A host that will not resolve is **not** dialed by name. That dial would be
+  re-resolved by the resolver that just failed, so it fails at resolution and
+  says nothing about whether the address behind the name is reachable.
+- If *some* hosts resolved, those are checked and a `WARNING` names the ones
+  that did not — a degraded check never reads like a complete one.
+- If *no* host resolved, the prober **exits non-zero**. Under a deny-all
+  confinement DNS is blocked too, which used to make every host fall back to a
+  name, every dial fail at resolution, and the check log "passed" having tested
+  nothing at all — on a host that might have full egress.
+- `-confinement-timeout` must be at least **500ms**. Anything shorter expires
+  before a connection could have completed, so every address looks blocked
+  whether or not it is. (Measured on one unconfined host, in the same second:
+  `10ms` → correctly "not confined"; `1ms` → "passed".)
+
+For a jail where DNS legitimately cannot work, supply the addresses instead of
+disabling the check: `-confinement-address <ip:port>`, repeated once per
+geolocation endpoint (the error message lists them). Resolution is then skipped
+and exactly those addresses are dialed. The host part must be an IP literal — a
+name there would put the same hole back.
 
 `-skip-confinement-check` disables it. It defaults to **false**, logs two
 `WARNING` lines when set, and exists only for an operator running a one-shot
