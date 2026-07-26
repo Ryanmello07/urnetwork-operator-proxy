@@ -450,3 +450,51 @@ func TestConsensusEmptyCitiesDoNotAgree(t *testing.T) {
 		t.Fatal("the country result must be unaffected")
 	}
 }
+
+// TestConsensusRetainsDisambiguator is the storage-side half of the
+// parenthetical-retention rule. Two sources both report "Frankfurt (Oder)",
+// so the qualifier is corroborated, and the published name must keep it:
+// publishing a bare "Frankfurt" would discard the only thing distinguishing
+// that city from Frankfurt am Main, and the server canonicalizes and stores
+// the submitted name permanently.
+func TestConsensusRetainsDisambiguator(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "freeipapi", OK: true, CountryCode: "DE", Country: "Germany", City: "Frankfurt (Oder)", Region: "Brandenburg"},
+		{Name: "ipinfo", OK: true, CountryCode: "DE", City: "Frankfurt (Oder)", Region: "Brandenburg"},
+	}
+	loc := consensus(ok)
+	if !loc.CityConfident {
+		t.Fatal("both sources report Frankfurt (Oder) with a region; CityConfident must be true")
+	}
+	if loc.City != "Frankfurt (Oder)" {
+		t.Fatalf("City = %q, want \"Frankfurt (Oder)\": a corroborated disambiguator must survive into the stored name", loc.City)
+	}
+	if loc.Region != "Brandenburg" {
+		t.Fatalf("Region = %q, want \"Brandenburg\"", loc.Region)
+	}
+}
+
+// TestConsensusDifferentFrankfurtsDoNotMerge is the consensus-level teeth of
+// the same rule. Frankfurt (Oder) and Frankfurt am Main are different cities
+// ~90km apart in different Bundesländer. Under unconditional parenthetical
+// stripping the first reduced to "Frankfurt", which prefix-matched the
+// second, and consensus published a confident "Frankfurt" with whichever
+// region the more-trusted source happened to report -- a wrong location,
+// stored permanently. They must not merge; the result degrades to country
+// granularity, which is safe and re-probes cleanly.
+func TestConsensusDifferentFrankfurtsDoNotMerge(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "freeipapi", OK: true, CountryCode: "DE", Country: "Germany", City: "Frankfurt (Oder)", Region: "Brandenburg"},
+		{Name: "ipinfo", OK: true, CountryCode: "DE", City: "Frankfurt am Main", Region: "Hesse"},
+	}
+	loc := consensus(ok)
+	if loc.CityConfident {
+		t.Fatalf("Frankfurt (Oder) and Frankfurt am Main are different cities; CityConfident must be false (got City %q, Region %q)", loc.City, loc.Region)
+	}
+	if loc.City != "" || loc.Region != "" {
+		t.Fatalf("City = %q, Region = %q, want both empty on disagreement", loc.City, loc.Region)
+	}
+	if !loc.CountryConfident || loc.CountryCode != "de" {
+		t.Fatal("the country result must survive the city disagreement")
+	}
+}

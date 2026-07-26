@@ -68,46 +68,101 @@ var latinFold = func() map[rune]string {
 	return m
 }()
 
-// stripParentheticals removes every parenthesized group and the parentheses
-// themselves: "Frankfurt am Main (Innenstadt I)" -> "Frankfurt am Main ".
+// parentheticalDropMinTokens is how many tokens must precede a parenthesized
+// group before the group is treated as a droppable qualifier. See
+// reduceParentheticals.
+const parentheticalDropMinTokens = 2
+
+// reduceParentheticals removes a parenthesized group ONLY when at least
+// parentheticalDropMinTokens tokens already precede it, and otherwise leaves
+// the group in place verbatim:
 //
-// Parenthesized text in these feeds is a qualifier -- a city district, a
-// disambiguator, an abbreviation -- that only some sources emit, so it cannot
-// participate in agreement. Nesting is tracked with a depth counter, an
-// unclosed "(" swallows the rest of the string, and a stray ")" is dropped;
-// none of those shapes panic or drop the un-parenthesized text before them.
-func stripParentheticals(s string) string {
-	if !strings.ContainsAny(s, "()") {
+//	"Frankfurt am Main (Innenstadt I)" -> "Frankfurt am Main "
+//	"Frankfurt (Oder)"                 -> "Frankfurt (Oder)"
+//
+// Parenthesized text in these feeds plays two incompatible roles. After a
+// multi-token name it is almost always a SUBDIVISION -- a city district, a
+// borough, a postal qualifier -- that only some sources emit, so it cannot
+// participate in agreement and must be dropped or "Frankfurt am Main
+// (Innenstadt I)" never merges with "Frankfurt am Main". After a single token
+// it is almost always a DISAMBIGUATOR: "Frankfurt (Oder)" is a real city
+// ~90km from Frankfurt am Main and in a different Land, and dropping its
+// qualifier would reduce it to "Frankfurt", which then prefix-matches
+// "Frankfurt am Main" and merges two genuinely different cities.
+//
+// Nothing lexical can tell those two roles apart -- it needs a gazetteer --
+// so the token count before the group is used as the proxy, and the tie is
+// broken toward the SAFE failure. The two failure modes are not symmetric: a
+// false merge publishes a wrong location that the server canonicalizes and
+// stores permanently, while a false split merely degrades that provider to
+// country granularity, which is safe and self-corrects on the next probe. A
+// rule that can only ever make matching STRICTER is therefore the right
+// trade, and it is accepted that it occasionally splits something that could
+// legitimately have merged ("Paris (75)" vs "Paris, France").
+//
+// Tokens are counted the same way PlaceTokens segments them (runs of letters
+// and digits, with combining marks continuing a run), not by whitespace, so
+// "Frankfurt-am-Main (Innenstadt)" counts three tokens and drops its group.
+// The count includes any earlier group that was retained.
+//
+// Degenerate shapes are handled without panicking and without discarding the
+// text around them: nesting is tracked with a depth counter and inherits the
+// enclosing group's fate, an unclosed "(" either swallows the rest of the
+// string (when dropping) or is kept verbatim (when retaining), and a ")" with
+// no opener is ordinary text.
+func reduceParentheticals(s string) string {
+	if !strings.ContainsRune(s, '(') {
 		return s
 	}
 	var b strings.Builder
 	b.Grow(len(s))
-	depth := 0
+	depth, tokens := 0, 0
+	inToken, dropping := false, false
+	emit := func(r rune) {
+		switch {
+		case unicode.Is(unicode.Mn, r), unicode.Is(unicode.Me, r):
+			// A combining mark continues the run it is attached to.
+		case unicode.IsLetter(r), unicode.IsDigit(r):
+			if !inToken {
+				tokens++
+				inToken = true
+			}
+		default:
+			inToken = false
+		}
+		b.WriteRune(r)
+	}
 	for _, r := range s {
 		switch r {
 		case '(':
+			if depth == 0 {
+				dropping = parentheticalDropMinTokens <= tokens
+			}
 			depth++
 		case ')':
 			if 0 < depth {
 				depth--
 			}
-		default:
-			if depth == 0 {
-				b.WriteRune(r)
-			}
+		}
+		if !dropping {
+			emit(r)
+		}
+		if r == ')' && depth == 0 {
+			dropping = false
 		}
 	}
 	return b.String()
 }
 
 // PlaceTokens normalizes a place name into the token sequence used for
-// matching: parentheticals stripped, case-folded to lower, accented Latin
+// matching: qualifying parentheticals dropped (see reduceParentheticals for
+// which ones qualify), case-folded to lower, accented Latin
 // letters folded to ASCII, punctuation and separators turned into spaces,
 // runs of whitespace collapsed. It returns nil for a name with no tokens.
 //
 // The tokens are for comparison only -- never for display. See PlaceDisplay.
 func PlaceTokens(s string) []string {
-	s = strings.ToLower(stripParentheticals(s))
+	s = strings.ToLower(reduceParentheticals(s))
 
 	var b strings.Builder
 	b.Grow(len(s))
@@ -142,18 +197,21 @@ func PlaceTokens(s string) []string {
 	return tokens
 }
 
-// PlaceDisplay renders a place name for storage and display: parentheticals
-// removed and whitespace collapsed, but casing and diacritics preserved
-// ("Logroño" stays "Logroño", not "logrono").
+// PlaceDisplay renders a place name for storage and display: the same
+// parenthetical reduction PlaceTokens applies, plus collapsed whitespace, but
+// casing and diacritics preserved ("Logroño" stays "Logroño", not "logrono").
 //
-// The parenthetical is dropped here too, not just in PlaceTokens, because it
-// is the part of the name the agreeing sources did NOT corroborate: keeping
-// "Frankfurt am Main (Innenstadt I)" as the stored name would assert a city
-// district on the authority of a single source. The server canonicalizes and
-// permanently stores whatever name is submitted, so that assertion would be
-// durable.
+// Display and matching must reduce parentheticals IDENTICALLY, in both
+// directions. A dropped subdivision must not survive into the stored name:
+// keeping "Frankfurt am Main (Innenstadt I)" would assert a city district on
+// the authority of a single source, and the server canonicalizes and
+// permanently stores whatever name it is given, so the assertion would be
+// durable. Symmetrically, a RETAINED disambiguator must survive: two sources
+// that both say "Frankfurt (Oder)" have corroborated the qualifier, and
+// publishing a bare "Frankfurt" would throw away the only thing distinguishing
+// that city from Frankfurt am Main.
 func PlaceDisplay(s string) string {
-	return strings.Join(strings.Fields(stripParentheticals(s)), " ")
+	return strings.Join(strings.Fields(reduceParentheticals(s)), " ")
 }
 
 // tokensPrefixOrEqual reports whether short is equal to, or a proper prefix

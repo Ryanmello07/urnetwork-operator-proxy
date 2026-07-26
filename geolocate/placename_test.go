@@ -17,12 +17,19 @@ func TestPlaceTokens(t *testing.T) {
 		{"lowercased", "FRANKFURT AM MAIN", []string{"frankfurt", "am", "main"}},
 		{"whitespace collapsed and trimmed", "  Frankfurt   am\tMain  ", []string{"frankfurt", "am", "main"}},
 
-		// Parenthetical stripping.
-		{"district suffix stripped", "Frankfurt am Main (Innenstadt I)", []string{"frankfurt", "am", "main"}},
-		{"nested parens stripped", "Foo (bar (baz) qux) end", []string{"foo", "end"}},
-		{"unclosed paren swallows the tail", "Frankfurt am Main (Innenstadt", []string{"frankfurt", "am", "main"}},
-		{"stray close paren dropped", "Frankfurt) am Main", []string{"frankfurt", "am", "main"}},
-		{"only a parenthetical", "(Innenstadt I)", nil},
+		// Parenthetical reduction. A group is dropped only when >= 2 tokens
+		// precede it (a subdivision); otherwise it is kept (a disambiguator).
+		{"district suffix dropped after a multi-token name", "Frankfurt am Main (Innenstadt I)", []string{"frankfurt", "am", "main"}},
+		{"disambiguator kept after a single token", "Frankfurt (Oder)", []string{"frankfurt", "oder"}},
+		{"token count is not whitespace-based", "Frankfurt-am-Main (Innenstadt)", []string{"frankfurt", "am", "main"}},
+		{"nested group dropped with its parent", "Foo Bar (baz (qux) quux) end", []string{"foo", "bar", "end"}},
+		{"nested group kept with its parent", "Foo (bar (baz) qux) end", []string{"foo", "bar", "baz", "qux", "end"}},
+		{"a retained group counts toward later groups", "Frankfurt (Oder) (Altstadt)", []string{"frankfurt", "oder"}},
+		{"unclosed paren swallows the tail when dropping", "Frankfurt am Main (Innenstadt", []string{"frankfurt", "am", "main"}},
+		{"unclosed paren is kept when retaining", "Frankfurt (Oder", []string{"frankfurt", "oder"}},
+		{"stray close paren is ordinary text", "Frankfurt) am Main", []string{"frankfurt", "am", "main"}},
+		{"leading parenthetical is kept", "(Innenstadt I)", []string{"innenstadt", "i"}},
+		{"empty parenthetical yields no tokens", "()", nil},
 		{"unbalanced closers do not underflow", ")))Denver(((", []string{"denver"}},
 
 		// Accent folding. Latin-1 Supplement and Latin Extended-A only; this
@@ -61,6 +68,9 @@ func TestPlaceTokens(t *testing.T) {
 func TestPlaceDisplay(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"Frankfurt am Main (Innenstadt I)", "Frankfurt am Main"},
+		// A retained disambiguator must survive into the stored name.
+		{"Frankfurt (Oder)", "Frankfurt (Oder)"},
+		{"  Frankfurt  (Oder)  ", "Frankfurt (Oder)"},
 		{"  Frankfurt   am  Main  ", "Frankfurt am Main"},
 		// Casing and diacritics are preserved: the display name is what gets
 		// stored server-side, permanently.
@@ -68,7 +78,11 @@ func TestPlaceDisplay(t *testing.T) {
 		{"DENVER", "DENVER"},
 		{"Washington, D.C.", "Washington, D.C."},
 		{"", ""},
-		{"(only a qualifier)", ""},
+		{"(only a qualifier)", "(only a qualifier)"},
+		// A retained group is echoed verbatim even when it holds no tokens.
+		// Unreachable from consensus: canonicalPlace never renders a name
+		// whose token sequence is empty.
+		{"()", "()"},
 	}
 	for _, c := range cases {
 		if got := PlaceDisplay(c.in); got != c.want {
@@ -113,6 +127,16 @@ func TestPlaceNamesMatchRejectsSuffixAndSubstring(t *testing.T) {
 		// Divergent after a shared prefix token.
 		{"Frankfurt am Main", "Frankfurt an der Oder"},
 		{"Newcastle upon Tyne", "Newcastle under Lyme"},
+		// A parenthetical after a SINGLE token is a disambiguator and is
+		// retained as tokens, so it can diverge and block the merge.
+		// "Frankfurt (Oder)" is a real, different city ~90km from Frankfurt
+		// am Main and in a different Land; unconditional stripping would
+		// reduce it to "Frankfurt", which then prefixes "Frankfurt am Main"
+		// and silently merges the two. This is the case the retention rule
+		// exists for.
+		{"Frankfurt am Main", "Frankfurt (Oder)"},
+		{"Frankfurt (Oder)", "Frankfurt (Main)"},
+		{"Frankfurt am Main (Innenstadt I)", "Frankfurt (Oder)"},
 	}
 	for _, c := range cases {
 		if PlaceNamesMatch(c.a, c.b) {
@@ -136,7 +160,7 @@ func TestPlaceNamesMatchEmptyMatchesNothing(t *testing.T) {
 		{"Frankfurt", ""},
 		{"   ", "Frankfurt"},
 		{"   ", "   "},
-		{"(qualifier only)", "Frankfurt"},
+		{"()", "()"},
 		{" - . ", " - . "},
 	}
 	for _, c := range cases {
@@ -158,17 +182,14 @@ func TestPlaceNamesMatchAcceptedPrefixConsequences(t *testing.T) {
 		{"Kansas City", "Kansas", "a state name is a prefix of a city name; both describe the same ip, so the shorter reading wins"},
 		{"Mexico City", "Mexico", "same shape as Kansas City / Kansas"},
 		{"Quebec City", "Quebec", "same shape as Kansas City / Kansas"},
-		// The one that is genuinely lossy: "Frankfurt (Oder)" is a real,
-		// DIFFERENT city ~90km from Frankfurt am Main, and its parenthetical
-		// is a disambiguator rather than a subdivision. Stripping
-		// parentheticals reduces it to "Frankfurt", which then prefixes
-		// "Frankfurt am Main". Telling a disambiguating parenthetical from a
-		// district parenthetical is not possible lexically -- it needs a
-		// gazetteer -- and the same merge already happens without any
-		// parentheses at all, because bare "Frankfurt" matches "Frankfurt am
-		// Main" by the rule's explicit design. Flagged rather than
-		// special-cased; see the report.
-		{"Frankfurt am Main", "Frankfurt (Oder)", "parenthetical disambiguators are indistinguishable from district suffixes without a gazetteer"},
+		// A BARE "Frankfurt" still merges with "Frankfurt (Oder)", and this
+		// one is unavoidable: a source that wrote only "Frankfurt" supplied
+		// nothing to distinguish the two cities, so there is no lexical
+		// signal left to act on. It is genuinely ambiguous rather than
+		// wrong, and the canonical-shortest rule keeps the published name at
+		// "Frankfurt" -- the most any source actually asserted. No further
+		// heuristic is added to chase it.
+		{"Frankfurt", "Frankfurt (Oder)", "a source that named no qualifier gave nothing to disambiguate with"},
 	}
 	for _, c := range cases {
 		if !PlaceNamesMatch(c.a, c.b) {
@@ -202,5 +223,24 @@ func TestPlaceNamesMatchNormalizationInteractions(t *testing.T) {
 	// accepting suffixes would also accept "York" ~ "New York".
 	if PlaceNamesMatch("Comunidad de Madrid", "Madrid") {
 		t.Error("PlaceNamesMatch(\"Comunidad de Madrid\", \"Madrid\") = true; a leading qualifier is a suffix relation and must not match")
+	}
+}
+
+// TestPlaceNamesMatchAcceptedFalseSplits documents the cost of retaining a
+// parenthetical after a single token: names that a human would merge do not
+// merge. This is deliberate. The two failure modes are asymmetric -- a false
+// merge publishes a wrong location the server stores as canonical and is hard
+// to walk back, while a false split only degrades that provider to country
+// granularity, which is safe and self-corrects on the next probe -- so a rule
+// that can only ever make matching stricter is the right trade.
+func TestPlaceNamesMatchAcceptedFalseSplits(t *testing.T) {
+	cases := []struct{ a, b, why string }{
+		{"Paris (75)", "Paris, France", "the departement number is retained after the single token \"Paris\", so it diverges from \"france\""},
+		{"Cambridge (MA)", "Cambridge Massachusetts", "same shape: a retained qualifier that the other source spelled out"},
+	}
+	for _, c := range cases {
+		if PlaceNamesMatch(c.a, c.b) {
+			t.Errorf("PlaceNamesMatch(%q, %q) = true, want false (accepted false split: %s)", c.a, c.b, c.why)
+		}
 	}
 }
