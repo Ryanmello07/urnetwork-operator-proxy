@@ -401,14 +401,21 @@ func findProvidersAtLocation(ctx context.Context, client *http.Client, apiURL st
 	// []*ProviderSpec, here a single spec with only LocationId set (json
 	// "location_id"); Count and RankMode (json "rank_mode") match the
 	// struct's json tags.
+	//
+	// ForceMinimum bypasses the PassesMinimums filter in loadClientScores.
+	// That filter exists to keep low-quality providers out of user-facing
+	// selection; a geolocation census wants every provider that can accept a
+	// contract, so leaving it off returned 1 of 39 providers on beta.
 	reqBody, err := json.Marshal(struct {
-		Specs    []map[string]string `json:"specs"`
-		Count    int                 `json:"count"`
-		RankMode string              `json:"rank_mode"`
+		Specs        []map[string]string `json:"specs"`
+		Count        int                 `json:"count"`
+		RankMode     string              `json:"rank_mode"`
+		ForceMinimum bool                `json:"force_minimum"`
 	}{
-		Specs:    []map[string]string{{"location_id": locationId}},
-		Count:    findProvidersCountPerLocation,
-		RankMode: "quality",
+		Specs:        []map[string]string{{"location_id": locationId}},
+		Count:        findProvidersCountPerLocation,
+		RankMode:     "quality",
+		ForceMinimum: true,
 	})
 	if err != nil {
 		return nil, err

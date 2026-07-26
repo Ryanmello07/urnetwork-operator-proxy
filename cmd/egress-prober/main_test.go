@@ -1,6 +1,10 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -129,5 +133,39 @@ func TestMissingFlagUsageDoesNotPrintSecrets(t *testing.T) {
 	}
 	if strings.Contains(missingLine, "-by-jwt") || strings.Contains(missingLine, "-operator-secret") {
 		t.Errorf("missing-flag line %q reports a secret flag as missing, but both were supplied via the environment; the env fallback is broken", missingLine)
+	}
+}
+
+// TestFindProvidersAtLocationRequestsForceMinimum is the regression test for
+// the enumeration gap: find-providers2 routes candidates through
+// loadClientScores, which drops any provider failing PassesMinimums -- a
+// user-facing quality gate. A geolocation census wants every provider that
+// can accept a contract, not only those meeting that bar. The server exposes
+// FindProviders2Args.ForceMinimum (json "force_minimum") for exactly this,
+// but the prober never set it, so on beta this returned 1 of 39 providers.
+//
+// The assertion decodes the actual JSON body rather than inspecting the Go
+// request struct: the server only ever sees the JSON, so asserting on the
+// struct would let a wrong or missing json tag pass silently.
+func TestFindProvidersAtLocationRequestsForceMinimum(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode request: %s", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"providers":[]}`))
+	}))
+	defer srv.Close()
+
+	_, err := findProvidersAtLocation(context.Background(), srv.Client(), srv.URL, "jwt", "loc-1")
+	if err != nil {
+		t.Fatalf("findProvidersAtLocation: %s", err)
+	}
+
+	// a geolocation census must not be filtered by the user-facing quality
+	// gate; without this the api returned 1 of 39 providers on beta
+	if got["force_minimum"] != true {
+		t.Errorf("force_minimum = %v, want true", got["force_minimum"])
 	}
 }
