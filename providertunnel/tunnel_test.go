@@ -810,3 +810,131 @@ func TestOpenUsesInTunnelOnlyDnsResolution(t *testing.T) {
 	}
 	assertInTunnelOnlyResolver(t, captured)
 }
+
+// issueSelfSignedLeaf mints a leaf that chains to NOTHING in the trust store:
+// it is its own issuer, and neither test CA signed it. Used below to prove that
+// an allowed-but-unpinned host still gets full WebPKI chain verification -- the
+// property the whole "unpinned is safe enough for a health check" argument
+// rests on.
+func issueSelfSignedLeaf(t *testing.T, host string) (*x509.Certificate, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: host},
+		DNSNames:     []string{host},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert, key
+}
+
+// TestHTTPClientForHostsAllowsTheExtraHosts: without this the egress-health
+// probe dies at the tunnel's allowlist with ErrPinHostUnknown for every
+// destination, and nothing but a live probe against a real provider would
+// reveal it -- every package-level test would still be green while the feature
+// was completely dead in production.
+func TestHTTPClientForHostsAllowsTheExtraHosts(t *testing.T) {
+	const healthHost = "health.example"
+
+	serverCert, serverKey := issueLeaf(t, healthHost)
+	addr, cleanup := startTLSTestServer(t, serverCert, serverKey)
+	defer cleanup()
+
+	client := httpClientOverDialerWithHosts(
+		dialerToAddr(addr),
+		map[string][]string{"pinned.example": {"some-pin"}},
+		[]string{healthHost},
+		5*time.Second,
+	)
+
+	resp, err := client.Get("https://" + healthHost + "/robots.txt")
+	if err != nil {
+		t.Fatalf("request to an explicitly allowed unpinned host failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+
+	// The allowlist is widened, not opened: a host in neither set is still
+	// refused before a single byte is dialed.
+	if _, err := client.Get("https://not-in-any-list.example/"); !errors.Is(err, ErrPinHostUnknown) {
+		t.Fatalf("err = %v, want ErrPinHostUnknown; the allowlist must still be closed", err)
+	}
+}
+
+// TestHTTPClientForHostsStillVerifiesTheChain: "allowed without a pin" must
+// mean ordinary WebPKI verification, not no verification. If this failed, a
+// provider on the path could forge a healthy-looking response for every
+// egress-health destination with a self-signed certificate, and the probe would
+// certify a blackholing provider as healthy -- the precise inversion of its
+// purpose.
+func TestHTTPClientForHostsStillVerifiesTheChain(t *testing.T) {
+	const healthHost = "health.example"
+
+	serverCert, serverKey := issueSelfSignedLeaf(t, healthHost)
+	addr, cleanup := startTLSTestServer(t, serverCert, serverKey)
+	defer cleanup()
+
+	client := httpClientOverDialerWithHosts(
+		dialerToAddr(addr),
+		map[string][]string{"pinned.example": {"some-pin"}},
+		[]string{healthHost},
+		5*time.Second,
+	)
+
+	resp, err := client.Get("https://" + healthHost + "/robots.txt")
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("FAIL-OPEN: an unpinned allowed host was accepted with an untrusted self-signed certificate")
+	}
+	var unknownAuthority x509.UnknownAuthorityError
+	if !errors.As(err, &unknownAuthority) && !strings.Contains(err.Error(), "certificate") {
+		t.Fatalf("err = %v, want a certificate verification failure", err)
+	}
+}
+
+// TestHTTPClientForHostsDoesNotUnpinAPinnedHost: naming a host in the extra
+// list must never remove its pin. Otherwise adding an entry to the health table
+// that happens to share a host with a geolocation source would silently drop
+// pinning for the geolocation lookup, which is the one place a provider CAN
+// forge a durable, user-visible result.
+func TestHTTPClientForHostsDoesNotUnpinAPinnedHost(t *testing.T) {
+	const pinnedHost = "pinned.example"
+
+	serverCert, serverKey := issueLeaf(t, pinnedHost)
+	trustedCert, _ := issueLeaf(t, pinnedHost) // a different key: the pin must not match
+
+	addr, cleanup := startTLSTestServer(t, serverCert, serverKey)
+	defer cleanup()
+
+	client := httpClientOverDialerWithHosts(
+		dialerToAddr(addr),
+		map[string][]string{pinnedHost: {SPKIPin(trustedCert)}},
+		[]string{pinnedHost, "PINNED.example"}, // also exercises normalization
+		5*time.Second,
+	)
+
+	resp, err := client.Get("https://" + pinnedHost + "/json")
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("FAIL-OPEN: listing a pinned host as an extra host unpinned it")
+	}
+	if !errors.Is(err, ErrPinMismatch) {
+		t.Fatalf("err = %v, want it to wrap ErrPinMismatch", err)
+	}
+}

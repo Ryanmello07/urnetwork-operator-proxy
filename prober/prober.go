@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 
+	"github.com/urnetwork/urnetwork-operator-proxy/egresshealth"
 	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
 )
 
@@ -20,6 +22,10 @@ type Locator func(ctx context.Context, client *http.Client) (*geolocate.Consensu
 // TunnelOpener opens a tunnel to one provider and returns an http.Client that
 // egresses through it, plus a close function.
 type TunnelOpener func(ctx context.Context, providerClientId string) (*http.Client, func() error, error)
+
+// EgressHealthChecker runs the egress-health check over a client. In production
+// this is egresshealth.Check, wired in cmd/egress-prober.
+type EgressHealthChecker func(ctx context.Context, client *http.Client) (*egresshealth.Result, error)
 
 // Submitter records a probed location.
 type Submitter interface {
@@ -66,6 +72,15 @@ type Prober struct {
 	Open   TunnelOpener
 	Locate Locator
 	Submit Submitter
+	// Health runs the egress-health check over the SAME tunnel the geolocation
+	// lookup used. Optional -- a nil checker skips it entirely.
+	//
+	// Nothing is submitted anywhere: the result is logged and dropped. Storage
+	// and the "is this provider healthy enough to select" verdict are separate
+	// work, and shipping a verdict before the signal has been watched in the
+	// field is how a probe starts de-listing working providers. This step
+	// produces the signal and proves it end to end.
+	Health EgressHealthChecker
 	// Attempts reports every probe attempt. Optional -- a nil reporter simply
 	// skips reporting -- but production must set it: see ProbeOne.
 	Attempts AttemptReporter
@@ -114,12 +129,26 @@ func (p *Prober) probeOne(ctx context.Context, providerClientId string) (string,
 		}
 	}()
 
-	loc, err := p.Locate(ctx, client)
-	if err != nil {
-		if errors.Is(err, geolocate.ErrNoConsensus) {
-			return FailureNoConsensus, err
+	loc, locErr := p.Locate(ctx, client)
+
+	// The egress-health check rides the tunnel that is already open, never a
+	// second one: a second tunnel would double the contract cost per provider
+	// and, worse, would be measuring a different session than the one the
+	// geolocation verdict came from.
+	//
+	// It runs AFTER the lookups and regardless of how they went. After, because
+	// the location is the product this pass exists to deliver and must not lose
+	// budget to a diagnostic. Regardless, because a provider whose geolocation
+	// failed is exactly the one whose egress pattern is worth having -- that is
+	// where "carried nothing at all" separates from "carried everything except
+	// the three geolocation APIs".
+	p.checkEgressHealth(ctx, providerClientId, client)
+
+	if locErr != nil {
+		if errors.Is(locErr, geolocate.ErrNoConsensus) {
+			return FailureNoConsensus, locErr
 		}
-		return FailureLocate, err
+		return FailureLocate, locErr
 	}
 
 	if err := p.Submit.Submit(ctx, providerClientId, loc); err != nil {
@@ -134,6 +163,41 @@ func (p *Prober) probeOne(ctx context.Context, providerClientId string) (string,
 		return FailureSubmit, err
 	}
 	return "", nil
+}
+
+// checkEgressHealth runs the egress-health check and logs one line per
+// provider. It never affects the probe's outcome: the failure classes reported
+// to the server describe geolocation, and a diagnostic must not be able to
+// change the record of whether a location was obtained.
+//
+// A run started on an expired context comes back 0/N -- which reads in the log
+// exactly like a total blackhole, but is the prober's own exhausted deadline
+// rather than anything the provider did. That would be a false accusation
+// against a working provider, so it is refused and logged as skipped instead.
+// egresshealth.Check makes the same check itself (ErrNoBudget); this one keeps
+// the log honest about WHY nothing ran.
+func (p *Prober) checkEgressHealth(ctx context.Context, providerClientId string, client *http.Client) {
+	if p.Health == nil {
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		log.Printf("egress-health: provider=%s skipped: no budget left in this probe (%s) -- a run on an expired deadline would fail every destination and be indistinguishable from a blackhole", providerClientId, err)
+		return
+	}
+
+	res, err := p.Health(ctx, client)
+	if err != nil {
+		// Structural: the check did not happen. Deliberately NOT rendered as a
+		// zero score, for the same reason as above.
+		log.Printf("egress-health: provider=%s did not run: %s", providerClientId, err)
+		return
+	}
+
+	line := fmt.Sprintf("egress-health: provider=%s %s", providerClientId, res.Summary())
+	if failed := res.FailedNames(); 0 < len(failed) {
+		line += " failed=" + strings.Join(failed, ",")
+	}
+	log.Print(line)
 }
 
 func (p *Prober) reportAttempt(ctx context.Context, providerClientId string, failure string) {

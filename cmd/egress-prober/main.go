@@ -1,10 +1,14 @@
 // Command egress-prober probes each provider's egress location by routing
 // geolocation lookups through that provider, and submits the results to the
-// operator's server.
+// operator's server. On the same tunnel it also runs an egress-health check
+// (see egresshealth/) that measures whether the provider carries ordinary
+// traffic at all, and logs a one-line per-provider summary. Health results are
+// logged only -- nothing is submitted and there is no server endpoint for them
+// yet.
 //
-// The prober host never contacts a geolocation api directly: every lookup
-// egresses through a provider tunnel. The only direct calls are to the
-// operator's own server (provider list, ingest).
+// The prober host never contacts a geolocation api or a health destination
+// directly: every request egresses through a provider tunnel. The only direct
+// calls are to the operator's own server (provider list, ingest).
 package main
 
 import (
@@ -28,6 +32,7 @@ import (
 	"github.com/urnetwork/connect"
 
 	"github.com/urnetwork/urnetwork-operator-proxy/confinement"
+	"github.com/urnetwork/urnetwork-operator-proxy/egresshealth"
 	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
 	"github.com/urnetwork/urnetwork-operator-proxy/ingest"
 	"github.com/urnetwork/urnetwork-operator-proxy/prober"
@@ -54,7 +59,7 @@ func main() {
 	skipConfinementCheck := flag.Bool("skip-confinement-check", false, "DANGEROUS: start even if this host can reach a geolocation api directly. Only for a one-shot manual probe on a host you know is not the operator's; a direct lookup records the OPERATOR's location for the provider and exposes the operator's address to the api")
 	confinementTimeout := flag.Duration("confinement-timeout", 3*time.Second, "per-address deadline for the startup confinement self-check; a timeout counts as blocked. Must be at least "+confinement.MinTimeout.String())
 	var confinementAddrs addressList
-	flag.Var(&confinementAddrs, "confinement-address", "ip:port the confinement self-check should dial instead of resolving the geolocation hosts; repeatable. For a jail where dns is legitimately blocked: supply every geolocation endpoint's address here and the check stays real. The host part must be an ip literal, not a name")
+	flag.Var(&confinementAddrs, "confinement-address", "ip:port the confinement self-check should dial instead of resolving the probe hosts; repeatable. For a jail where dns is legitimately blocked: supply the address of every geolocation source AND every egress-health destination here and the check stays real. The host part must be an ip literal, not a name")
 	dueURL := flag.String("due-url", "", "url of the server's due-provider endpoint; empty derives <api-url>/network/provider-egress-due")
 	dueLimit := flag.Int("due-limit", 100, "how many due providers to ask the server for per pass; the server clamps this to its own maximum (500)")
 	flag.Parse()
@@ -242,7 +247,14 @@ func newProber(tunnelCfg providertunnel.Config, probeTimeout time.Duration, oper
 			if err != nil {
 				return nil, nil, err
 			}
-			return t.HTTPClient(probeTimeout), t.Close, nil
+			// ONE client, for both the geolocation lookups and the
+			// egress-health check, so both measure the same tunnel and the
+			// provider is only put under contract once. The geolocation hosts
+			// stay pinned; the egress-health destinations are allowed under
+			// ordinary WebPKI verification -- see
+			// providertunnel.HTTPClientForHosts for why pinning them would make
+			// the health signal worse rather than better.
+			return t.HTTPClientForHosts(probeTimeout, egresshealth.DestinationHosts()), t.Close, nil
 		},
 		// -probe-timeout must govern the per-source deadline too, not just
 		// the http.Client's overall timeout. geolocate caps each source fetch
@@ -257,9 +269,42 @@ func newProber(tunnelCfg providertunnel.Config, probeTimeout time.Duration, oper
 				PerSourceTimeout: probeTimeout,
 			})
 		},
+		// The egress-health check runs over the tunnel Open already returned --
+		// never a second one. Its results are logged and go no further: there is
+		// deliberately no server endpoint and no submission yet, because the
+		// storage schema and the "is this provider healthy enough to select"
+		// verdict are separate work, and a verdict shipped before the signal has
+		// been watched in the field would start de-listing working providers.
+		//
+		// Its budget is derived from -probe-timeout the same way the geolocation
+		// per-source deadline is: PerRequestTimeout is one -probe-timeout (each
+		// request pays a cold in-tunnel DoH resolution plus a full TLS
+		// handshake), and the whole run is capped at the same value multiplied
+		// by the number of concurrent rounds, so a provider that swallows
+		// everything cannot hold a pass open indefinitely.
+		Health: func(ctx context.Context, client *http.Client) (*egresshealth.Result, error) {
+			return egresshealth.Check(ctx, client, egresshealth.Options{
+				PerRequestTimeout: probeTimeout,
+				Budget:            egressHealthBudget(probeTimeout),
+			})
+		},
 		Submit:   operator,
 		Attempts: operator,
 	}
+}
+
+// egressHealthBudget bounds a whole egress-health run given the per-request
+// timeout. With the default concurrency the run is at most
+// ceil(destinations/concurrency) sequential rounds, and this allows exactly
+// that many per-request timeouts: enough that a slow-but-working provider
+// finishes, tight enough that a swallowing provider ends the run instead of
+// stalling the pass.
+func egressHealthBudget(probeTimeout time.Duration) time.Duration {
+	rounds := (len(egresshealth.Destinations()) + egresshealth.DefaultConcurrency - 1) / egresshealth.DefaultConcurrency
+	if rounds < 1 {
+		rounds = 1
+	}
+	return time.Duration(rounds) * probeTimeout
 }
 
 // newSchedulers returns the scheduler for a server-driven pass and the one for
@@ -318,10 +363,41 @@ func selectProviders(ctx context.Context, due dueLister, limit int, apiURL strin
 	}
 }
 
-// confinementPort is the port the self-check dials. Every geolocate source is
-// https, and https is the only thing a geolocation lookup from this process
-// would ever be.
+// confinementPort is the port the self-check dials. Every geolocate source and
+// every egresshealth destination is https on the default port, and https is the
+// only thing a probe from this process would ever be. egresshealth's
+// TestEveryDestinationIsHTTPSOn443 keeps that true from the other side -- a
+// destination on another port would silently fall outside this check.
 const confinementPort = "443"
+
+// probeHosts is every third-party host this process reaches through a tunnel:
+// the pinned geolocation sources plus the egress-health destinations. It is
+// what the confinement self-check must prove unreachable directly, and what an
+// operator translates into -confinement-address entries.
+//
+// Both lists are DERIVED from the tables that own them (geolocate.SourceHosts,
+// egresshealth.DestinationHosts) for the reason spelled out on each: a
+// hand-maintained second copy drifts on the first table change, and the check
+// keeps reporting a pass while no longer covering a real endpoint.
+//
+// The egress-health destinations belong here for the same reason as the
+// geolocation ones, though the harm differs. A direct geolocation lookup
+// records the OPERATOR's location for a provider. A direct egress-health check
+// is worse in one specific way: it would pass -- the operator's own host can
+// obviously reach Cloudflare and Amazon -- and so would certify a blackholing
+// provider as healthy, which is the exact inversion of the signal.
+func probeHosts() []string {
+	seen := map[string]bool{}
+	var hosts []string
+	for _, h := range append(geolocate.SourceHosts(), egresshealth.DestinationHosts()...) {
+		if h == "" || seen[h] {
+			continue
+		}
+		seen[h] = true
+		hosts = append(hosts, h)
+	}
+	return hosts
+}
 
 // addressList collects the repeatable -confinement-address flag.
 //
@@ -367,10 +443,11 @@ func (a *addressList) Set(v string) error {
 // location for that provider, and the operator's address would be handed to
 // three third-party apis.
 //
-// The addresses come from geolocate.SourceHosts, resolved here at startup, so
-// the repo holds exactly one endpoint list. A hand-maintained second copy
-// would drift on the first endpoint change and the check would keep passing
-// while no longer covering a real endpoint.
+// The addresses come from probeHosts -- geolocate.SourceHosts plus
+// egresshealth.DestinationHosts -- resolved here at startup, so the repo holds
+// exactly one copy of each endpoint list. A hand-maintained second copy would
+// drift on the first endpoint change and the check would keep passing while no
+// longer covering a real endpoint.
 //
 // This does not replace the Go-level fail-closed behaviour (lookups only ever
 // run on a tunnel-bound http.Client; providertunnel refuses any host outside
@@ -385,7 +462,7 @@ func (a *addressList) Set(v string) error {
 // them resolve, the shortfall is logged as a WARNING so a degraded check never
 // reads like a complete one.
 func checkConfinement(ctx context.Context, dial confinement.DialFunc, lookup confinement.LookupFunc, explicitAddrs []string, timeout time.Duration) error {
-	hosts := geolocate.SourceHosts()
+	hosts := probeHosts()
 
 	var addrs, unresolved []string
 	if len(explicitAddrs) > 0 {
@@ -396,7 +473,7 @@ func checkConfinement(ctx context.Context, dial confinement.DialFunc, lookup con
 		// all. Keeping them in sync with the geolocation endpoints is the
 		// operator's job, so the endpoint list is logged alongside them.
 		addrs = explicitAddrs
-		log.Printf("egress-prober: confinement self-check: dialing the %d address(es) given with -confinement-address, skipping resolution: %s (geolocation hosts: %s -- keep these addresses current with that list)",
+		log.Printf("egress-prober: confinement self-check: dialing the %d address(es) given with -confinement-address, skipping resolution: %s (probe hosts: %s -- keep these addresses current with that list)",
 			len(addrs), strings.Join(addrs, " "), strings.Join(hosts, " "))
 	} else {
 		// Resolution is bounded by the same budget as a dial: under a real
@@ -410,9 +487,9 @@ func checkConfinement(ctx context.Context, dial confinement.DialFunc, lookup con
 			return err
 		}
 
-		log.Printf("egress-prober: confinement self-check: %d geolocation host(s) -> %d address(es): %s", len(hosts), len(addrs), strings.Join(addrs, " "))
+		log.Printf("egress-prober: confinement self-check: %d probe host(s) -> %d address(es): %s", len(hosts), len(addrs), strings.Join(addrs, " "))
 		if 0 < len(unresolved) && 0 < len(addrs) {
-			log.Printf("egress-prober: WARNING confinement self-check is DEGRADED: %d of %d geolocation host(s) could not be resolved and were NOT tested: %s. Whether this host can reach them directly is unknown. Allow dns resolution for the prober, or pass -confinement-address <ip:port> for each of them.",
+			log.Printf("egress-prober: WARNING confinement self-check is DEGRADED: %d of %d probe host(s) could not be resolved and were NOT tested: %s. Whether this host can reach them directly is unknown. Allow dns resolution for the prober, or pass -confinement-address <ip:port> for each of them.",
 				len(unresolved), len(hosts), strings.Join(unresolved, " "))
 		}
 	}
@@ -422,7 +499,7 @@ func checkConfinement(ctx context.Context, dial confinement.DialFunc, lookup con
 			// The vacuous pass this replaced: with dns blocked, every host fell
 			// back to a bare name, every dial failed at resolution, and the
 			// check reported success without having tested one address.
-			return fmt.Errorf("%w -- allow dns resolution for the prober, or pass -confinement-address <ip:port> once per geolocation endpoint (%s) so the check dials them directly", err, strings.Join(hosts, " "))
+			return fmt.Errorf("%w -- allow dns resolution for the prober, or pass -confinement-address <ip:port> once per probe endpoint (%s) so the check dials them directly", err, strings.Join(hosts, " "))
 		}
 		return err
 	}

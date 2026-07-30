@@ -14,7 +14,10 @@ package main
 //
 // It prints what each geolocation source said individually alongside the
 // consensus, so a disagreement between sources is visible rather than hidden
-// behind the verdict.
+// behind the verdict, and then runs the egress-health check over the SAME
+// tunnel and prints every destination's outcome. That second half is the
+// end-to-end proof for the health signal: the same client, the same session,
+// against nine real destinations the geolocation probe never touches.
 
 import (
 	"context"
@@ -23,6 +26,7 @@ import (
 	"time"
 
 	"github.com/urnetwork/connect"
+	"github.com/urnetwork/urnetwork-operator-proxy/egresshealth"
 	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
 	"github.com/urnetwork/urnetwork-operator-proxy/providertunnel"
 )
@@ -68,7 +72,13 @@ func TestManualProbeOneProvider(t *testing.T) {
 	}
 	defer tun.Close()
 
-	loc, err := geolocate.LocateWithOptions(ctx, tun.HTTPClient(90*time.Second),
+	// The same one client the CLI builds: geolocation hosts pinned, egress
+	// health destinations allowed unpinned. Using tun.HTTPClient here instead
+	// would refuse every health destination at the allowlist, so this also
+	// keeps the manual probe honest about what the shipped path does.
+	client := tun.HTTPClientForHosts(90*time.Second, egresshealth.DestinationHosts())
+
+	loc, err := geolocate.LocateWithOptions(ctx, client,
 		geolocate.LocateOptions{PerSourceTimeout: 45 * time.Second})
 	if err != nil {
 		t.Fatalf("geolocate through provider %s: %s", providerId, err)
@@ -86,5 +96,23 @@ func TestManualProbeOneProvider(t *testing.T) {
 		} else {
 			t.Logf("  source %-12s FAIL %s", s.Name, s.Err)
 		}
+	}
+
+	// Egress health over the SAME tunnel -- never a second one.
+	health, err := egresshealth.Check(ctx, client, egresshealth.Options{
+		PerRequestTimeout: 45 * time.Second,
+		Budget:            3 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("egress health through provider %s did not run: %s", providerId, err)
+	}
+	t.Logf("egress-health       %s", health.Summary())
+	for _, c := range health.Checks {
+		status := "FAIL"
+		if c.OK {
+			status = "ok  "
+		}
+		t.Logf("  %-4s %-18s %-5s status=%-4d bytes=%-6d %-8s %s",
+			status, c.Name, c.Class, c.StatusCode, c.ByteCount, c.Latency.Round(time.Millisecond), c.Err)
 	}
 }

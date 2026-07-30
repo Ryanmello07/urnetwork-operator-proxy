@@ -169,9 +169,45 @@ func Open(ctx context.Context, cfg Config, providerClientId connect.Id) (*Tunnel
 }
 
 // HTTPClient returns a client whose every connection is dialed through the
-// tunnel, with the configured certificate pins applied.
+// tunnel, with the configured certificate pins applied. Only the pinned hosts
+// may be reached.
 func (t *Tunnel) HTTPClient(timeout time.Duration) *http.Client {
 	return httpClientOverDialer(t.tun.DialContext, t.pins, timeout)
+}
+
+// HTTPClientForHosts is HTTPClient widened by a set of additional hosts that
+// are allowed WITHOUT a certificate pin. The pinned hosts stay pinned exactly
+// as before; extraHosts are reached under ordinary WebPKI chain verification
+// (the same verification crypto/tls does for any https client -- MinVersion
+// TLS 1.2, ServerName set, InsecureSkipVerify never set anywhere in this
+// package).
+//
+// This exists for the egress-health probe (see egresshealth/), which checks
+// that a provider carries traffic to ~9 well-known internet destinations. Those
+// destinations are deliberately NOT pinned, and the reason is that pinning them
+// would make the signal worse, not better:
+//
+//   - The threat pinning defends against here is a provider forging a result.
+//     For geolocation that is a live threat with a durable consequence: a forged
+//     country is written to the database and served to users. For egress health,
+//     forging a pass requires presenting a chain-valid certificate for
+//     cloudflare-dns.com, www.amazon.com and so on -- i.e. compromising or
+//     mis-issuing from a public CA. A provider cannot do that by being on the
+//     path, which is the capability actually in question.
+//
+//   - Pinning nine additional hosts, whose leaves rotate on nine independent
+//     schedules, would turn every routine certificate rotation into a
+//     pin-mismatch failure. That failure would be indistinguishable, in the
+//     recorded result, from the provider blackholing the destination -- the
+//     exact fault this probe exists to detect. A maintenance chore that
+//     manufactures false accusations against providers is worse than the
+//     residual risk it removes.
+//
+// The allowlist itself is preserved: a host that is neither pinned nor in
+// extraHosts is still refused outright by DialTLSContext, so this widens the
+// closed set rather than opening it.
+func (t *Tunnel) HTTPClientForHosts(timeout time.Duration, extraHosts []string) *http.Client {
+	return httpClientOverDialerWithHosts(t.tun.DialContext, t.pins, extraHosts, timeout)
 }
 
 // Close tears the tunnel down. It is safe to call more than once; only the
@@ -210,11 +246,35 @@ type dialContextFunc func(ctx context.Context, network string, address string) (
 // PinnedTLSConfigForHost(pins, host) avoids that trap by construction: the
 // verifier closes over host by value, not over any *tls.Config field.
 func httpClientOverDialer(dial dialContextFunc, pins map[string][]string, timeout time.Duration) *http.Client {
+	return httpClientOverDialerWithHosts(dial, pins, nil, timeout)
+}
+
+// httpClientOverDialerWithHosts is httpClientOverDialer with an additional set
+// of allowed-but-unpinned hosts. See Tunnel.HTTPClientForHosts for why the
+// egress-health destinations are allowed unpinned, and why that is not a
+// weakening of the geolocation guarantee: pinned hosts are unaffected, an
+// unpinned host still gets full WebPKI chain verification, and a host in
+// neither set is still refused.
+func httpClientOverDialerWithHosts(dial dialContextFunc, pins map[string][]string, extraHosts []string, timeout time.Duration) *http.Client {
 	// Normalized once, up front: this is the allowlist of the closed set of
-	// geolocation hosts this tunnel is permitted to speak TLS to (see
-	// geolocate/sources.go). Any https host not in this set is refused
-	// below, in DialTLSContext -- see the ErrPinHostUnknown check.
+	// hosts this tunnel is permitted to speak TLS to -- the pinned geolocation
+	// endpoints (see geolocate/sources.go) plus any explicitly-permitted
+	// unpinned hosts. Any https host not in this set is refused below, in
+	// DialTLSContext -- see the ErrPinHostUnknown check.
 	allowed := normalizePins(pins)
+	for _, host := range extraHosts {
+		host = normalizeHost(host)
+		if host == "" {
+			continue
+		}
+		if _, pinned := allowed[host]; pinned {
+			// Already pinned: leave the pin set alone. An extra host must never
+			// be able to REMOVE a pin, or adding a name to the health table
+			// would silently unpin a geolocation endpoint.
+			continue
+		}
+		allowed[host] = nil
+	}
 
 	tr := &http.Transport{
 		DialContext: dial,

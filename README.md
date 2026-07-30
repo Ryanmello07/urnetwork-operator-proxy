@@ -78,8 +78,9 @@ the prober tests the *property* instead of the mechanism: if a direct connection
 succeeds, the confinement is missing and the prober will not run. Without it, a
 probe that fails to tunnel would fall back to the host's own egress and record
 **the operator's** location for that provider — and hand the operator's address
-to three third-party APIs. The addresses tested are derived from
-`geolocate.SourceHosts()`, so there is no second endpoint list to drift.
+to third-party APIs. The addresses tested are derived from
+`geolocate.SourceHosts()` **and** `egresshealth.DestinationHosts()`, so there is
+no second endpoint list to drift.
 
 **Inability to verify is not evidence of confinement.** The check only reports a
 pass when it obtained real evidence, and refuses to start otherwise:
@@ -99,8 +100,10 @@ pass when it obtained real evidence, and refuses to start otherwise:
   `10ms` → correctly "not confined"; `1ms` → "passed".)
 
 For a jail where DNS legitimately cannot work, supply the addresses instead of
-disabling the check: `-confinement-address <ip:port>`, repeated once per
-geolocation endpoint (the error message lists them). Resolution is then skipped
+disabling the check: `-confinement-address <ip:port>`, repeated once per probe
+endpoint — every geolocation source *and* every egress-health destination (the
+error message lists them all; `egresshealth.DestinationHosts()` is the source of
+truth for the second half). Resolution is then skipped
 and exactly those addresses are dialed. The host part must be an IP literal — a
 name there would put the same hole back.
 
@@ -108,6 +111,49 @@ name there would put the same hole back.
 `WARNING` lines when set, and exists only for an operator running a one-shot
 manual probe from a host that is not the operator's. Do not set it in a
 deployment.
+
+### Egress health
+
+Provider reliability scoring on the server is **presence-based**:
+`reliabilityRunningAggSql` counts reported time blocks and sums
+`1.0/valid_client_count`, and never consults delivered bytes. A provider that
+stays connected 24/7 while blackholing every byte therefore scores perfectly and
+stays selectable — observed on mainnet: one provider accepted 87 KB and returned
+0 bytes with `connected = true AND valid = true`.
+
+So each pass also runs an **egress-health check over the same tunnel** the
+geolocation probe already opened (never a second one), against nine well-known
+destinations in three classes, and logs one line per provider:
+
+```
+egress-health: provider=<id> ok=7/9 dns=3/3 cdn=1/3 site=3/3 failed=fastly-jquery,cloudfront-awssdk
+```
+
+The classes are what make a partial failure diagnosable. `dns=3/3 cdn=0/3` is a
+provider whose egress range is refused by CDNs — the client-visible failure the
+geolocation probe cannot see, since geolocation APIs do not care where a request
+came from. `ok=0/9` is a blackhole. A flat count could not tell them apart, and
+neither could a probe that only ever talks to three geolocation APIs.
+
+- **Nothing is submitted and there is no server endpoint yet.** Storage and the
+  "healthy enough to select" verdict are separate work; shipping a verdict
+  before the signal has been watched in the field is how a probe starts
+  de-listing working providers.
+- Destinations are spread across **different operators within each class**, so a
+  provider that whitelists one vendor cannot pass a class.
+- Each check is a small GET with the body read capped at 4 KiB, so a full run
+  costs at most 36 KiB of body — under 1% of one 5 MiB active bandwidth probe.
+- The health destinations are reached **unpinned** but under ordinary WebPKI
+  verification. Pinning nine leaves that rotate on nine schedules would turn
+  every routine certificate rotation into a failure indistinguishable from the
+  provider blackholing the destination. The geolocation sources stay pinned.
+- A run is skipped, and logged as skipped, when the probe has no budget left: a
+  run on an expired deadline would fail every destination and read as a
+  blackhole.
+
+`egresshealth.DestinationHosts()` is the one place the destination hosts are
+written down — the confinement check and `-confinement-address` guidance both
+derive from it.
 
 ### Which providers get probed
 

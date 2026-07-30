@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/urnetwork/urnetwork-operator-proxy/confinement"
+	"github.com/urnetwork/urnetwork-operator-proxy/egresshealth"
 	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
 )
 
@@ -27,10 +28,11 @@ func lookupFails(ctx context.Context, host string) ([]string, error) {
 	return nil, errors.New("lookup " + host + ": no such host")
 }
 
-// lookupPerHost gives every geolocate source host its own documentation-range
+// lookupPerHost gives every host the check is supposed to cover -- geolocation
+// sources AND egress-health destinations -- its own documentation-range
 // address, so a test can assert that the check covered exactly that set.
 func lookupPerHost(ctx context.Context, host string) ([]string, error) {
-	for i, h := range geolocate.SourceHosts() {
+	for i, h := range probeHosts() {
 		if h == host {
 			return []string{fmt.Sprintf("203.0.113.%d", i+1)}, nil
 		}
@@ -53,12 +55,13 @@ func captureLog(t *testing.T) *bytes.Buffer {
 	return buf
 }
 
-// TestCheckConfinementProbesEveryGeolocationHost is the anti-drift assertion
-// that matters most here: the addresses the check tests must be DERIVED from
-// the same table geolocate will later fetch through a tunnel, not a second
-// hand-maintained copy. A second copy drifts on the first endpoint change and
-// the check keeps passing while no longer covering a real endpoint.
-func TestCheckConfinementProbesEveryGeolocationHost(t *testing.T) {
+// TestCheckConfinementProbesEveryProbeHost is the anti-drift assertion that
+// matters most here: the addresses the check tests must be DERIVED from the
+// same tables the prober will later fetch through a tunnel -- geolocate's
+// sources and egresshealth's destinations -- not a second hand-maintained copy.
+// A second copy drifts on the first endpoint change and the check keeps passing
+// while no longer covering a real endpoint.
+func TestCheckConfinementProbesEveryProbeHost(t *testing.T) {
 	captureLog(t)
 	var dialed []string
 	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -70,9 +73,9 @@ func TestCheckConfinementProbesEveryGeolocationHost(t *testing.T) {
 		t.Fatalf("checkConfinement: %s", err)
 	}
 
-	hosts := geolocate.SourceHosts()
+	hosts := probeHosts()
 	if len(hosts) == 0 {
-		t.Fatal("geolocate.SourceHosts is empty; the check would have nothing to test")
+		t.Fatal("probeHosts is empty; the check would have nothing to test")
 	}
 	var want []string
 	for i := range hosts {
@@ -81,7 +84,7 @@ func TestCheckConfinementProbesEveryGeolocationHost(t *testing.T) {
 	sort.Strings(want)
 	sort.Strings(dialed)
 	if strings.Join(dialed, ",") != strings.Join(want, ",") {
-		t.Fatalf("checkConfinement dialed %v, want the resolved address of every geolocate source host %v (%v)", dialed, want, hosts)
+		t.Fatalf("checkConfinement dialed %v, want the resolved address of every probe host %v (%v)", dialed, want, hosts)
 	}
 }
 
@@ -165,9 +168,9 @@ func TestCheckConfinementRefusesWhenNothingResolves(t *testing.T) {
 // resolved hosts are still tested; the gap is named.
 func TestCheckConfinementWarnsWhenSomeHostsDoNotResolve(t *testing.T) {
 	logs := captureLog(t)
-	hosts := geolocate.SourceHosts()
+	hosts := probeHosts()
 	if len(hosts) < 2 {
-		t.Skip("need at least two geolocate source hosts for a partial-resolution case")
+		t.Skip("need at least two probe hosts for a partial-resolution case")
 	}
 	skipped := hosts[len(hosts)-1]
 	lookup := func(ctx context.Context, host string) ([]string, error) {
@@ -380,5 +383,77 @@ func runProber(t *testing.T, args ...string) (string, int) {
 	default:
 		t.Fatalf("running the prober: %s", err)
 		return "", -1
+	}
+}
+
+// TestProbeHostsCoversBothTables: the confinement self-check is only as good as
+// the host list it is given. Both tables must be represented, and neither may
+// be represented twice -- a duplicate would make the check dial the same
+// address again and read like broader coverage than it has.
+//
+// The egress-health destinations matter here in a way that is easy to
+// under-weight. A prober that can reach them directly does not merely leak the
+// operator's address: the check would PASS from the operator's own host, and so
+// would certify a blackholing provider as healthy. That is the inversion of the
+// signal, not a degradation of it.
+func TestProbeHostsCoversBothTables(t *testing.T) {
+	hosts := probeHosts()
+	index := map[string]int{}
+	for _, h := range hosts {
+		index[h]++
+	}
+	for _, h := range hosts {
+		if index[h] != 1 {
+			t.Fatalf("probeHosts lists %q %d times: %v", h, index[h], hosts)
+		}
+	}
+	for _, h := range geolocate.SourceHosts() {
+		if index[h] == 0 {
+			t.Errorf("geolocation source host %q is not in probeHosts %v; the confinement check would not cover it", h, hosts)
+		}
+	}
+	for _, h := range egresshealth.DestinationHosts() {
+		if index[h] == 0 {
+			t.Errorf("egress-health destination host %q is not in probeHosts %v; the confinement check would not cover it, and an operator reading -confinement-address guidance would never learn it exists", h, hosts)
+		}
+	}
+	if len(hosts) < len(egresshealth.DestinationHosts()) {
+		t.Fatalf("probeHosts (%d) is smaller than the egress-health table alone (%d)", len(hosts), len(egresshealth.DestinationHosts()))
+	}
+}
+
+// TestEgressHealthDestinationsAreNotPinned records a deliberate decision so it
+// cannot be reversed by accident. The health destinations are reached through
+// the tunnel WITHOUT certificate pins (see
+// providertunnel.Tunnel.HTTPClientForHosts): their leaves rotate on nine
+// independent schedules, and a stale pin would surface as a failed destination
+// -- indistinguishable, in the recorded result, from the provider blackholing
+// it. Ordinary WebPKI verification still applies, which is what a provider on
+// the path cannot forge.
+func TestEgressHealthDestinationsAreNotPinned(t *testing.T) {
+	pins := geolocatePins()
+	for _, h := range egresshealth.DestinationHosts() {
+		if _, pinned := pins[h]; pinned {
+			t.Errorf("egress-health destination %q has a certificate pin; routine leaf rotation would then read as the provider blackholing it", h)
+		}
+	}
+}
+
+// TestEgressHealthBudgetIsBounded: the budget must scale with -probe-timeout
+// (so raising it actually helps a slow provider) and must not be unbounded (so
+// a swallowing provider cannot hold a pass open).
+func TestEgressHealthBudgetIsBounded(t *testing.T) {
+	small := egressHealthBudget(time.Second)
+	large := egressHealthBudget(10 * time.Second)
+	if small <= 0 {
+		t.Fatalf("egressHealthBudget(1s) = %s, want positive", small)
+	}
+	if large <= small {
+		t.Fatalf("egressHealthBudget does not scale with -probe-timeout: 1s -> %s, 10s -> %s", small, large)
+	}
+	rounds := large / (10 * time.Second)
+	if rounds < 1 || 6 < rounds {
+		t.Fatalf("egressHealthBudget allows %d per-request rounds; that is not a sane bound for %d destinations at concurrency %d",
+			rounds, len(egresshealth.DestinationHosts()), egresshealth.DefaultConcurrency)
 	}
 }
