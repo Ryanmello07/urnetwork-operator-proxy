@@ -276,35 +276,59 @@ func newProber(tunnelCfg providertunnel.Config, probeTimeout time.Duration, oper
 		// verdict are separate work, and a verdict shipped before the signal has
 		// been watched in the field would start de-listing working providers.
 		//
-		// Its budget is derived from -probe-timeout the same way the geolocation
-		// per-source deadline is: PerRequestTimeout is one -probe-timeout (each
-		// request pays a cold in-tunnel DoH resolution plus a full TLS
-		// handshake), and the whole run is capped at the same value multiplied
-		// by the number of concurrent rounds, so a provider that swallows
-		// everything cannot hold a pass open indefinitely.
+		// Its budget is derived from -probe-timeout: see egressHealthOptions for
+		// the arithmetic and for what a full pass therefore costs.
 		Health: func(ctx context.Context, client *http.Client) (*egresshealth.Result, error) {
-			return egresshealth.Check(ctx, client, egresshealth.Options{
-				PerRequestTimeout: probeTimeout,
-				Budget:            egressHealthBudget(probeTimeout),
-			})
+			return egresshealth.Check(ctx, client, egressHealthOptions(probeTimeout))
 		},
 		Submit:   operator,
 		Attempts: operator,
 	}
 }
 
-// egressHealthBudget bounds a whole egress-health run given the per-request
-// timeout. With the default concurrency the run is at most
-// ceil(destinations/concurrency) sequential rounds, and this allows exactly
-// that many per-request timeouts: enough that a slow-but-working provider
-// finishes, tight enough that a swallowing provider ends the run instead of
-// stalling the pass.
-func egressHealthBudget(probeTimeout time.Duration) time.Duration {
+// egressHealthOptions derives the health check's bounds from -probe-timeout so
+// that a FULL health run costs at most ONE additional -probe-timeout per
+// provider, whatever the provider does.
+//
+// The arithmetic matters, because the naive version is a 4x regression on the
+// pass. There is no per-provider deadline in the scheduler -- the bound on a
+// probe comes from the http.Client timeout and geolocate's per-source cap -- so
+// whatever budget is handed to the health check is added to the wall clock of
+// every probe against a provider that swallows requests. Giving each health
+// request a full -probe-timeout, over ceil(9/3) = 3 sequential rounds, would
+// add 3 x -probe-timeout: at the defaults, a blackholing provider would go from
+// ~60s to ~240s, and a 100-provider batch at -concurrency 4 from ~25 min to
+// ~100 min against a 1h -interval.
+//
+// Instead the WHOLE run gets one -probe-timeout, divided across the rounds. A
+// blackholing provider therefore costs about 2 x -probe-timeout in total
+// (geolocation, then health), not 4x.
+//
+// Per-request that is 20s at the 60s default, against 60s for a geolocation
+// source. The shorter budget is defensible here and not merely convenient: by
+// the time the health check runs, the multiclient session is established and
+// the tunnel has already carried the geolocation lookups. A health request pays
+// a name resolution (often already cached in-tunnel by then), a TCP connect and
+// a TLS handshake -- not the cold-start the geolocation cap is sized for. If
+// that turns out to be wrong in the field it shows up as a specific,
+// recognisable shape: timeouts spread evenly across all three classes, on
+// providers whose geolocation succeeded.
+func egressHealthOptions(probeTimeout time.Duration) egresshealth.Options {
 	rounds := (len(egresshealth.Destinations()) + egresshealth.DefaultConcurrency - 1) / egresshealth.DefaultConcurrency
 	if rounds < 1 {
 		rounds = 1
 	}
-	return time.Duration(rounds) * probeTimeout
+	perRequest := probeTimeout / time.Duration(rounds)
+	if perRequest <= 0 {
+		// Only reachable for a -probe-timeout smaller than the round count in
+		// nanoseconds, which flag validation already rules out; falling back to
+		// the whole budget is still bounded.
+		perRequest = probeTimeout
+	}
+	return egresshealth.Options{
+		PerRequestTimeout: perRequest,
+		Budget:            probeTimeout,
+	}
 }
 
 // newSchedulers returns the scheduler for a server-driven pass and the one for
@@ -476,10 +500,19 @@ func checkConfinement(ctx context.Context, dial confinement.DialFunc, lookup con
 		log.Printf("egress-prober: confinement self-check: dialing the %d address(es) given with -confinement-address, skipping resolution: %s (probe hosts: %s -- keep these addresses current with that list)",
 			len(addrs), strings.Join(addrs, " "), strings.Join(hosts, " "))
 	} else {
-		// Resolution is bounded by the same budget as a dial: under a real
-		// deny-all confinement dns is blocked too, and an unbounded lookup
-		// would hang startup.
-		resolveCtx, cancel := context.WithTimeout(ctx, timeout)
+		// Resolution is bounded so that a blocked resolver cannot hang startup
+		// -- under a real deny-all confinement dns is blocked too. The budget is
+		// PER HOST, not for the whole list: confinement.Addresses resolves
+		// sequentially, and this list grew from 3 geolocation hosts to 12 when
+		// the egress-health destinations joined it. Keeping one flat budget for
+		// the whole loop would have quietly made the check four times more
+		// likely to time out mid-list on a slow resolver -- which does not fail
+		// loudly, it degrades: the later hosts land in `unresolved`, the check
+		// reports a DEGRADED pass, and the endpoints it stopped covering are
+		// exactly the ones added last. (Measured here with a working resolver:
+		// 12 hosts -> 49 addresses in 25ms, so this is headroom, not a
+		// requirement.)
+		resolveCtx, cancel := context.WithTimeout(ctx, timeout*time.Duration(len(hosts)))
 		var err error
 		addrs, unresolved, err = confinement.Addresses(resolveCtx, lookup, hosts, confinementPort)
 		cancel()

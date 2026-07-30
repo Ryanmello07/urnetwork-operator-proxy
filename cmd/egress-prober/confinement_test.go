@@ -439,21 +439,37 @@ func TestEgressHealthDestinationsAreNotPinned(t *testing.T) {
 	}
 }
 
-// TestEgressHealthBudgetIsBounded: the budget must scale with -probe-timeout
-// (so raising it actually helps a slow provider) and must not be unbounded (so
-// a swallowing provider cannot hold a pass open).
-func TestEgressHealthBudgetIsBounded(t *testing.T) {
-	small := egressHealthBudget(time.Second)
-	large := egressHealthBudget(10 * time.Second)
-	if small <= 0 {
-		t.Fatalf("egressHealthBudget(1s) = %s, want positive", small)
+// TestEgressHealthAddsAtMostOneProbeTimeout is the arithmetic that keeps the
+// health check from stalling a pass. There is no per-provider deadline in the
+// scheduler, so whatever budget the health check gets is added to the wall
+// clock of every probe against a provider that swallows requests. A budget of
+// one-per-request across three rounds would triple that. The whole run must fit
+// in one -probe-timeout.
+func TestEgressHealthAddsAtMostOneProbeTimeout(t *testing.T) {
+	for _, probeTimeout := range []time.Duration{time.Second, 30 * time.Second, 60 * time.Second, 5 * time.Minute} {
+		opts := egressHealthOptions(probeTimeout)
+		if opts.Budget != probeTimeout {
+			t.Errorf("egressHealthOptions(%s).Budget = %s; a full health run must add at most one -probe-timeout per provider", probeTimeout, opts.Budget)
+		}
+		if opts.PerRequestTimeout <= 0 {
+			t.Errorf("egressHealthOptions(%s).PerRequestTimeout = %s, want positive", probeTimeout, opts.PerRequestTimeout)
+		}
+		if opts.PerRequestTimeout > opts.Budget {
+			t.Errorf("egressHealthOptions(%s): per-request %s exceeds the whole-run budget %s", probeTimeout, opts.PerRequestTimeout, opts.Budget)
+		}
+		// The per-request bound must leave room for every destination to be
+		// attempted within the budget, or the last round is always cut off and
+		// those destinations fail for a reason the provider had nothing to do
+		// with.
+		rounds := (len(egresshealth.Destinations()) + egresshealth.DefaultConcurrency - 1) / egresshealth.DefaultConcurrency
+		if got := opts.PerRequestTimeout * time.Duration(rounds); got > opts.Budget {
+			t.Errorf("egressHealthOptions(%s): %d rounds x %s = %s exceeds the budget %s; the last round would always be cut off",
+				probeTimeout, rounds, opts.PerRequestTimeout, got, opts.Budget)
+		}
 	}
-	if large <= small {
-		t.Fatalf("egressHealthBudget does not scale with -probe-timeout: 1s -> %s, 10s -> %s", small, large)
-	}
-	rounds := large / (10 * time.Second)
-	if rounds < 1 || 6 < rounds {
-		t.Fatalf("egressHealthBudget allows %d per-request rounds; that is not a sane bound for %d destinations at concurrency %d",
-			rounds, len(egresshealth.DestinationHosts()), egresshealth.DefaultConcurrency)
+	// ...and it must still scale, so raising -probe-timeout actually helps a
+	// slow provider.
+	if egressHealthOptions(10*time.Second).PerRequestTimeout <= egressHealthOptions(time.Second).PerRequestTimeout {
+		t.Error("egressHealthOptions does not scale with -probe-timeout")
 	}
 }

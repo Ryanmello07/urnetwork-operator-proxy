@@ -135,6 +135,11 @@ geolocation probe cannot see, since geolocation APIs do not care where a request
 came from. `ok=0/9` is a blackhole. A flat count could not tell them apart, and
 neither could a probe that only ever talks to three geolocation APIs.
 
+Whether the site-class destinations actually discriminate against datacenter
+ranges is **not yet validated in the field**: from one datacenter host, both
+`amazon` and `reddit` answered normally. That is the first thing the field data
+should settle.
+
 - **Nothing is submitted and there is no server endpoint yet.** Storage and the
   "healthy enough to select" verdict are separate work; shipping a verdict
   before the signal has been watched in the field is how a probe starts
@@ -143,6 +148,10 @@ neither could a probe that only ever talks to three geolocation APIs.
   provider that whitelists one vendor cannot pass a class.
 - Each check is a small GET with the body read capped at 4 KiB, so a full run
   costs at most 36 KiB of body — under 1% of one 5 MiB active bandwidth probe.
+  A full run against a completely unresponsive provider costs at most one extra
+  `-probe-timeout` of wall clock per provider (the whole run shares that one
+  budget across three concurrent rounds), so a blackholing provider costs about
+  2× `-probe-timeout` in total rather than 4×.
 - The health destinations are reached **unpinned** but under ordinary WebPKI
   verification. Pinning nine leaves that rotate on nine schedules would turn
   every routine certificate rotation into a failure indistinguishable from the

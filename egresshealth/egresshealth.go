@@ -99,10 +99,11 @@ type Destination struct {
 	Name  string
 	Class Class
 	URL   string
-	// Headers are sent with the request. Two uses: the DoH JSON GET form that
-	// Cloudflare gates behind an Accept header, and a Range header on the
-	// destinations that honor one, which keeps a large asset from putting more
-	// than a couple of KiB on the wire.
+	// Headers are sent with the request, and exist because two destinations
+	// cannot be checked without them: cloudflare-dns.com answers 400 to the DoH
+	// JSON GET form without an Accept header, and the CDN entries need a Range
+	// header to keep a large asset from putting more than a couple of KiB on the
+	// wire. See also UserAgent, which every request carries.
 	Headers map[string]string
 }
 
@@ -167,11 +168,18 @@ const UserAgent = "urnetwork-egress-prober/0.1 (+https://github.com/urnetwork/ur
 //     destination that would routinely exceed the wire budget. The favicon is
 //     2734 bytes, served by the same Wikimedia edge.
 //
-//   - amazon.com and reddit.com are in the table precisely BECAUSE they reject
-//     datacenter IP ranges. That rejection is the client-visible failure the
-//     geolocation probe cannot see. Wikipedia is the neutral control that keeps
-//     the class interpretable: site=1/3 with wikipedia OK is datacenter-IP
-//     rejection, site=0/3 is the class failing outright.
+//   - amazon.com and reddit.com are in the table because they are the kind of
+//     destination that rejects datacenter IP ranges -- the client-visible
+//     failure the geolocation probe cannot see. That property is NOT yet
+//     validated in the field: from one datacenter host on 2026-07-30 both
+//     answered 206, so this host's range is not blocked by either. The
+//     rejection is reputation- and range-dependent, so whether these two
+//     actually discriminate is a question for the first weeks of field data,
+//     not something to assert here.
+//
+//   - Wikipedia is the neutral control that keeps the class interpretable:
+//     site=1/3 with wikipedia OK is selective rejection, site=0/3 is the class
+//     failing outright.
 //
 // Status observed for every entry on 2026-07-30 from an unconfined host: 200 or
 // 206, non-empty body, all well under MaxBodyBytes.
