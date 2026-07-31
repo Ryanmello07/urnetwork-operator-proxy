@@ -1046,11 +1046,13 @@ var destinations = []Destination{
 		// /robots.txt, so it can never satisfy ExpectBody. Declared as the
 		// redirect it actually is. Measured on the beta fleet: 4 of 40
 		// providers failed on this entry alone before the fix.
+		// Measured 302 from one vantage but 301 through provider tunnels: the
+		// exact status depends on where the client exits, so it cannot be
+		// declared. Reachability is the question this class actually asks.
 		Name:     "hulu",
 		Class:    ClassSite,
 		URL:      "https://www.hulu.com",
-		Expect:   ExpectStatus,
-		Status:   302,
+		Expect:   ExpectReachable,
 		Headers:  map[string]string{"Range": rangeFirst1KiB},
 		MaxBytes: maxAssetBytes,
 	},
@@ -1345,19 +1347,6 @@ var destinations = []Destination{
 		Name:     "internet-archive",
 		Class:    ClassSite,
 		URL:      "https://archive.org",
-		Headers:  map[string]string{"Range": rangeFirst1KiB},
-		MaxBytes: maxAssetBytes,
-	},
-	{
-		// Re-pointed for the same reason as sucuri-cdn: the bare host ignores
-		// Range and returns 31,388 B, which failed on 7 of 40 beta providers.
-		// robots.txt returns 886 B.
-		// Same geo-redirect shape as microsoft: fine from a datacenter host,
-		// failed on all 40 provider tunnels.
-		Name:     "openstreetmap",
-		Class:    ClassSite,
-		Expect:   ExpectReachable,
-		URL:      "https://www.openstreetmap.org/robots.txt",
 		Headers:  map[string]string{"Range": rangeFirst1KiB},
 		MaxBytes: maxAssetBytes,
 	},
