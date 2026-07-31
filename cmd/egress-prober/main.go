@@ -68,6 +68,7 @@ func main() {
 	skipConfinementCheck := flag.Bool("skip-confinement-check", false, "DANGEROUS: start even if this host can reach a geolocation api directly. Only for a one-shot manual probe on a host you know is not the operator's; a direct lookup records the OPERATOR's location for the provider and exposes the operator's address to the api")
 	confinementTimeout := flag.Duration("confinement-timeout", 3*time.Second, "per-address deadline for the startup confinement self-check; a timeout counts as blocked. Must be at least "+confinement.MinTimeout.String())
 	var confinementAddrs addressList
+	publicAPIURL := flag.String("public-api-url", "", "the address the api answers on FROM THE PUBLIC INTERNET, used as the operator bandwidth target. This is not -api-url: control-plane calls go prober -> api directly (an internal name on docker), but the bandwidth target travels prober -> platform -> provider -> internet -> api, so it needs the public address. Empty drops the operator target and measures the cdn only")
 	egressHealthAll := flag.Bool("egress-health-all", true, "run EVERY destination in the egress-health table instead of a random sample. Default true: the full table is also the only way this exercises CONCURRENCY, since a 30-destination sample never asks the provider to carry the full parallel load a real client would. Setting it false restores sampling, which is cheaper and keeps the destination list unpredictable, but no longer tests that dimension")
 	flag.Var(&confinementAddrs, "confinement-address", "ip:port the confinement self-check should dial instead of resolving the probe hosts; repeatable. For a jail where dns is legitimately blocked: supply the address of every geolocation source AND every egress-health destination here and the check stays real. The host part must be an ip literal, not a name")
 	dueURL := flag.String("due-url", "", "url of the server's due-provider endpoint; empty derives <api-url>/network/provider-egress-due")
@@ -216,9 +217,19 @@ func main() {
 	bandwidthSampler := (*bandwidth.Sampler)(nil)
 	bandwidthTargets := []bandwidth.Target{}
 	if !*skipBandwidth {
+		// The cdn target is always present; the operator target is dropped when
+		// no public api url is configured, because an internal name fails from
+		// the far side of the tunnel for EVERY provider and reads as a
+		// fleet-wide fault rather than a misconfiguration.
 		bandwidthTargets = []bandwidth.Target{
-			bandwidth.OperatorTarget(*apiURL, *operatorSecret),
 			{Name: "cdn", Source: bandwidth.SourceCDN, URL: *bandwidthCDNURL},
+		}
+		if strings.TrimSpace(*publicAPIURL) != "" {
+			bandwidthTargets = append([]bandwidth.Target{
+				bandwidth.OperatorTarget(*publicAPIURL, *operatorSecret),
+			}, bandwidthTargets...)
+		} else {
+			log.Printf("egress-prober: no -public-api-url, measuring the cdn target only (the operator target cannot be reached through a provider tunnel by its internal name)")
 		}
 		bandwidthSampler = &bandwidth.Sampler{
 			Targets: bandwidthTargets,

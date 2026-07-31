@@ -144,13 +144,23 @@ type Sample struct {
 // OperatorTarget builds the operator-endpoint target. The operator secret is
 // carried in the same X-UR-Operator-Secret header the other operator routes
 // use.
-func OperatorTarget(serverURL string, operatorSecret string) Target {
+//
+// publicServerURL is NOT the same value as the -api-url the prober uses for
+// its control-plane calls, and conflating the two is a real bug that was
+// deployed once: the control-plane url is reached prober -> api directly, so
+// on a docker deployment it is an internal name like http://api:8080, but
+// THIS request travels prober -> platform -> provider -> internet -> back to
+// the api, so it must be the address the api answers on from the public
+// internet. An internal name fails the same way for every provider
+// ("context deadline exceeded"), which reads like a fleet-wide provider fault
+// and is not one.
+func OperatorTarget(publicServerURL string, operatorSecret string) Target {
 	h := http.Header{}
 	h.Set("X-UR-Operator-Secret", operatorSecret)
 	return Target{
 		Name:   "operator",
 		Source: SourceOperator,
-		URL:    strings.TrimRight(serverURL, "/") + "/network/provider-bandwidth-test",
+		URL:    strings.TrimRight(publicServerURL, "/") + "/network/provider-bandwidth-test",
 		Header: h,
 	}
 }
@@ -161,9 +171,15 @@ func CDNTarget() Target {
 	return Target{Name: "cdn", Source: SourceCDN, URL: CDNTestURL}
 }
 
-// DefaultTargets is the production pair, in log order.
-func DefaultTargets(serverURL string, operatorSecret string) []Target {
-	return []Target{OperatorTarget(serverURL, operatorSecret), CDNTarget()}
+// DefaultTargets is the production pair, in log order. An empty
+// publicServerURL drops the operator target rather than emitting one that
+// cannot resolve from the far side of the tunnel: a target that fails for
+// every provider is worse than no target, because it looks like a finding.
+func DefaultTargets(publicServerURL string, operatorSecret string) []Target {
+	if strings.TrimSpace(publicServerURL) == "" {
+		return []Target{CDNTarget()}
+	}
+	return []Target{OperatorTarget(publicServerURL, operatorSecret), CDNTarget()}
 }
 
 // TargetHosts returns the hostnames the targets are reached at, for the
