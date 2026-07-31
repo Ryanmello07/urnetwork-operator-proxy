@@ -1246,10 +1246,12 @@ func TestWorstCaseBytesPerRunFitsTheBudget(t *testing.T) {
 	var worst, wholeTable int64
 	for _, c := range tableClasses(destinations) {
 		var largest, classTotal int64
+		pool := 0
 		for _, d := range destinations {
 			if d.Class != c {
 				continue
 			}
+			pool++
 			classTotal += d.maxBytes()
 			if largest < d.maxBytes() {
 				largest = d.maxBytes()
@@ -1258,7 +1260,7 @@ func TestWorstCaseBytesPerRunFitsTheBudget(t *testing.T) {
 		n := int64(sampleCount(destinations, c, sampleSizes))
 		worst += n * largest
 		wholeTable += classTotal
-		t.Logf("  %-12s %2d of %3d x %4d = %6d bytes", c, n, classTotal/largest, largest, n*largest)
+		t.Logf("  %-12s %2d of %3d x %4d = %6d bytes", c, n, pool, largest, n*largest)
 	}
 	t.Logf("worst case per run: %d bytes (%.2f KiB), budget %d; the whole table would be %d (%.2f KiB)",
 		worst, float64(worst)/1024, budget, wholeTable, float64(wholeTable)/1024)
@@ -1303,7 +1305,7 @@ func TestSampleSizesAreDeclaredForEveryClass(t *testing.T) {
 				pool++
 			}
 		}
-		if pool < n {
+		if pool <= n {
 			t.Errorf("class %q samples %d from a pool of %d; the sample must be drawn from more than it takes, or it is a fixed table wearing a sample's name", c, n, pool)
 		}
 	}

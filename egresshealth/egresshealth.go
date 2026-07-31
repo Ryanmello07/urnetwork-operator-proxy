@@ -182,9 +182,10 @@ const (
 
 	// ClassReputation measures something the other classes do not, and is
 	// EXCLUDED FROM THE HEALTH SCORE ON PURPOSE. Do not fold it into
-	// Result.OKCount/Total. Every entry in it was measured refusing a datacenter
-	// IP outright -- 403, 401 -- in four consecutive runs from a hosted host. On
-	// a residential or cellular exit those same endpoints return clean. So a
+	// Result.OKCount/Total. Six of its eight entries were measured refusing a
+	// datacenter IP outright -- 403, 401 -- in four consecutive runs from a
+	// hosted host, and again when this table was built. On a residential or
+	// cellular exit those same endpoints return clean. So a
 	// failure here says "this exit is treated as a datacenter by bot-management
 	// vendors", which is genuinely useful (a provider that passes is more useful
 	// to a real user, because that is what the user will hit) but is NOT a
