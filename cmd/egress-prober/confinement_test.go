@@ -457,14 +457,21 @@ func TestEgressHealthAddsAtMostOneProbeTimeout(t *testing.T) {
 		if opts.PerRequestTimeout > opts.Budget {
 			t.Errorf("egressHealthOptions(%s): per-request %s exceeds the whole-run budget %s", probeTimeout, opts.PerRequestTimeout, opts.Budget)
 		}
-		// The per-request bound must leave room for every destination to be
-		// attempted within the budget, or the last round is always cut off and
-		// those destinations fail for a reason the provider had nothing to do
-		// with.
-		rounds := (len(egresshealth.Destinations()) + egresshealth.DefaultConcurrency - 1) / egresshealth.DefaultConcurrency
+		// The per-request bound must leave room for every SAMPLED destination
+		// to be attempted within the budget, or the last round is always cut
+		// off and those destinations fail for a reason the provider had nothing
+		// to do with.
+		rounds := (egresshealth.SamplePerRun() + egresshealth.DefaultConcurrency - 1) / egresshealth.DefaultConcurrency
 		if got := opts.PerRequestTimeout * time.Duration(rounds); got > opts.Budget {
 			t.Errorf("egressHealthOptions(%s): %d rounds x %s = %s exceeds the budget %s; the last round would always be cut off",
 				probeTimeout, rounds, opts.PerRequestTimeout, got, opts.Budget)
+		}
+		// ...and it must be sized off the sample rather than the table, or each
+		// request gets a fraction of what a cold-tunnel request needs while the
+		// assertion above still passes.
+		if wholeTable := (len(egresshealth.Destinations()) + egresshealth.DefaultConcurrency - 1) / egresshealth.DefaultConcurrency; rounds >= wholeTable {
+			t.Errorf("egressHealthOptions divides %s across %d rounds, which is the whole %d-entry table; a run samples %d destinations",
+				probeTimeout, rounds, len(egresshealth.Destinations()), egresshealth.SamplePerRun())
 		}
 	}
 	// ...and it must still scale, so raising -probe-timeout actually helps a

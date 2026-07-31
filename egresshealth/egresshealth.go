@@ -28,11 +28,11 @@
 //
 // # Classes
 //
-// Destinations are grouped so a PARTIAL failure is diagnosable. "ok=14/27"
-// alone says nothing; "dns=7/7 cdn=0/5 site=5/5" says the tunnel carries bytes
-// and resolves names but is being refused by content providers, which is the
-// datacenter-IP-rejection case -- a completely different fault from a total
-// blackhole (ok=0/27), and a different fault again from one flaky destination.
+// Destinations are grouped so a PARTIAL failure is diagnosable. "ok=14/26"
+// alone says nothing; "dns=4/4 cdn=0/5 site=12/12" says the tunnel carries
+// bytes and resolves names but is being refused by content providers, which is
+// the datacenter-IP-rejection case -- a completely different fault from a total
+// blackhole (ok=0/26), and a different fault again from one flaky destination.
 //
 // The table deliberately spreads across DIFFERENT operators within each class,
 // so a provider that special-cases one vendor's ranges cannot pass a class.
@@ -41,46 +41,89 @@
 // OKCount/Total -- see its doc comment below, which is the one thing in this
 // package most likely to be "fixed" into a bug.
 //
+// # Sampling: the table is large, a run is not
+//
+// The table is 140 destinations. A run fetches a bounded RANDOM SAMPLE of each
+// class rather than the whole thing (see sampleSizes for the arithmetic), so
+// coverage accumulates across runs instead of being paid on every one.
+//
+// This is one code path with one set of constants for every deployment. There
+// is no "small table for mainstream, big table for beta" switch and there must
+// not be one: a knob that only one environment exercises is how a gap goes
+// unnoticed here -- the untested branch is the one that runs against 100k
+// providers.
+//
+// Sampling also buys a property a fixed table cannot have, and it is a security
+// property rather than a cost one. A provider cannot know which destinations it
+// will be asked for, because the draw happens at run time from the prober's own
+// randomness. Whitelisting a handful of well-known hosts -- which defeats any
+// fixed table, and defeated the fixed nine-entry table this descends from --
+// now fails: to pass reliably a provider has to carry traffic to essentially
+// the whole table, which is the thing being measured. That is a reason to
+// prefer sampling a wide table over simply carrying a narrow one.
+//
+// # DNS
+//
+// The dns class is seven DNS-over-HTTPS endpoints. It is not, and cannot
+// currently be, a test of resolvers as such: the owner's list names 23 bare
+// resolver ADDRESSES (8.8.8.8, 1.1.1.1, ...), and a resolver is queried over
+// UDP/53 or TCP/53, which this package has no way to reach -- the tunnel is
+// exposed to it as an *http.Client and nothing else. Genuine resolver coverage
+// needs a UDP path through the tunnel, which is a different piece of work; the
+// bare-IP rows are ignored here rather than fetched over http, which would test
+// something else entirely and pass or fail for reasons unrelated to resolution.
+//
+// What the DoH entries do prove is that a name was resolved END TO END through
+// the tunnel, because every one of them parses its answer (see verifyDNSJSON).
+// A captive portal answers 200 with bytes; only an answer section proves
+// resolution.
+//
 // # Ambiguity this cannot resolve on its own
 //
 // Name resolution is a shared precondition: the tunnel resolves every hostname
 // through in-tunnel DoH (connect's DefaultDnsResolverSettings, which uses
 // 1.1.1.1, 8.8.8.8, 9.9.9.9 and 208.67.222.222), and providertunnel
-// deliberately disables the off-tunnel fallback. So a run that comes back 0/27
+// deliberately disables the off-tunnel fallback. So a run that comes back 0/26
 // is "this provider carried nothing useful", which covers both a blackhole and
 // an in-tunnel DoH failure. The per-check Err strings are what separate them:
 // a resolution failure names the lookup, a blackhole times out on the request.
-// Do not read 0/27 as proof of a blackhole without them.
+// Do not read 0/26 as proof of a blackhole without them.
 //
 // # Byte budget
 //
 // Each check is a small GET whose body read is capped -- per destination via
-// Destination.MaxBytes, and never above MaxBodyBytes. The worst case for a full
-// run is therefore the SUM of the per-destination caps, which is arithmetic the
-// table can be checked against (TestWorstCaseBytesPerRunFitsTheBudget):
+// Destination.MaxBytes, and never above MaxBodyBytes, which is 1024 bytes.
 //
-//	dns          7 x  768 =  5376
-//	connectivity 8 x  256 =  2048
-//	cdn          5 x 2048 = 10240
-//	site         5 x 2048 = 10240
-//	                        -----
-//	health              =   27904
-//	reputation   6 x 1024 =  6144
-//	                        -----
-//	total               =   34048 bytes = 33.25 KiB
+// Fetching the whole table at that cap would cost 128 KiB per provider per run
+// (the same table fetched UNCAPPED was measured at 36,960 KiB, because several
+// front pages are 1.5-2.4 MB). 128 KiB is affordable for beta's ~40 providers
+// and is ~12 GB per pass at 100k providers, which is far outside the budget
+// this rides -- so the run samples, and the SAMPLE is what the budget is
+// computed on. The arithmetic is on sampleSizes and is asserted by
+// TestWorstCaseBytesPerRunFitsTheBudget:
 //
-// That is BELOW the 36 KiB (9 x 4 KiB) worst case of the smaller nine-entry
-// table this replaces, which is the point: the connectivity class is
-// purpose-built for this and answers in 0-69 bytes, so a table three times
-// wider is also a cheaper one. Adding TLS handshakes, request/response headers
-// and the DoH lookups behind them, a full run stays well under 128 KiB.
+//	dns           4 x  768 =  3072
+//	connectivity  5 x  256 =  1280
+//	cdn           5 x 1024 =  5120
+//	site         12 x 1024 = 12288
+//	                        ------
+//	health                 = 21760
+//	reputation    4 x 1024 =  4096
+//	                        ------
+//	per run                = 25856 bytes = 25.25 KiB
 //
-// Where it is honored, a Range header holds the larger destinations to ~2 KiB
-// on the wire; a server that IGNORES Range can still put up to one TCP receive
-// window in flight before the capped read closes the body, which is the one
-// place these figures can be exceeded on the wire. www.canva.com was measured
-// answering a 403 with 1.4 MB of body, so this is not theoretical -- the cap is
-// what keeps it from mattering.
+// That is below the 33.25 KiB of the 31-entry fixed table this replaces, from a
+// table four and a half times wider. Adding TLS handshakes, request/response
+// headers and the DoH lookups behind them, a run stays well under 128 KiB.
+//
+// Where it is honored, a Range header holds the larger destinations to ~1 KiB
+// on the wire. Many hosts IGNORE it -- measured on this table: www.wikipedia.org,
+// www.atlassian.com, cloud.google.com, apnews.com and www.baidu.com all
+// returned 200 and the whole asset, and jsDelivr and BootstrapCDN did the same
+// in an earlier round -- so the header is an optimisation, and io.LimitReader
+// is what actually bounds the cost. A server that ignores Range can still put
+// up to one TCP receive window in flight before the capped read closes the
+// body, which is the one place these figures can be exceeded on the wire.
 //
 // This rides the same budget as the server's active bandwidth probe, which
 // spends model.MaxProviderBandwidthBytesPerProbe = 5 MiB per probe and
@@ -90,10 +133,13 @@ package egresshealth
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -111,13 +157,28 @@ type Class string
 const (
 	ClassDNS Class = "dns"
 	// ClassConnectivity is the purpose-built captive-portal-detection endpoints
-	// every operating system already ships with. They are unauthenticated, carry
-	// no anti-bot machinery, and answer in tens of bytes -- the cheapest useful
-	// signal in the table, and the class least likely to fail for a reason that
-	// has nothing to do with the provider.
+	// every operating system already ships with, plus the echo services that
+	// answer with the exit address. They are unauthenticated, carry no anti-bot
+	// machinery, and answer in tens of bytes -- the cheapest useful signal in
+	// the table, and the class least likely to fail for a reason that has
+	// nothing to do with the provider.
 	ClassConnectivity Class = "connectivity"
-	ClassCDN          Class = "cdn"
-	ClassSite         Class = "site"
+	// ClassCDN is CDN edges, distribution mirrors and bulk-download hosts: the
+	// operators whose business is serving static bytes. This is the class that
+	// fails when a provider's egress range is on a CDN blocklist.
+	ClassCDN Class = "cdn"
+	// ClassSite is ordinary web properties -- search, social, video, commerce,
+	// news, reference, developer infrastructure, and the regional properties
+	// that carry the same traffic outside the US and EU.
+	//
+	// The regional entries (qq.com, taobao, vk, naver, globo, ...) are
+	// deliberately NOT a class of their own, even though the source list groups
+	// them that way. A "regional" class would fail on healthy providers for
+	// geographic reasons -- an exit in one country reaching another country's
+	// properties slowly or not at all -- which is the ClassReputation trap
+	// reintroduced INSIDE the health score. Mixed into site, they widen the
+	// operator spread without inventing a verdict the data cannot support.
+	ClassSite Class = "site"
 
 	// ClassReputation measures something the other classes do not, and is
 	// EXCLUDED FROM THE HEALTH SCORE ON PURPOSE. Do not fold it into
@@ -144,6 +205,11 @@ const (
 	// address alone, and this class needs field data across many providers
 	// before anyone treats it as a clean IP-quality score. It is a diagnostic
 	// under observation, not a metric.
+	//
+	// Two entries in it do not currently discriminate, and both are recorded on
+	// the entries themselves so a log line is not misread: stackoverflow answers
+	// 302 to everyone (a zero-body issue, never an ip refusal), and ecosia's
+	// answer differed between the staged runs and the one that built this table.
 	ClassReputation Class = "reputation"
 )
 
@@ -167,6 +233,53 @@ var unscoredClasses = map[Class]bool{ClassReputation: true}
 // scored reports whether a class counts towards the health score.
 func scored(c Class) bool { return !unscoredClasses[c] }
 
+// sampleSizes is how many destinations of each class one run draws. It is a
+// package constant, identical in every deployment -- see the package comment on
+// why there is no per-environment knob.
+//
+// Two constraints fix these numbers, and it is worth recording which one binds.
+//
+// The BYTE budget: at the 1024-byte cap a run may spend about 33 KiB per
+// provider (what the 31-entry fixed table cost), which would buy ~33
+// destinations. The arithmetic for the sizes below is on the package comment
+// and comes to 25.25 KiB.
+//
+// The WALL-CLOCK budget binds first, and is why the sizes stop short of what
+// the bytes would allow: a whole run has to fit in one -probe-timeout, which
+// means ceil(n/DefaultConcurrency) * DefaultPerRequestTimeout <= DefaultBudget.
+// At n = 30 that is ceil(30/6) = 5 rounds x 10s = 50s against a 60s budget.
+// Raising site to 18 would spend the spare bytes and put the run at 6 rounds =
+// 60s, with no margin for a slow round. Bytes are cheap here; a probe that
+// overruns its deadline charges a healthy provider with a blackhole.
+//
+// THREE IS THE FLOOR for any class, and none of these is below four. A class
+// verdict has to separate one flaky endpoint from a class-wide fault: at 1 the
+// class is a single destination wearing a class name, at 2 one flake is half
+// the class and cdn=1/2 says nothing, and at 3 "cdn=0/3" means three
+// independently operated endpoints all refused in the same run -- which is a
+// statement. The sizes above the floor buy spread rather than certainty: dns
+// draws 4 of 7 so a run usually spans more than one jurisdiction, and site
+// draws 12 because it is the widest pool and its verdict would otherwise rest
+// on the narrowest evidence.
+//
+// Coverage is a RATE, not a promise: site draws 12 of 93, so a given site
+// destination is asked for on about one run in eight. That is not "the table is
+// covered in eight runs" -- drawing 12 at a time from 93 until every entry has
+// been seen takes on the order of 40 runs (93/12 * H(93) ~= 40). What
+// accumulates quickly is fleet-wide coverage, because every provider draws
+// independently.
+//
+// A class with no entry here is probed WHOLE. That is the safe direction: a
+// class added to the table without a sample size costs visible bytes rather
+// than silently never being probed.
+var sampleSizes = map[Class]int{
+	ClassDNS:          4,
+	ClassConnectivity: 5,
+	ClassCDN:          5,
+	ClassSite:         12,
+	ClassReputation:   4,
+}
+
 // Expect declares what "success" means for one destination. The default,
 // ExpectBody, is the original rule and the reason this check catches
 // blackholes; ExpectStatus exists for the endpoints where an empty body is the
@@ -180,7 +293,7 @@ const (
 	// body is a FAILURE. TestEmptyBodyIs200Failure guards it.
 	ExpectBody Expect = iota
 	// ExpectStatus requires exactly Destination.Status and permits an empty
-	// body. It exists because 21 of 143 endpoints measured from a real
+	// body. It exists because 21 of the 143 endpoints measured from a real
 	// datacenter host are reachable while legitimately returning zero bytes --
 	// every generate_204 connectivity check, and many 3xx redirects -- and the
 	// ExpectBody rule would score all of them as failures.
@@ -189,6 +302,13 @@ const (
 	// the status must match exactly. A provider that synthesizes a bare 200 does
 	// not pass an ExpectStatus 204 destination. Relaxing this to "any 2xx" would
 	// turn the class into a hole in the blackhole rule.
+	//
+	// It is still the WEAKER contract in one respect that matters, and no entry
+	// should take it without cause: a bare status line proves only that
+	// something answered, while a body proves bytes crossed. That is why a 4xx
+	// is never declared here (a refusal must stay a failure), and why a
+	// destination that could be pointed at a url returning a real body is
+	// pointed there instead of being declared.
 	ExpectStatus
 )
 
@@ -212,8 +332,6 @@ type Destination struct {
 	// MaxBytes caps the body read for this destination. Zero means MaxBodyBytes,
 	// and a value above MaxBodyBytes is clamped to it -- the package-level cap is
 	// the one documented in the byte budget and cannot be raised per entry.
-	// Sizing this per destination is what let the table triple in width while
-	// getting cheaper.
 	MaxBytes int
 	// Verify optionally proves the body is what the destination is supposed to
 	// serve, and is the answer to a class of failure a status code cannot see: a
@@ -226,19 +344,23 @@ type Destination struct {
 // MaxBodyBytes is the ceiling on any single body read, and the clamp on
 // Destination.MaxBytes. It is a cap on the READ, applied with io.LimitReader: a
 // hostile or merely huge response cannot blow the byte budget documented on the
-// package -- www.canva.com answers a 403 with 1.4 MB.
+// package -- www.canva.com answers a 403 with 1.4 MB and apnews.com a 200 with
+// 2.3 MB.
 //
-// Unlike the earlier single-cap version of this table, hitting a cap is NOT by
-// itself a signal that something is wrong: several destinations are capped
-// deliberately below what they serve when healthy (the Wikipedia favicon is
-// 2734 bytes against a 2048-byte cap, and cachefly's test asset is unbounded).
-// What matters is that the body is non-empty and, where Verify is set, parses.
-const MaxBodyBytes = 4096
+// It is 1024 bytes, down from 4096. Nothing in the table needs more: the point
+// of a read is that bytes arrived and, where Verify is set, that they parse,
+// and every verifier in this package works on far less than a kilobyte. Hitting
+// the cap is NOT by itself a signal that anything is wrong -- most destinations
+// serve far more than this when healthy.
+const MaxBodyBytes = 1024
 
-// rangeFirst2KiB is the Range header used on destinations observed to honor
-// one. The response is then a 206 of ~2 KiB rather than the whole asset. A
-// server that ignores it simply returns 200 and the capped read applies.
-const rangeFirst2KiB = "bytes=0-2047"
+// rangeFirst1KiB is the Range header sent with every body-bearing destination
+// outside the two classes that are small by construction. Where it is honored
+// the response is a 206 of ~1 KiB instead of the whole asset; where it is
+// ignored the response is a 200 and the capped read applies. It is an
+// optimisation on the WIRE cost, never the bound -- see the package comment for
+// the hosts measured ignoring it.
+const rangeFirst1KiB = "bytes=0-1023"
 
 // acceptDNSJSON is the Accept header for the DoH JSON GET form. Cloudflare
 // answers 400 without it. The others serve JSON with no header at all; sending
@@ -250,13 +372,12 @@ const acceptDNSJSON = "application/dns-json"
 const dnsQuery = "?name=example.com&type=A"
 
 // Per-class read caps. They are sized just above the largest response measured
-// from each class on 2026-07-31, so the byte budget on the package is real
-// arithmetic rather than a hope.
+// from each class, so the byte budget on the package is real arithmetic rather
+// than a hope.
 const (
-	maxDNSBytes          = 768  // largest measured: doh.dns.sb, 582 B
-	maxConnectivityBytes = 256  // largest measured: captive.apple.com, 69 B
-	maxAssetBytes        = 2048 // matches rangeFirst2KiB
-	maxReputationBytes   = 1024 // enough of a refusal page to see what refused
+	maxDNSBytes          = 768  // largest measured: doh.dns.sb, 579 B (it returns DNSSEC records)
+	maxConnectivityBytes = 256  // largest measured that must PARSE: captive.apple.com, 69 B
+	maxAssetBytes        = 1024 // = MaxBodyBytes; everything else
 )
 
 // UserAgent identifies this probe to every destination. It is deliberately
@@ -269,16 +390,16 @@ const (
 // same URL answered 403 `Please set a user-agent and respect our robot policy`
 // under the default agent and 200 under this one, from the same host in the
 // same minute. A destination that fails for every provider is not a signal, it
-// is noise that would read as site=4/5 across the entire fleet forever.
+// is noise that would read as site=11/12 across the entire fleet forever.
 //
 // It also demonstrably changes what ClassReputation measures -- see that
 // class's comment, where the same host got 403 under curl's default agent and
 // 206 under this one.
 const UserAgent = "urnetwork-egress-prober/0.1 (+https://github.com/urnetwork/urnetwork-operator-proxy; operator egress health probe)"
 
-// destinations is the production table: small, well-known, individually
-// operated endpoints, spread across operators WITHIN each class so that a
-// provider which whitelists one vendor cannot pass a class.
+// destinations is the production table: the owner's curated 159-row list,
+// minus the rows that cannot be checked over an *http.Client, plus the seven
+// DoH endpoints. A run does not fetch it -- see sampleSizes.
 //
 // Every URL is https and on the default port 443. That is a hard requirement,
 // not a coincidence -- the confinement self-check dials one fixed port
@@ -286,9 +407,59 @@ const UserAgent = "urnetwork-egress-prober/0.1 (+https://github.com/urnetwork/ur
 // would silently fall outside the check. TestEveryDestinationIsHTTPSOn443
 // enforces it.
 //
-// Every entry below was measured from a datacenter host on 2026-07-31 with this
-// package's UserAgent. Choices worth recording, because the obvious pick was
-// wrong in a way only measurement showed:
+// Every entry was measured from a datacenter host with this package's
+// UserAgent, and its contract is what that measurement says: a 200 with a body
+// takes the default ExpectBody rule, and 202/204/3xx declare their status. The
+// rules the measurements forced, in the order they matter:
+//
+//   - A 4xx or 5xx is NEVER declared with ExpectStatus. Six reputation entries
+//     answer 403/401 from a datacenter exit; declaring those would convert the
+//     class's entire signal into a pass.
+//
+//   - A 200 with a ZERO-LENGTH body cannot be declared either, because it is
+//     the blackhole signature itself. Two endpoints measured that way
+//     (d1.awsstatic.com and cachefly.cachefly.net's bare host); both are
+//     re-pointed at a url on the same operator that serves a real body, and
+//     neither is whitelisted by status. See their entries.
+//
+//   - A destination whose STATUS is not stable cannot be declared, and this is
+//     not hypothetical. Three of the owner's 21 zero-body endpoints answered
+//     differently when this table was built, from the same host and address
+//     days later: netflix 302 -> 200, cnn 302 -> 200, hulu 302 -> 301. A
+//     fourth (timesofindia) went the other way, answering 301-with-no-body
+//     where the staged run had a body. Those four are re-pointed at
+//     /robots.txt, which is a real body and does not move. The exits that will
+//     actually run this are providers in arbitrary countries, so a
+//     geography-dependent redirect status is a false failure waiting to
+//     happen. The rest of the zero-body list is declared as measured, per the
+//     owner's instruction.
+//
+//   - Redirects are declared, never chased: the production client refuses to
+//     follow them (providertunnel's CheckRedirect), which is what makes a 3xx
+//     an answer about THIS url rather than about wherever it pointed.
+//
+// Other choices worth recording, because the obvious pick was wrong in a way
+// only measurement showed:
+//
+//   - The nine http:// rows in the list are here as https, all of them verified
+//     answering the same status over TLS (the five generate_204 endpoints, the
+//     three fixed-text portal checks, archive.ubuntu.com). A plaintext
+//     destination is not an option: it could be forged by the provider on the
+//     path, which is precisely the party under test. Two rows could not survive
+//     that: speedtest.tele2.net has no https listener at all (measured: no
+//     connection), and the "Example.com Plain HTTP" row duplicates the https
+//     one. Both are dropped.
+//
+//   - ifconfig.me is asked for /ip, not /. The bare host serves an HTML page to
+//     anything that does not look like curl -- measured, 10915 bytes of it --
+//     and /ip always answers with the address, which is what verifyIPText can
+//     actually prove.
+//
+//   - one.one.one.one and speed.cloudflare.com are in ClassSite rather than
+//     ClassConnectivity, where the source list files them. They answer with an
+//     ordinary web page rather than a fixed portal-detection token, so they
+//     cannot carry this class's Verify contract, and a connectivity entry
+//     without one would pass for a captive portal.
 //
 //   - dns.alidns.com serves the JSON form on /resolve ONLY. Its /dns-query path
 //     answers `400 no 'dns' query parameter found` -- it is wire-format only.
@@ -301,39 +472,13 @@ const UserAgent = "urnetwork-egress-prober/0.1 (+https://github.com/urnetwork/ur
 //     443-only rule above; Control D answers 200 with a non-JSON body, which is
 //     precisely the shape Verify exists to reject.
 //
-//   - www.msftconnecttest.com is NOT here despite being an obvious connectivity
-//     endpoint: https to it failed three times out of three from the measuring
-//     host (connection never established) while http succeeded. A plaintext
-//     destination is not an option -- it could be forged by the provider on the
-//     path -- so it is unusable here.
-//
-//   - The Google, gstatic and connectivitycheck.gstatic generate_204 endpoints
-//     are one operator wearing three hostnames; only one is in the table.
-//     icanhazip.com and 1.1.1.1/cdn-cgi/trace are both Cloudflare, which
-//     cp.cloudflare.com already covers.
-//
-//   - cdnjs is used with a SMALL asset rather than a Range header: Cloudflare
-//     was observed ignoring Range on cdnjs and returning the full 87 KB of
-//     jquery.min.js. normalize.min.css is 1861 bytes whole.
-//
-//   - cdn.jsdelivr.net was dropped: it answered 206 while returning the entire
-//     6138-byte file, so the Range header buys nothing there, and its multi-CDN
-//     fronting overlaps the Cloudflare and Fastly entries already in the class.
-//     stackpath.bootstrapcdn.com was dropped for the same reason at 30x the size
-//     (155 KB for bootstrap.min.css, Range ignored). unpkg.com is
-//     Cloudflare-fronted and duplicates cdnjs's operator.
-//
-//   - The Wikipedia entry points at the favicon, not the front page. The front
-//     page is 120 KB and Wikimedia's ATS does not honor Range, so it is the one
-//     destination that would routinely exceed the wire budget. The favicon is
-//     2734 bytes, served by the same Wikimedia edge.
-//
-//   - www.minecraft.net and www3.nhk.or.jp were candidates for ClassReputation
-//     and are not here. minecraft.net never answered at all (a full timeout,
-//     which costs an entire per-request round of wall clock for a class that
-//     does not affect the score) and nhk answered 303 -- a redirect this client
-//     refuses to follow, and a different answer from the timeout originally
-//     recorded for it, so it is not stable enough to interpret.
+//   - Operators repeat inside a class, and that is tolerated here where the
+//     narrow table refused it: connectivity carries three Google-operated
+//     generate_204 hostnames and three Cloudflare-operated endpoints, because
+//     the owner's list carries them and dropping them would narrow the pool a
+//     sample is drawn from. What protects the class is the draw: five of
+//     fourteen, chosen per run, so no single operator can be relied on to
+//     appear. Do not read "14 destinations" as "14 operators".
 var destinations = []Destination{
 	// DNS-over-HTTPS, JSON GET form, SEVEN distinct operators including two
 	// Chinese ones (dns.alidns.com, doh.pub) for deliberate jurisdictional
@@ -343,7 +488,8 @@ var destinations = []Destination{
 	//
 	// Every entry carries Verify: a 200 with bytes is not proof that a name was
 	// resolved, because a captive portal or an interception box returns exactly
-	// that. Only a parseable answer is.
+	// that. Only a parseable answer is. No Range header: these bodies are small
+	// and a truncated one would not parse.
 	{
 		Name:     "cloudflare-doh",
 		Class:    ClassDNS,
@@ -400,72 +546,91 @@ var destinations = []Destination{
 		MaxBytes: maxDNSBytes,
 		Verify:   verifyDNSJSON,
 	},
-
 	// Connectivity checks: the endpoints operating systems use to detect captive
-	// portals. Eight distinct operators, none of them authenticated, none of them
-	// behind anti-bot machinery, and all of them answering in under 70 bytes.
+	// portals, plus the echo services that answer with the exit address. None is
+	// authenticated, none is behind anti-bot machinery, and all of them answer in
+	// well under 256 bytes.
 	//
 	// The generate_204 entries are the reason Expect exists: 204 with no body is
-	// the CORRECT answer, and the old rule would have scored all of them as
-	// failures. They are also the strictest entries in the table -- an exact
+	// the CORRECT answer, and the ExpectBody rule would have scored all of them
+	// as failures. They are also the strictest entries in the table -- an exact
 	// status match, so a provider that synthesizes a bare 200 fails them.
 	//
-	// The body-bearing ones carry Verify for the captive-portal case those
+	// Every body-bearing entry carries Verify, for the captive-portal case these
 	// endpoints were literally designed to detect: a portal returns 200 with a
-	// login page, which is non-empty and would otherwise pass.
+	// login page, which is non-empty and would otherwise pass. That rule is what
+	// moved one.one.one.one and speed.cloudflare.com out of this class -- they
+	// answer with an ordinary page there is nothing fixed to check.
+	//
+	// No Range header anywhere here: these bodies are smaller than the cap
+	// already, and a 206 would buy nothing.
 	{
-		Name:     "google-204",
+		Name:     "google-generate-204",
 		Class:    ClassConnectivity,
 		URL:      "https://www.google.com/generate_204",
 		Expect:   ExpectStatus,
-		Status:   http.StatusNoContent,
+		Status:   204,
 		MaxBytes: maxConnectivityBytes,
 	},
 	{
-		Name:     "cloudflare-204",
+		Name:     "google-connectivitycheck",
 		Class:    ClassConnectivity,
-		URL:      "https://cp.cloudflare.com/generate_204",
+		URL:      "https://connectivitycheck.gstatic.com/generate_204",
 		Expect:   ExpectStatus,
-		Status:   http.StatusNoContent,
+		Status:   204,
 		MaxBytes: maxConnectivityBytes,
 	},
 	{
-		Name:     "ubuntu-204",
+		Name:     "gstatic-204",
 		Class:    ClassConnectivity,
-		URL:      "https://connectivity-check.ubuntu.com",
+		URL:      "https://www.gstatic.com/generate_204",
 		Expect:   ExpectStatus,
-		Status:   http.StatusNoContent,
+		Status:   204,
 		MaxBytes: maxConnectivityBytes,
 	},
 	{
-		Name:     "firefox-portal",
-		Class:    ClassConnectivity,
-		URL:      "https://detectportal.firefox.com/success.txt",
-		MaxBytes: maxConnectivityBytes,
-		Verify:   verifyContains("success"),
-	},
-	{
-		Name:     "apple-captive",
+		Name:     "apple-captive-portal",
 		Class:    ClassConnectivity,
 		URL:      "https://captive.apple.com/hotspot-detect.html",
 		MaxBytes: maxConnectivityBytes,
 		Verify:   verifyContains("Success"),
 	},
 	{
-		Name:     "gnome-nmcheck",
+		Name:     "ubuntu-connectivity-check",
+		Class:    ClassConnectivity,
+		URL:      "https://connectivity-check.ubuntu.com",
+		Expect:   ExpectStatus,
+		Status:   204,
+		MaxBytes: maxConnectivityBytes,
+	},
+	{
+		Name:     "firefox-detectportal",
+		Class:    ClassConnectivity,
+		URL:      "https://detectportal.firefox.com/success.txt",
+		MaxBytes: maxConnectivityBytes,
+		Verify:   verifyContains("success"),
+	},
+	{
+		Name:     "gnome-nm-check",
 		Class:    ClassConnectivity,
 		URL:      "https://nmcheck.gnome.org/check_network_status.txt",
 		MaxBytes: maxConnectivityBytes,
 		Verify:   verifyContains("online"),
 	},
 	{
-		// The two echo services also happen to report the exit address, which is
-		// the same fact geolocate already obtains; they leak nothing new.
-		Name:     "ipify",
+		Name:     "cloudflare-cp-204",
 		Class:    ClassConnectivity,
-		URL:      "https://api.ipify.org",
+		URL:      "https://cp.cloudflare.com/generate_204",
+		Expect:   ExpectStatus,
+		Status:   204,
 		MaxBytes: maxConnectivityBytes,
-		Verify:   verifyIPText,
+	},
+	{
+		Name:     "cloudflare-trace",
+		Class:    ClassConnectivity,
+		URL:      "https://1.1.1.1/cdn-cgi/trace",
+		MaxBytes: maxConnectivityBytes,
+		Verify:   verifyContains("ip="),
 	},
 	{
 		Name:     "aws-checkip",
@@ -474,143 +639,967 @@ var destinations = []Destination{
 		MaxBytes: maxConnectivityBytes,
 		Verify:   verifyIPText,
 	},
-
-	// CDN-hosted static assets, five distinct CDN operators: Cloudflare, Fastly
-	// (via code.jquery.com), Amazon CloudFront, Google, and CacheFly. This is the
-	// class that fails when a provider's egress range is on a CDN blocklist.
 	{
-		Name:     "cloudflare-cdnjs",
+		Name:     "ifconfig-me",
+		Class:    ClassConnectivity,
+		URL:      "https://ifconfig.me/ip",
+		MaxBytes: maxConnectivityBytes,
+		Verify:   verifyIPText,
+	},
+	{
+		Name:     "icanhazip",
+		Class:    ClassConnectivity,
+		URL:      "https://icanhazip.com",
+		MaxBytes: maxConnectivityBytes,
+		Verify:   verifyIPText,
+	},
+	{
+		Name:     "ipify",
+		Class:    ClassConnectivity,
+		URL:      "https://api.ipify.org",
+		MaxBytes: maxConnectivityBytes,
+		Verify:   verifyIPText,
+	},
+	// The list's ipinfo row is NOT here, and the reason is structural rather
+	// than about the endpoint: ipinfo.io is a PINNED geolocation source
+	// (geolocate/sources.go), and the health destinations are deliberately
+	// reached unpinned. A host that is both would either weaken the pin or make
+	// a routine leaf rotation read as the provider blackholing a destination.
+	// cmd/egress-prober's TestEgressHealthDestinationsAreNotPinned enforces it.
+	// The class keeps four other echo services.
+	{
+		Name:     "example-com-https",
+		Class:    ClassConnectivity,
+		URL:      "https://example.com",
+		MaxBytes: maxConnectivityBytes,
+		Verify:   verifyContains("Example Domain"),
+	},
+
+	// Content delivery: CDN edges, distribution mirrors and bulk-download hosts.
+	// Eighteen destinations across Cloudflare, Fastly, jsDelivr, unpkg, Google,
+	// Microsoft, CloudFront, KeyCDN, CDN77, Sucuri, CacheFly, OVH and five OS
+	// distribution mirrors. This is the class that fails when a provider's egress
+	// range sits on a CDN blocklist.
+	//
+	// The four asset urls (cdnjs, googleapis, jsdelivr, sdk.amazonaws) are
+	// version-pinned on purpose -- an unversioned url would move under us -- with
+	// the tradeoff that if a vendor ever prunes one it becomes a permanent 404
+	// and a permanent false failure. If one named entry fails across the whole
+	// fleet while its class passes, suspect the URL before suspecting the
+	// providers. They are asset urls rather than front pages because a CDN entry
+	// should prove the EDGE serves bytes, which a marketing page fronted by the
+	// same CDN does not do as directly.
+	{
+		Name:     "cloudflare-cdn",
 		Class:    ClassCDN,
 		URL:      "https://cdnjs.cloudflare.com/ajax/libs/normalize/8.0.1/normalize.min.css",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
 		MaxBytes: maxAssetBytes,
 	},
 	{
-		Name:     "fastly-jquery",
+		Name:     "cloudflare-sized-1kb",
 		Class:    ClassCDN,
-		URL:      "https://code.jquery.com/jquery-3.7.1.min.js",
-		Headers:  map[string]string{"Range": rangeFirst2KiB},
+		URL:      "https://speed.cloudflare.com/__down?bytes=1024",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
 		MaxBytes: maxAssetBytes,
 	},
 	{
-		// Version-pinned on purpose (an unversioned url would move under us),
-		// with the tradeoff that if AWS ever prunes v2 of the browser SDK this
-		// becomes a permanent 404 and a permanent false failure for every
-		// provider. If cdn=4/5 with only this entry failing across the whole
-		// fleet, suspect the URL before suspecting the providers. The same
-		// applies to the pinned jquery entries.
-		Name:     "cloudfront-awssdk",
+		Name:     "fastly",
 		Class:    ClassCDN,
-		URL:      "https://sdk.amazonaws.com/js/aws-sdk-2.1691.0.min.js",
-		Headers:  map[string]string{"Range": rangeFirst2KiB},
+		URL:      "https://www.fastly.net",
+		Expect:   ExpectStatus,
+		Status:   301,
 		MaxBytes: maxAssetBytes,
 	},
 	{
-		Name:     "google-ajax",
+		Name:     "jsdelivr-fastly-mirror",
+		Class:    ClassCDN,
+		URL:      "https://fastly.jsdelivr.net/npm/normalize.css@8.0.1/normalize.min.css",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "unpkg",
+		Class:    ClassCDN,
+		URL:      "https://unpkg.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "google-hosted-libraries",
 		Class:    ClassCDN,
 		URL:      "https://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.min.js",
-		Headers:  map[string]string{"Range": rangeFirst2KiB},
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
 		MaxBytes: maxAssetBytes,
 	},
 	{
-		// CacheFly's own test asset: it exists to be fetched, and it honors Range,
-		// so the 10 MB behind it never leaves their edge.
+		Name:     "microsoft-azure-cdn",
+		Class:    ClassCDN,
+		URL:      "https://ajax.aspnetcdn.com",
+		Expect:   ExpectStatus,
+		Status:   301,
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		// d1.awsstatic.com, which the list names, answered 200 with a ZERO-LENGTH
+		// body on every measurement -- indistinguishable from the blackhole
+		// signature, so it cannot be judged by status and must not be
+		// whitelisted into one. Its /robots.txt answers 403. This is the same
+		// operator (CloudFront) on the url the previous table measured serving a
+		// real body, with Range honored (206, 1024 bytes).
+		Name:     "amazon-cloudfront",
+		Class:    ClassCDN,
+		URL:      "https://sdk.amazonaws.com/js/aws-sdk-2.1691.0.min.js",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "keycdn",
+		Class:    ClassCDN,
+		URL:      "https://www.keycdn.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "cdn77",
+		Class:    ClassCDN,
+		URL:      "https://www.cdn77.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "sucuri-cdn",
+		Class:    ClassCDN,
+		URL:      "https://www.sucuri.net",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		// The list's bare host answered 200 with a zero-length body. CacheFly's own
+		// test asset exists to be fetched and honors Range (206, 1024 bytes), so
+		// the 10 MB behind it never leaves their edge.
 		Name:     "cachefly",
 		Class:    ClassCDN,
 		URL:      "https://cachefly.cachefly.net/10mb.test",
-		Headers:  map[string]string{"Range": rangeFirst2KiB},
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "ovh-proof-eu",
+		Class:    ClassCDN,
+		URL:      "https://proof.ovh.net",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "kernel-org-mirrors",
+		Class:    ClassCDN,
+		URL:      "https://mirrors.kernel.org",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "debian-cdn",
+		Class:    ClassCDN,
+		URL:      "https://deb.debian.org",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "ubuntu-archive-plain-http",
+		Class:    ClassCDN,
+		URL:      "https://archive.ubuntu.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "alpine-cdn",
+		Class:    ClassCDN,
+		URL:      "https://dl-cdn.alpinelinux.org",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "fedora-downloads",
+		Class:    ClassCDN,
+		URL:      "https://dl.fedoraproject.org",
+		Expect:   ExpectStatus,
+		Status:   302,
 		MaxBytes: maxAssetBytes,
 	},
 
-	// Ordinary sites, chosen for availability rather than for discrimination:
-	// every one of these answered on four consecutive runs. The
+	// Ordinary web properties: search, social, video, commerce, developer
+	// infrastructure, news, reference, productivity, gaming, and the regional
+	// properties that carry the same traffic outside the US and EU. site=0/12
+	// means the tunnel is not carrying ordinary web traffic at all.
+	//
+	// Chosen for availability rather than for discrimination -- every one of them
+	// answered on four consecutive runs from a datacenter host, and the
 	// "rejects datacenter ranges" role this class used to carry has moved to
-	// ClassReputation, which is where it belongs and where it is not scored.
-	// site=0/5 now means the tunnel is not carrying ordinary web traffic.
+	// ClassReputation, where it is not scored.
+	//
+	// The 3xx entries here declare the status they were measured answering. Read
+	// the rule on the table above before adding another: a declared status is
+	// weaker evidence than a body, and a status that varies by the exit's
+	// geography is not declarable at all.
 	{
-		Name:     "wikipedia",
+		Name:     "cloudflare-one-one-one-one",
 		Class:    ClassSite,
-		URL:      "https://www.wikipedia.org/static/favicon/wikipedia.ico",
+		URL:      "https://one.one.one.one",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "cloudflare-speed-test",
+		Class:    ClassSite,
+		URL:      "https://speed.cloudflare.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "google",
+		Class:    ClassSite,
+		URL:      "https://www.google.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "bing",
+		Class:    ClassSite,
+		URL:      "https://www.bing.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "yahoo",
+		Class:    ClassSite,
+		URL:      "https://www.yahoo.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "duckduckgo",
+		Class:    ClassSite,
+		URL:      "https://duckduckgo.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "baidu",
+		Class:    ClassSite,
+		URL:      "https://www.baidu.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "yandex",
+		Class:    ClassSite,
+		URL:      "https://yandex.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "facebook",
+		Class:    ClassSite,
+		URL:      "https://www.facebook.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "instagram",
+		Class:    ClassSite,
+		URL:      "https://www.instagram.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "twitter-x",
+		Class:    ClassSite,
+		URL:      "https://x.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "linkedin",
+		Class:    ClassSite,
+		URL:      "https://www.linkedin.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "tiktok",
+		Class:    ClassSite,
+		URL:      "https://www.tiktok.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "pinterest",
+		Class:    ClassSite,
+		URL:      "https://www.pinterest.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "snapchat",
+		Class:    ClassSite,
+		URL:      "https://www.snapchat.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "discord",
+		Class:    ClassSite,
+		URL:      "https://discord.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "telegram",
+		Class:    ClassSite,
+		URL:      "https://telegram.org",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "whatsapp",
+		Class:    ClassSite,
+		URL:      "https://www.whatsapp.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "mastodon",
+		Class:    ClassSite,
+		URL:      "https://mastodon.social",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "bluesky",
+		Class:    ClassSite,
+		URL:      "https://bsky.app",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "youtube",
+		Class:    ClassSite,
+		URL:      "https://www.youtube.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		// Re-pointed, and this is the finding that justifies the rule above: the
+		// staged measurement recorded 302-with-no-body four times, and this host
+		// measured 200 with 3.2 MB days later. Same host, same address. A status
+		// that flips like that cannot be declared, and the exit that matters here
+		// is a provider's, in an arbitrary country. robots.txt is 3790 bytes of
+		// real body and does not move.
+		Name:     "netflix",
+		Class:    ClassSite,
+		URL:      "https://www.netflix.com/robots.txt",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "twitch",
+		Class:    ClassSite,
+		URL:      "https://www.twitch.tv",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "vimeo",
+		Class:    ClassSite,
+		URL:      "https://vimeo.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		// Re-pointed for the same reason: staged 302, measured here as 301.
+		Name:     "hulu",
+		Class:    ClassSite,
+		URL:      "https://www.hulu.com/robots.txt",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "disney",
+		Class:    ClassSite,
+		URL:      "https://www.disneyplus.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "spotify",
+		Class:    ClassSite,
+		URL:      "https://open.spotify.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "soundcloud",
+		Class:    ClassSite,
+		URL:      "https://soundcloud.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "dailymotion",
+		Class:    ClassSite,
+		URL:      "https://www.dailymotion.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "amazon",
+		Class:    ClassSite,
+		URL:      "https://www.amazon.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "ebay",
+		Class:    ClassSite,
+		URL:      "https://www.ebay.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "walmart",
+		Class:    ClassSite,
+		URL:      "https://www.walmart.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "alibaba",
+		Class:    ClassSite,
+		URL:      "https://www.alibaba.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "aliexpress",
+		Class:    ClassSite,
+		URL:      "https://www.aliexpress.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "target",
+		Class:    ClassSite,
+		URL:      "https://www.target.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "shopify",
+		Class:    ClassSite,
+		URL:      "https://www.shopify.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "microsoft",
+		Class:    ClassSite,
+		URL:      "https://www.microsoft.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "apple",
+		Class:    ClassSite,
+		URL:      "https://www.apple.com/robots.txt",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
 		MaxBytes: maxAssetBytes,
 	},
 	{
 		Name:     "github",
 		Class:    ClassSite,
 		URL:      "https://github.com/robots.txt",
-		Headers:  map[string]string{"Range": rangeFirst2KiB},
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
 		MaxBytes: maxAssetBytes,
 	},
 	{
-		Name:     "example-com",
+		Name:     "github-api",
 		Class:    ClassSite,
-		URL:      "https://example.com/",
-		Headers:  map[string]string{"Range": rangeFirst2KiB},
+		URL:      "https://api.github.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
 		MaxBytes: maxAssetBytes,
 	},
 	{
-		Name:     "cloudflare-www",
+		Name:     "gitlab",
+		Class:    ClassSite,
+		URL:      "https://gitlab.com",
+		Expect:   ExpectStatus,
+		Status:   301,
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "cloudflare",
 		Class:    ClassSite,
 		URL:      "https://www.cloudflare.com/robots.txt",
-		Headers:  map[string]string{"Range": rangeFirst2KiB},
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
 		MaxBytes: maxAssetBytes,
 	},
 	{
-		Name:     "apple-www",
+		Name:     "aws",
 		Class:    ClassSite,
-		URL:      "https://www.apple.com/robots.txt",
-		Headers:  map[string]string{"Range": rangeFirst2KiB},
+		URL:      "https://aws.amazon.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "google-cloud",
+		Class:    ClassSite,
+		URL:      "https://cloud.google.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "digitalocean",
+		Class:    ClassSite,
+		URL:      "https://www.digitalocean.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "docker-hub",
+		Class:    ClassSite,
+		URL:      "https://hub.docker.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "npm-registry",
+		Class:    ClassSite,
+		URL:      "https://registry.npmjs.org",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "pypi",
+		Class:    ClassSite,
+		URL:      "https://pypi.org",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "rubygems",
+		Class:    ClassSite,
+		URL:      "https://rubygems.org",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "python-org",
+		Class:    ClassSite,
+		URL:      "https://www.python.org",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "go-dev",
+		Class:    ClassSite,
+		URL:      "https://go.dev",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "kernel-org",
+		Class:    ClassSite,
+		URL:      "https://www.kernel.org",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "mdn",
+		Class:    ClassSite,
+		URL:      "https://developer.mozilla.org",
+		Expect:   ExpectStatus,
+		Status:   302,
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		// Re-pointed for the same reason as netflix: staged 302-with-no-body,
+		// measured here as 200 with 4.9 MB.
+		Name:     "cnn",
+		Class:    ClassSite,
+		URL:      "https://www.cnn.com/robots.txt",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "bbc",
+		Class:    ClassSite,
+		URL:      "https://www.bbc.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "new-york-times",
+		Class:    ClassSite,
+		URL:      "https://www.nytimes.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "the-guardian",
+		Class:    ClassSite,
+		URL:      "https://www.theguardian.com",
+		Expect:   ExpectStatus,
+		Status:   302,
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "ap-news",
+		Class:    ClassSite,
+		URL:      "https://apnews.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "al-jazeera",
+		Class:    ClassSite,
+		URL:      "https://www.aljazeera.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "deutsche-welle",
+		Class:    ClassSite,
+		URL:      "https://www.dw.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "france-24",
+		Class:    ClassSite,
+		URL:      "https://www.france24.com",
+		Expect:   ExpectStatus,
+		Status:   302,
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		// The favicon, not the front page: the front page is 120 KB and Wikimedia's
+		// ATS does not honor Range (measured: 200, whole asset), so it is the one
+		// destination that would routinely exceed the WIRE budget even though the
+		// read cap bounds what is kept.
+		Name:     "wikipedia",
+		Class:    ClassSite,
+		URL:      "https://www.wikipedia.org/static/favicon/wikipedia.ico",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "wordpress",
+		Class:    ClassSite,
+		URL:      "https://wordpress.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "imdb",
+		Class:    ClassSite,
+		URL:      "https://www.imdb.com",
+		Expect:   ExpectStatus,
+		Status:   202,
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "internet-archive",
+		Class:    ClassSite,
+		URL:      "https://archive.org",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "openstreetmap",
+		Class:    ClassSite,
+		URL:      "https://www.openstreetmap.org",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "noaa-weather",
+		Class:    ClassSite,
+		URL:      "https://www.weather.gov",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "qq",
+		Class:    ClassSite,
+		URL:      "https://www.qq.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "sina",
+		Class:    ClassSite,
+		URL:      "https://www.sina.com.cn",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "taobao",
+		Class:    ClassSite,
+		URL:      "https://www.taobao.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "jd-com",
+		Class:    ClassSite,
+		URL:      "https://www.jd.com",
+		Expect:   ExpectStatus,
+		Status:   301,
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "mail-ru",
+		Class:    ClassSite,
+		URL:      "https://mail.ru",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "vk",
+		Class:    ClassSite,
+		URL:      "https://vk.com",
+		Expect:   ExpectStatus,
+		Status:   302,
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "naver",
+		Class:    ClassSite,
+		URL:      "https://www.naver.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "line",
+		Class:    ClassSite,
+		URL:      "https://line.me",
+		Expect:   ExpectStatus,
+		Status:   302,
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		// Re-pointed: measured here as 301 with no body, while the staged run had
+		// it answering with one. Unstable in the same way, caught from the other
+		// direction (it is absent from the zero-body list).
+		Name:     "times-of-india",
+		Class:    ClassSite,
+		URL:      "https://timesofindia.indiatimes.com/robots.txt",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "globo",
+		Class:    ClassSite,
+		URL:      "https://www.globo.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "mercadolibre",
+		Class:    ClassSite,
+		URL:      "https://www.mercadolibre.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "abc-australia",
+		Class:    ClassSite,
+		URL:      "https://www.abc.net.au",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "news24",
+		Class:    ClassSite,
+		URL:      "https://www.news24.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "zoom",
+		Class:    ClassSite,
+		URL:      "https://zoom.us",
+		Expect:   ExpectStatus,
+		Status:   301,
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "slack",
+		Class:    ClassSite,
+		URL:      "https://slack.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "dropbox",
+		Class:    ClassSite,
+		URL:      "https://www.dropbox.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "notion",
+		Class:    ClassSite,
+		URL:      "https://www.notion.so",
+		Expect:   ExpectStatus,
+		Status:   307,
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "trello",
+		Class:    ClassSite,
+		URL:      "https://trello.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "atlassian",
+		Class:    ClassSite,
+		URL:      "https://www.atlassian.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "figma",
+		Class:    ClassSite,
+		URL:      "https://www.figma.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "steam",
+		Class:    ClassSite,
+		URL:      "https://store.steampowered.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "playstation",
+		Class:    ClassSite,
+		URL:      "https://www.playstation.com",
+		Expect:   ExpectStatus,
+		Status:   301,
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "xbox",
+		Class:    ClassSite,
+		URL:      "https://www.xbox.com",
+		Expect:   ExpectStatus,
+		Status:   307,
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "nintendo",
+		Class:    ClassSite,
+		URL:      "https://www.nintendo.com",
+		Expect:   ExpectStatus,
+		Status:   301,
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "roblox",
+		Class:    ClassSite,
+		URL:      "https://www.roblox.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "riot-games",
+		Class:    ClassSite,
+		URL:      "https://www.riotgames.com",
+		Expect:   ExpectStatus,
+		Status:   302,
 		MaxBytes: maxAssetBytes,
 	},
 
-	// Reputation. NOT PART OF THE HEALTH SCORE -- see ClassReputation. Every one
-	// of these refused a datacenter IP outright in four consecutive runs (403,
-	// except reuters at 401), and on a residential or cellular exit they are
-	// expected to return clean. A provider that passes them is more useful to a
-	// real user; a provider that fails them is a hosted exit, not a broken one.
+	// Reputation. NOT PART OF THE HEALTH SCORE -- see ClassReputation. Six of
+	// these eight refused this datacenter exit outright (403, except reuters at
+	// 401) and on a residential or cellular exit are expected to return clean. A
+	// provider that passes them is more useful to a real user; a provider that
+	// fails them is a hosted exit, not a broken one.
+	//
+	// The remaining two are kept because they keep the class honest about what it
+	// measures, and both carry a note: reddit is the endpoint that produced the
+	// three contradictory readings quoted on ClassReputation, and stackoverflow
+	// never refused anything -- it redirects.
 	{
 		Name:     "akamai",
 		Class:    ClassReputation,
-		URL:      "https://www.akamai.com/",
-		Headers:  map[string]string{"Range": rangeFirst2KiB},
-		MaxBytes: maxReputationBytes,
+		URL:      "https://www.akamai.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		// The staged runs recorded ecosia as NOT refusing; this host measured 403
+		// with 4472 bytes on the same day the table was built. Left where the
+		// owner classified it -- a vendor whose answer differs run to run is
+		// exactly what an unscored diagnostic class is for.
+		Name:     "ecosia",
+		Class:    ClassReputation,
+		URL:      "https://www.ecosia.org",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "reddit",
+		Class:    ClassReputation,
+		URL:      "https://www.reddit.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
 	},
 	{
 		Name:     "etsy",
 		Class:    ClassReputation,
-		URL:      "https://www.etsy.com/",
-		Headers:  map[string]string{"Range": rangeFirst2KiB},
-		MaxBytes: maxReputationBytes,
+		URL:      "https://www.etsy.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
 	},
 	{
-		Name:     "epicgames",
+		// 302 with an empty body, four staged runs and one here. Recorded because
+		// it constrains how this class is read: stackoverflow is marked reputation
+		// but did NOT refuse this datacenter exit -- it redirects everyone. Before
+		// this entry declared its status it failed every run, which reads in a log
+		// exactly like an ip-reputation refusal and is not one. Do not interpret a
+		// stack-overflow failure as reputation without checking the status first.
+		Name:     "stack-overflow",
 		Class:    ClassReputation,
-		URL:      "https://www.epicgames.com/",
-		Headers:  map[string]string{"Range": rangeFirst2KiB},
-		MaxBytes: maxReputationBytes,
-	},
-	{
-		Name:     "canva",
-		Class:    ClassReputation,
-		URL:      "https://www.canva.com/",
-		Headers:  map[string]string{"Range": rangeFirst2KiB},
-		MaxBytes: maxReputationBytes,
+		URL:      "https://stackoverflow.com",
+		Expect:   ExpectStatus,
+		Status:   302,
+		MaxBytes: maxAssetBytes,
 	},
 	{
 		Name:     "reuters",
 		Class:    ClassReputation,
-		URL:      "https://www.reuters.com/",
-		Headers:  map[string]string{"Range": rangeFirst2KiB},
-		MaxBytes: maxReputationBytes,
+		URL:      "https://www.reuters.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
 	},
 	{
-		// Kept deliberately even though it does NOT currently discriminate for
-		// this client: it is the endpoint that produced the three contradictory
-		// readings quoted on ClassReputation, and it is the control that keeps the
-		// class honest about what it is measuring.
-		Name:     "reddit",
+		Name:     "canva",
 		Class:    ClassReputation,
-		URL:      "https://www.reddit.com/",
-		Headers:  map[string]string{"Range": rangeFirst2KiB},
-		MaxBytes: maxReputationBytes,
+		URL:      "https://www.canva.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
+	},
+	{
+		Name:     "epic-games",
+		Class:    ClassReputation,
+		URL:      "https://www.epicgames.com",
+		Headers:  map[string]string{"Range": rangeFirst1KiB},
+		MaxBytes: maxAssetBytes,
 	},
 }
 
@@ -664,6 +1653,11 @@ func verifyIPText(body []byte) error {
 // Substring, after TrimSpace, NOT equality: detectportal.firefox.com serves
 // "success\n" -- eight bytes for a seven-character word -- so an equality check
 // would fail for every provider forever, which is noise dressed as signal.
+//
+// Every want below is measured to appear within the first maxConnectivityBytes
+// of its endpoint's body, which is what makes a substring test on a CAPPED read
+// meaningful: cloudflare's trace document puts ip= in its first 40 bytes, and
+// example.com's title in its first 60.
 func verifyContains(want string) func([]byte) error {
 	return func(body []byte) error {
 		text := strings.TrimSpace(string(body))
@@ -708,17 +1702,24 @@ type ClassSummary struct {
 // Result is one full run.
 type Result struct {
 	Checks []CheckResult
-	// OKCount and Total cover the SCORED classes only. A datacenter provider
-	// that fails every reputation destination still reads as fully healthy here,
-	// which is the intended behaviour -- see ClassReputation.
+	// OKCount and Total cover the SCORED classes only, and only the
+	// destinations this run SAMPLED. A datacenter provider that fails every
+	// reputation destination still reads as fully healthy here, which is the
+	// intended behaviour -- see ClassReputation.
 	OKCount int
 	Total   int
-	// ByClass is the per-class tally for the scored classes only.
+	// ByClass is the per-class tally for the scored classes only, over the
+	// sample.
 	ByClass map[Class]ClassSummary
 	// Reputation is the tally for ClassReputation, reported ALONGSIDE the score
-	// and never inside it, so a log line can carry reputation=2/6 without that
+	// and never inside it, so a log line can carry reputation=2/4 without that
 	// figure contaminating ok=N/M.
 	Reputation ClassSummary
+	// TableTotal is the size of the full table the sample was drawn from, all
+	// classes included, and is rendered as table=N so nobody reads "dns=4/4" as
+	// "the table holds four resolvers". Zero when the run was not sampled (a
+	// test driving check() directly), and then omitted from Summary.
+	TableTotal int
 }
 
 // Options tunes a single Check call. The zero value is valid and uses the
@@ -734,20 +1735,29 @@ type Options struct {
 	// Concurrency caps simultaneous requests. Zero or negative uses
 	// DefaultConcurrency.
 	Concurrency int
+	// Rand draws this run's sample. Nil -- which is what production passes --
+	// means a fresh generator seeded from crypto/rand for every run, which is
+	// the whole anti-gaming property: the provider cannot know what it will be
+	// asked for. Tests set it to make a run reproducible.
+	//
+	// It must not be SHARED between concurrent runs: math/rand.Rand is stateful
+	// and not goroutine-safe, and the prober probes several providers at once.
+	// Leaving it nil is what makes that safe, so production leaves it nil.
+	Rand *rand.Rand
 }
 
 // Defaults for Options. They are vars so tests can lower them.
 //
 // The three are one piece of arithmetic, not three independent knobs:
 //
-//	rounds = ceil(len(destinations)/DefaultConcurrency) = ceil(31/6) = 6
-//	rounds * DefaultPerRequestTimeout = 6 * 10s = 60s = DefaultBudget
+//	rounds = ceil(SamplePerRun()/DefaultConcurrency) = ceil(30/6) = 5
+//	rounds * DefaultPerRequestTimeout = 5 * 10s = 50s <= DefaultBudget
 //
-// Changing any one of them without the others either cuts off the last round
-// (destinations fail for a reason the provider had nothing to do with) or lets
-// a swallowing provider stall the pass for longer than one probe timeout.
-// cmd/egress-prober derives the same ratio from -probe-timeout, and
-// TestEgressHealthAddsAtMostOneProbeTimeout holds it.
+// Changing any one of them -- or raising a sample size -- without the others
+// either cuts off the last round (destinations fail for a reason the provider
+// had nothing to do with) or lets a swallowing provider stall the pass for
+// longer than one probe timeout. cmd/egress-prober derives the same ratio from
+// -probe-timeout, and TestEgressHealthAddsAtMostOneProbeTimeout holds it.
 var (
 	// DefaultPerRequestTimeout is generous because every probe runs over a COLD
 	// tunnel: nothing is warm, keep-alives are disabled, and each request pays
@@ -759,18 +1769,17 @@ var (
 	// run that is going to be a total loss ends rather than stalling the pass,
 	// and a healthy one is never cut off mid-round.
 	DefaultBudget = 60 * time.Second
-	// DefaultConcurrency was 3 while the table held 9 destinations. It is 6 for
-	// 31 because the per-request timeout is a floor: at 3, a 60s probe budget
-	// spread over ceil(31/3) = 11 rounds leaves ~5.5s per request, which is
-	// BELOW the cold-tunnel figure above, and cold-start timeouts would then be
+	// DefaultConcurrency was 3 while the table held 9 destinations. It is 6
+	// because the per-request timeout is a floor: at 3, a 60s probe budget
+	// spread over ceil(30/3) = 10 rounds leaves 6s per request, which is BELOW
+	// the cold-tunnel figure above, and cold-start timeouts would then be
 	// charged to providers as blackholes.
 	//
-	// The constraint it trades against is unchanged, and is about handshakes
-	// rather than bytes: simultaneous TLS handshakes over one cold gvisor tunnel
-	// with keep-alives disabled contend with each other and inflate every
-	// latency. 31 destinations mean 31 handshakes however small the bodies are,
-	// so the cheaper table does not by itself justify more parallelism -- the
-	// per-request floor does.
+	// Note that this is sized against the SAMPLE, not the table: sampling is
+	// what keeps a 140-destination table costing 30 requests. The constraint it
+	// trades against is about handshakes rather than bytes -- simultaneous TLS
+	// handshakes over one cold gvisor tunnel with keep-alives disabled contend
+	// with each other and inflate every latency.
 	//
 	// The field signal that this is set too high is specific: first-round
 	// timeouts spread evenly across ALL classes, on providers whose geolocation
@@ -795,13 +1804,19 @@ var ErrNoDestinations = errors.New("egresshealth: at least one destination is re
 // verdict.
 var ErrNoBudget = errors.New("egresshealth: the context was already done before any check ran")
 
-// Check runs every production destination through client and returns the full
-// pattern of what worked.
+// Check runs a random sample of the production destinations through client and
+// returns the full pattern of what worked.
+//
+// The sample is drawn per call and per class (see sampleDestinations and
+// sampleSizes): the same provider probed twice is asked for different
+// destinations, and no provider can know in advance which ones. Coverage of
+// the table accumulates across runs and across the fleet rather than being
+// paid on every run.
 //
 // One destination failing never aborts the run: the pattern of failures IS the
-// value, so every destination is attempted and every outcome recorded. An error
-// is returned only when something structural stopped the run from happening at
-// all (see ErrNilClient, ErrNoDestinations, ErrNoBudget) -- so
+// value, so every sampled destination is attempted and every outcome recorded.
+// An error is returned only when something structural stopped the run from
+// happening at all (see ErrNilClient, ErrNoDestinations, ErrNoBudget) -- so
 // `err == nil && OKCount == 0` is a real, trustworthy total-blackhole reading,
 // distinguishable from a run that never took place.
 //
@@ -809,7 +1824,26 @@ var ErrNoBudget = errors.New("egresshealth: the context was already done before 
 // measures is that provider's willingness and ability to carry ordinary
 // traffic.
 func Check(ctx context.Context, client *http.Client, opts Options) (*Result, error) {
-	return check(ctx, client, destinations, opts)
+	res, err := check(ctx, client, sampleDestinations(destinations, sampleSizes, opts.rng()), opts)
+	if res != nil {
+		res.TableTotal = len(destinations)
+	}
+	return res, err
+}
+
+// SamplePerRun is how many requests one run makes: the sum of the per-class
+// sample sizes, bounded by what the table actually holds.
+//
+// It is exported because cmd/egress-prober sizes the health check's per-request
+// deadline from it -- rounds = ceil(SamplePerRun()/DefaultConcurrency) -- and
+// using len(Destinations()) there would divide one probe timeout across the
+// whole 140-entry table and give every request a few hundred milliseconds.
+func SamplePerRun() int {
+	n := 0
+	for _, c := range tableClasses(destinations) {
+		n += sampleCount(destinations, c, sampleSizes)
+	}
+	return n
 }
 
 func (o Options) perRequestTimeout() time.Duration {
@@ -833,6 +1867,29 @@ func (o Options) concurrency() int {
 	return DefaultConcurrency
 }
 
+// rng is the randomness one run's sample is drawn from.
+//
+// A caller-supplied generator is used as given, which is what makes a test
+// reproducible. Otherwise a fresh one is built per run and seeded from
+// crypto/rand -- not from the clock, and never from the global generator. The
+// anti-gaming property is that a provider cannot predict which destinations it
+// will be asked for, and a clock seed is predictable to anyone who knows
+// roughly when the pass started. The global generator is avoided for a duller
+// reason: it is shared process-wide state that any other package can reseed.
+func (o Options) rng() *rand.Rand {
+	if o.Rand != nil {
+		return o.Rand
+	}
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		// crypto/rand does not fail in practice. If it ever does, a clock seed
+		// still samples: a weaker unpredictability is worth having, a skipped
+		// run is not.
+		return rand.New(rand.NewSource(time.Now().UnixNano()))
+	}
+	return rand.New(rand.NewSource(int64(binary.BigEndian.Uint64(b[:]))))
+}
+
 // maxBytes is the body read cap for this destination: its own, clamped to the
 // package ceiling so no single entry can raise the documented budget.
 func (d Destination) maxBytes() int64 {
@@ -840,6 +1897,85 @@ func (d Destination) maxBytes() int64 {
 		return int64(d.MaxBytes)
 	}
 	return MaxBodyBytes
+}
+
+// tableClasses lists the classes present in dests, in TABLE order and without
+// repeats.
+//
+// Table order, never map iteration order, and that is load-bearing rather than
+// tidy: sampleDestinations draws from the generator once per class, so a class
+// order that varied between runs would make the same seed produce a different
+// sample. Reproducibility is what the tests turn on.
+func tableClasses(dests []Destination) []Class {
+	seen := map[Class]bool{}
+	var out []Class
+	for _, d := range dests {
+		if seen[d.Class] {
+			continue
+		}
+		seen[d.Class] = true
+		out = append(out, d.Class)
+	}
+	return out
+}
+
+// sampleCount is how many destinations of class c a run draws: the declared
+// size, or the whole class when it is smaller than that or has no declared size
+// at all. See sampleSizes for why "no declared size" means "probe it all".
+func sampleCount(dests []Destination, c Class, sizes map[Class]int) int {
+	total := 0
+	for _, d := range dests {
+		if d.Class == c {
+			total++
+		}
+	}
+	n, declared := sizes[c]
+	if !declared || n <= 0 || total < n {
+		return total
+	}
+	return n
+}
+
+// sampleDestinations draws each class's sample for one run.
+//
+// It is a partial Fisher-Yates over each class's indices, so every subset of a
+// class is equally likely and no destination is drawn twice. The result is
+// returned in TABLE order (the indices are sorted afterwards) so that Checks,
+// FailedNames and the log line keep reading in the order the table declares,
+// whatever the draw was -- a summary that reordered itself per run would be
+// undiffable.
+//
+// It takes the table, the sizes and the generator as arguments rather than
+// reaching for package state, which is the same seam check() uses: a test can
+// drive it with a stub table and a fixed seed and assert exactly what came out.
+func sampleDestinations(dests []Destination, sizes map[Class]int, r *rand.Rand) []Destination {
+	byClass := map[Class][]int{}
+	for i, d := range dests {
+		byClass[d.Class] = append(byClass[d.Class], i)
+	}
+
+	var picked []int
+	for _, c := range tableClasses(dests) {
+		idx := byClass[c]
+		n := sampleCount(dests, c, sizes)
+		if n >= len(idx) {
+			picked = append(picked, idx...)
+			continue
+		}
+		shuffled := append([]int(nil), idx...)
+		for i := 0; i < n; i++ {
+			j := i + r.Intn(len(shuffled)-i)
+			shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+		}
+		picked = append(picked, shuffled[:n]...)
+	}
+	sort.Ints(picked)
+
+	out := make([]Destination, 0, len(picked))
+	for _, i := range picked {
+		out = append(out, dests[i])
+	}
+	return out
 }
 
 // check is the seam Check is built on, taking the destination table explicitly
@@ -874,7 +2010,7 @@ func check(ctx context.Context, client *http.Client, dests []Destination, opts O
 	}
 	wg.Wait()
 
-	// ByClass and Reputation are seeded from the TABLE, not from the results
+	// ByClass and Reputation are seeded from the SAMPLE, not from the results
 	// that happened to come back, so a class in which every single check failed
 	// still appears as 0/n. Accumulating only from successes would make the
 	// datacenter-IP case -- the whole reason the class dimension exists --
@@ -1026,6 +2162,12 @@ func (d Destination) judge(status int, body []byte) error {
 // is how they obtain the host list to translate. A hand-maintained copy would
 // drift on the first table change while the check kept reporting success.
 //
+// It covers the WHOLE table, not a sample: any destination can be drawn on any
+// run, so the confinement check has to prove every one of them unreachable
+// directly, and the tunnel client has to be allowed to reach every one of them.
+// This list is therefore now ~140 hosts rather than ~30 -- see the README on
+// what that means for an operator maintaining -confinement-address by hand.
+//
 // Reputation hosts are included: they are reached through the tunnel like any
 // other destination, so the confinement check must prove them unreachable
 // directly. Being excluded from the SCORE has nothing to do with confinement.
@@ -1051,12 +2193,14 @@ func DestinationHosts() []string {
 	return hosts
 }
 
-// Destinations returns a copy of the production table.
+// Destinations returns a copy of the production table -- all of it, not one
+// run's sample.
 //
 // A copy, not the table: a caller that mutated it -- or the Headers map inside
 // an entry -- would silently change what every subsequent probe measures, and
 // the drift would be invisible in the table's own source. Callers that only
-// need the host list want DestinationHosts.
+// need the host list want DestinationHosts; callers sizing a run's budget want
+// SamplePerRun.
 func Destinations() []Destination {
 	out := make([]Destination, len(destinations))
 	for i, d := range destinations {
@@ -1074,15 +2218,19 @@ func Destinations() []Destination {
 
 // Summary renders the one-line, per-pass form:
 //
-//	ok=25/27 dns=7/7 connectivity=8/8 cdn=5/5 site=5/5 reputation=1/6
+//	ok=25/26 dns=4/4 connectivity=5/5 cdn=4/5 site=12/12 reputation=1/4 table=140
+//
+// Every figure except table= is over the destinations this run SAMPLED, which
+// is why the table size is on the line: dns=4/4 is four of seven asked and
+// answered, not a four-entry class.
 //
 // The reputation figure sits OUTSIDE ok=N/M on purpose and is never added into
 // it: it measures how the exit's address-and-client pair is treated by
 // bot-management vendors, not whether the provider works. See ClassReputation.
 //
 // Class order is Classes, never map iteration order, so successive passes are
-// diffable. Classes absent from the table are omitted; a class present in the
-// table but absent from Classes is appended in sorted order rather than
+// diffable. Classes absent from the sample are omitted; a class present in the
+// sample but absent from Classes is appended in sorted order rather than
 // silently dropped.
 func (r *Result) Summary() string {
 	if r == nil {
@@ -1096,6 +2244,9 @@ func (r *Result) Summary() string {
 	}
 	if 0 < r.Reputation.Total {
 		fmt.Fprintf(&b, " %s=%d/%d", ClassReputation, r.Reputation.OK, r.Reputation.Total)
+	}
+	if 0 < r.TableTotal {
+		fmt.Fprintf(&b, " table=%d", r.TableTotal)
 	}
 	return b.String()
 }
@@ -1127,7 +2278,8 @@ func (r *Result) orderedClasses() []Class {
 
 // FailedNames lists the SCORED destinations that did not pass, in table order.
 // The summary line says how many failed; this says which, which is what turns a
-// log line into something actionable.
+// log line into something actionable -- and with a sampled table it is the only
+// way to know WHICH destinations a run actually asked for.
 //
 // Reputation failures are not here, because they are not failures of the thing
 // ok=N/M reports; ReputationFailedNames lists those separately so a log line

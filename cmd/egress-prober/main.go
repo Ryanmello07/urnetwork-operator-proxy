@@ -304,17 +304,22 @@ func newProber(tunnelCfg providertunnel.Config, probeTimeout time.Duration, oper
 // blackholing provider therefore costs about 2 x -probe-timeout in total
 // (geolocation, then health), not 4x.
 //
-// Per-request that is 20s at the 60s default, against 60s for a geolocation
-// source. The shorter budget is defensible here and not merely convenient: by
-// the time the health check runs, the multiclient session is established and
-// the tunnel has already carried the geolocation lookups. A health request pays
-// a name resolution (often already cached in-tunnel by then), a TCP connect and
-// a TLS handshake -- not the cold-start the geolocation cap is sized for. If
-// that turns out to be wrong in the field it shows up as a specific,
-// recognisable shape: timeouts spread evenly across all three classes, on
-// providers whose geolocation succeeded.
+// Per-request that is 12s at the 60s default (5 rounds of the 30-destination
+// sample), against 60s for a geolocation source. The shorter budget is
+// defensible here and not merely convenient: by the time the health check runs,
+// the multiclient session is established and the tunnel has already carried the
+// geolocation lookups. A health request pays a name resolution (often already
+// cached in-tunnel by then), a TCP connect and a TLS handshake -- not the
+// cold-start the geolocation cap is sized for. If that turns out to be wrong in
+// the field it shows up as a specific, recognisable shape: timeouts spread
+// evenly across all classes, on providers whose geolocation succeeded.
 func egressHealthOptions(probeTimeout time.Duration) egresshealth.Options {
-	rounds := (len(egresshealth.Destinations()) + egresshealth.DefaultConcurrency - 1) / egresshealth.DefaultConcurrency
+	// SamplePerRun, never len(Destinations()): a run fetches a random sample of
+	// the table, not the table. Sizing the rounds off the full 140 entries would
+	// divide one probe timeout by 24 and hand each request a couple of seconds
+	// over a cold tunnel -- cold-start timeouts, charged to providers as
+	// blackholes, on a run that was only ever going to make 30 requests.
+	rounds := (egresshealth.SamplePerRun() + egresshealth.DefaultConcurrency - 1) / egresshealth.DefaultConcurrency
 	if rounds < 1 {
 		rounds = 1
 	}

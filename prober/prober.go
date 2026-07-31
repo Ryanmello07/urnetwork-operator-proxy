@@ -193,6 +193,12 @@ func (p *Prober) checkEgressHealth(ctx context.Context, providerClientId string,
 		return
 	}
 
+	// The line reads:
+	//
+	//	egress-health: provider=<id> ok=25/26 dns=4/4 connectivity=5/5 cdn=4/5
+	//	site=12/12 reputation=1/4 table=140 failed=cachefly
+	//	reputation-failed=akamai,etsy,canva
+	//
 	// Summary carries the scored classes as ok=N/M plus the per-class tallies,
 	// and the reputation figure alongside them -- never inside ok=N/M. The two
 	// failure lists are kept apart for the same reason: "failed=" is a list of
@@ -200,6 +206,14 @@ func (p *Prober) checkEgressHealth(ctx context.Context, providerClientId string,
 	// "reputation-failed=" is a list of vendors that treat the exit as a
 	// datacenter, which is the normal state of a hosted provider and not a
 	// fault. Merging them would read as one longer failure list.
+	//
+	// Every tally is over the destinations this run SAMPLED, not the table:
+	// egresshealth draws a bounded random subset of each class per run, so
+	// cdn=4/5 is four of the five drawn today out of eighteen, and table=140
+	// is on the line so that cannot be misread. It also means "failed=" is the
+	// only record of WHICH destinations a given provider was asked for -- two
+	// consecutive lines for the same provider name different endpoints, and
+	// that is the check working, not drifting.
 	line := fmt.Sprintf("egress-health: provider=%s %s", providerClientId, res.Summary())
 	if failed := res.FailedNames(); 0 < len(failed) {
 		line += " failed=" + strings.Join(failed, ",")

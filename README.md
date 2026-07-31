@@ -107,13 +107,17 @@ truth for the second half). Resolution is then skipped
 and exactly those addresses are dialed. The host part must be an IP literal — a
 name there would put the same hole back.
 
-That list is **34 endpoints** since the egress-health table widened (3
-geolocation sources + 31 destinations), and the self-check dials them
-**sequentially** with `-confinement-timeout` each. Against a firewall that
-DROPs rather than rejects, startup therefore costs up to 34 × the timeout
-(~100s at the 3s default) before the first probe. It is a one-time startup
-cost, and it is the price of the check covering every endpoint the process can
-reach.
+That list is **143 endpoints** since the egress-health table went wide (3
+geolocation sources + 140 destinations), and the self-check dials every
+resolved address for them **sequentially** with `-confinement-timeout` each.
+Against a firewall that REJECTs (or a docker `internal: true` network, where
+there is no route at all) each dial fails immediately and startup is quick.
+Against one that silently DROPs, startup now costs up to 143 × the timeout
+before the first probe, and `-confinement-address` is no longer something an
+operator can reasonably maintain by hand at that size — prefer a deployment
+where resolution works, or where refusals are immediate. The whole table is
+covered because **any** destination can be drawn on any run (see sampling
+below).
 
 `-skip-confinement-check` disables it. It defaults to **false**, logs two
 `WARNING` lines when set, and exists only for an operator running a one-shot
@@ -130,37 +134,72 @@ stays selectable — observed on mainnet: one provider accepted 87 KB and return
 0 bytes with `connected = true AND valid = true`.
 
 So each pass also runs an **egress-health check over the same tunnel** the
-geolocation probe already opened (never a second one), against 31 well-known
-destinations — 25 scored, across four classes, plus six that are measured and
-deliberately not scored — and logs one line per provider:
+geolocation probe already opened (never a second one). The table is **140
+destinations**; a run fetches a bounded **random sample** of each class — 30
+requests — and logs one line per provider:
 
 ```
-egress-health: provider=<id> ok=23/25 dns=7/7 connectivity=8/8 cdn=3/5 site=5/5 reputation=1/6 failed=fastly-jquery,cloudfront-awssdk reputation-failed=akamai,etsy,epicgames,canva,reuters
+egress-health: provider=<id> ok=25/26 dns=4/4 connectivity=5/5 cdn=4/5 site=12/12 reputation=1/4 table=140 failed=cachefly reputation-failed=akamai,etsy,canva
 ```
 
-The classes are what make a partial failure diagnosable. `dns=7/7 cdn=0/5` is a
+The classes are what make a partial failure diagnosable. `dns=4/4 cdn=0/5` is a
 provider whose egress range is refused by CDNs — the client-visible failure the
 geolocation probe cannot see, since geolocation APIs do not care where a request
-came from. `ok=0/25` is a blackhole. A flat count could not tell them apart, and
+came from. `ok=0/26` is a blackhole. A flat count could not tell them apart, and
 neither could a probe that only ever talks to three geolocation APIs.
 
-| class | n | what it proves |
-| --- | --- | --- |
-| `dns` | 7 | DoH JSON across seven operators, two of them Chinese. The **answer is parsed**: a 200 with a body proves nothing, since a captive portal returns exactly that. |
-| `connectivity` | 8 | The OS captive-portal endpoints (`generate_204`, `success.txt`, …). Unauthenticated, no anti-bot, 0–69 bytes — the cheapest useful signal in the table. |
-| `cdn` | 5 | Five distinct CDN operators. The class that fails when an egress range is on a CDN blocklist. |
-| `site` | 5 | Ordinary sites verified reachable on four consecutive runs. `site=0/5` means the tunnel is not carrying ordinary web traffic. |
-| `reputation` | 6 | **Not scored.** See below. |
+| class | table | per run | what it proves |
+| --- | --- | --- | --- |
+| `dns` | 7 | 4 | DoH JSON across seven operators, two of them Chinese. The **answer is parsed**: a 200 with a body proves nothing, since a captive portal returns exactly that. |
+| `connectivity` | 14 | 5 | The OS captive-portal endpoints (`generate_204`, `success.txt`, …) and the echo services. Unauthenticated, no anti-bot, 8–69 bytes — the cheapest useful signal in the table. |
+| `cdn` | 18 | 5 | CDN edges, distribution mirrors and bulk-download hosts. The class that fails when an egress range is on a CDN blocklist. |
+| `site` | 93 | 12 | Ordinary web properties, including the regional ones. `site=0/12` means the tunnel is not carrying ordinary web traffic. |
+| `reputation` | 8 | 4 | **Not scored.** See below. |
+
+**Sampling, not a smaller table.** Fetching all 140 at the 1 KiB cap would cost
+128 KiB per provider per run — fine for beta's ~40 providers, ~12 GB a pass at
+100k. The sample costs **25,856 bytes ≈ 25 KiB**, below the 33 KiB the previous
+31-entry fixed table cost, and coverage accumulates across runs and across the
+fleet instead of being paid every run. There is **one sampling constant for
+every deployment** — no beta/mainstream branch, because a knob only one
+environment exercises is a knob nobody tests.
+
+It is also a security gain over any fixed table: the draw happens at run time
+from the prober's own crypto-seeded randomness, so **a provider cannot know
+which destinations it will be asked for**. Whitelisting a handful of well-known
+hosts no longer passes the check — to pass reliably a provider has to carry
+traffic to essentially the whole table, which is the thing being measured.
+Sample sizes never go below **3** per class: below that, one flaky endpoint is
+half the class and `cdn=1/2` says nothing, while `cdn=0/3` means three
+independently operated endpoints all refused in the same run.
+
+The `dns` class is **DoH over 443**, not resolvers as such. The 23 bare resolver
+addresses in the source list (`8.8.8.8`, `1.1.1.1`, …) are ignored: a resolver
+is queried over UDP/53, and this package is handed an `*http.Client` and nothing
+else. Genuine resolver coverage needs a UDP path through the tunnel and is not
+possible today.
 
 Each destination declares what success means. The default is a 2xx **and a
 non-empty body** — the rule that catches a blackhole, since a status line with
 no data behind it is exactly what a blackholing provider produces. Endpoints
-where an empty body is *correct* (every `generate_204`) declare an exact status
-instead, which is stricter, not looser: a provider that synthesizes a bare `200`
-fails them.
+where an empty body is *correct* (every `generate_204`, and the redirects this
+client refuses to follow) declare an exact status instead, which is stricter,
+not looser: a provider that synthesizes a bare `200` fails them. A 4xx is never
+declared — a refusal must stay a failure — and a `200` with a **zero-length**
+body is never declared either, because that is the blackhole signature itself:
+the two endpoints measured that way are pointed at a URL on the same operator
+that serves a real body.
 
-**`reputation` is measured and never scored.** Its six destinations refuse a
-datacenter IP outright (403, or 401 for Reuters) and are expected to return
+One measured caveat, recorded because it decided four entries: a redirect status
+on a consumer site is **not stable**. Three of the 21 zero-body endpoints
+answered differently days apart from the same host and address (`netflix`
+302→200, `cnn` 302→200, `hulu` 302→301), and the exits that actually run this
+are providers in arbitrary countries. Those, plus `timesofindia`, are pointed at
+`/robots.txt` — a real body that does not move — rather than having a
+geography-dependent status declared for them.
+
+**`reputation` is measured and never scored.** Six of its eight destinations
+refuse a datacenter IP outright (403, or 401 for Reuters) and are expected to return
 clean from a residential or cellular exit, so a failure says "this exit looks
 like a datacenter to bot-management vendors", not "this provider is broken".
 Folding it into `ok=N/M` would make every hosted provider read as degraded and
@@ -169,7 +208,12 @@ far it can be read: `www.reddit.com` answered **403** to curl's default agent,
 **200** to the Go prober, and **206** to curl carrying the prober's user-agent —
 same host, same address, same day. That is client fingerprinting as much as IP
 reputation, so the class needs field data before anyone treats it as an
-IP-quality score.
+IP-quality score. Two of the eight do not currently discriminate and are noted
+in the code so a log line is not misread: `stackoverflow` answers 302 to
+everyone (a zero-body issue, never a refusal — before its status was declared it
+failed every run, which reads exactly like an IP refusal and is not one), and
+`ecosia` refused this host on the day the table was built while the staged runs
+recorded it clean.
 
 - **Nothing is submitted and there is no server endpoint yet.** Storage and the
   "healthy enough to select" verdict are separate work; shipping a verdict
@@ -178,18 +222,24 @@ IP-quality score.
 - Destinations are spread across **different operators within each class**, so a
   provider that whitelists one vendor cannot pass a class.
 - Each check is a small GET with a **per-destination** body cap (768 B for DoH,
-  256 B for connectivity, 2 KiB for assets, 1 KiB for reputation), so a full run
-  costs at most **34,048 bytes ≈ 33 KiB** of body — *less* than the 36 KiB of
-  the nine-destination table it replaces, because the connectivity endpoints are
-  ~100× smaller than the old flat 4 KiB cap. Under 1% of one 5 MiB active
-  bandwidth probe. A full run against a completely unresponsive provider costs
+  256 B for connectivity, 1 KiB for everything else, and never above 1 KiB), so
+  a run costs at most **25,856 bytes ≈ 25 KiB** of body — *less* than the 33 KiB
+  of the 31-destination table it replaces, from a table four and a half times
+  wider. Under 1% of one 5 MiB active bandwidth probe. A `Range` header holds
+  the larger destinations to ~1 KiB where it is honoured, but several hosts
+  ignore it (measured: `www.wikipedia.org`, `www.atlassian.com`,
+  `cloud.google.com`, `apnews.com`, `www.baidu.com`; earlier, jsDelivr and
+  BootstrapCDN), so the `io.LimitReader` cap — not the header — is what actually
+  bounds the cost. A full run against a completely unresponsive provider costs
   at most one extra `-probe-timeout` of wall clock per provider (the whole run
   shares that one budget across six concurrent rounds), so a blackholing
   provider costs about 2× `-probe-timeout` in total rather than 4×.
 - The health destinations are reached **unpinned** but under ordinary WebPKI
-  verification. Pinning 31 leaves that rotate on 31 schedules would turn every
+  verification. Pinning 140 leaves that rotate on 140 schedules would turn every
   routine certificate rotation into a failure indistinguishable from the
-  provider blackholing the destination. The geolocation sources stay pinned.
+  provider blackholing the destination. The geolocation sources stay pinned —
+  which is why `ipinfo.io` is *not* in the health table despite being on the
+  source list: a host cannot be both.
 - A run is skipped, and logged as skipped, when the probe has no budget left: a
   run on an expired deadline would fail every destination and read as a
   blackhole.

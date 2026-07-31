@@ -183,7 +183,8 @@ func (t *Tunnel) HTTPClient(timeout time.Duration) *http.Client {
 // package).
 //
 // This exists for the egress-health probe (see egresshealth/), which checks
-// that a provider carries traffic to ~9 well-known internet destinations. Those
+// that a provider carries traffic to a random sample of ~140 well-known
+// internet destinations. Those
 // destinations are deliberately NOT pinned, and the reason is that pinning them
 // would make the signal worse, not better:
 //
@@ -195,7 +196,7 @@ func (t *Tunnel) HTTPClient(timeout time.Duration) *http.Client {
 //     mis-issuing from a public CA. A provider cannot do that by being on the
 //     path, which is the capability actually in question.
 //
-//   - Pinning nine additional hosts, whose leaves rotate on nine independent
+//   - Pinning ~140 additional hosts, whose leaves rotate on ~140 independent
 //     schedules, would turn every routine certificate rotation into a
 //     pin-mismatch failure. That failure would be indistinguishable, in the
 //     recorded result, from the provider blackholing the destination -- the
