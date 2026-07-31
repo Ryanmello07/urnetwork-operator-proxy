@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -478,5 +480,21 @@ func TestEgressHealthAddsAtMostOneProbeTimeout(t *testing.T) {
 	// slow provider.
 	if egressHealthOptions(10*time.Second).PerRequestTimeout <= egressHealthOptions(time.Second).PerRequestTimeout {
 		t.Error("egressHealthOptions does not scale with -probe-timeout")
+	}
+}
+
+// The full table is the default because it is the only configuration that
+// exercises CONCURRENCY: a sample asks the provider to carry ~30 parallel
+// requests, where a real client under load looks far more like the whole
+// table. Sampling remains available and is cheaper, but it cannot test that.
+func TestEgressHealthAllDefaultsOn(t *testing.T) {
+	fs := flag.NewFlagSet("egress-prober", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	all := fs.Bool("egress-health-all", true, "")
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse: %s", err)
+	}
+	if !*all {
+		t.Error("-egress-health-all defaults off; every provider test must run the full table")
 	}
 }
