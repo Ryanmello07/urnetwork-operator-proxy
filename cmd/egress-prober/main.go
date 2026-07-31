@@ -59,6 +59,7 @@ func main() {
 	skipConfinementCheck := flag.Bool("skip-confinement-check", false, "DANGEROUS: start even if this host can reach a geolocation api directly. Only for a one-shot manual probe on a host you know is not the operator's; a direct lookup records the OPERATOR's location for the provider and exposes the operator's address to the api")
 	confinementTimeout := flag.Duration("confinement-timeout", 3*time.Second, "per-address deadline for the startup confinement self-check; a timeout counts as blocked. Must be at least "+confinement.MinTimeout.String())
 	var confinementAddrs addressList
+	egressHealthAll := flag.Bool("egress-health-all", false, "run EVERY destination in the egress-health table instead of a random sample. For operator diagnostics only: it costs ~4.5x the bytes and wall clock, and it forfeits the anti-gaming property that random sampling provides (a fixed, enumerable list is exactly what a provider can whitelist). Scheduled passes should leave this off")
 	flag.Var(&confinementAddrs, "confinement-address", "ip:port the confinement self-check should dial instead of resolving the probe hosts; repeatable. For a jail where dns is legitimately blocked: supply the address of every geolocation source AND every egress-health destination here and the check stays real. The host part must be an ip literal, not a name")
 	dueURL := flag.String("due-url", "", "url of the server's due-provider endpoint; empty derives <api-url>/network/provider-egress-due")
 	dueLimit := flag.Int("due-limit", 100, "how many due providers to ask the server for per pass; the server clamps this to its own maximum (500)")
@@ -178,7 +179,7 @@ func main() {
 		HTTP:           &http.Client{Timeout: 30 * time.Second},
 	}
 
-	dueScheduler, enumScheduler := newSchedulers(newProber(tunnelCfg, *probeTimeout, operator), *concurrency, *cacheTTL)
+	dueScheduler, enumScheduler := newSchedulers(newProber(tunnelCfg, *probeTimeout, operator, *egressHealthAll), *concurrency, *cacheTTL)
 
 	// I3: a single-shot run (-interval 0) is the mode the README recommends
 	// for external cron/systemd scheduling, which decides success or
@@ -236,7 +237,7 @@ func main() {
 // the due queue when a probe was recently ATTEMPTED, not only when one
 // succeeded, so a prober that does not report leaves every unprobeable
 // provider at the head of the queue forever -- see prober.ProbeOne.
-func newProber(tunnelCfg providertunnel.Config, probeTimeout time.Duration, operator *ingest.Client) *prober.Prober {
+func newProber(tunnelCfg providertunnel.Config, probeTimeout time.Duration, operator *ingest.Client, allDestinations bool) *prober.Prober {
 	return &prober.Prober{
 		Open: func(ctx context.Context, providerClientId string) (*http.Client, func() error, error) {
 			id, err := connect.ParseId(providerClientId)
@@ -279,7 +280,12 @@ func newProber(tunnelCfg providertunnel.Config, probeTimeout time.Duration, oper
 		// Its budget is derived from -probe-timeout: see egressHealthOptions for
 		// the arithmetic and for what a full pass therefore costs.
 		Health: func(ctx context.Context, client *http.Client) (*egresshealth.Result, error) {
-			return egresshealth.Check(ctx, client, egressHealthOptions(probeTimeout))
+			opts := egressHealthOptions(probeTimeout)
+			if allDestinations {
+				opts.AllDestinations = true
+				opts.Budget, opts.Concurrency = egresshealth.BudgetForAllDestinations(opts.PerRequestTimeout)
+			}
+			return egresshealth.Check(ctx, client, opts)
 		},
 		Submit:   operator,
 		Attempts: operator,

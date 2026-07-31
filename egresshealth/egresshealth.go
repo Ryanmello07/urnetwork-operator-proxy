@@ -1759,6 +1759,24 @@ type Options struct {
 	// and not goroutine-safe, and the prober probes several providers at once.
 	// Leaving it nil is what makes that safe, so production leaves it nil.
 	Rand *rand.Rand
+
+	// AllDestinations runs EVERY destination in the table instead of drawing a
+	// sample. It exists for operator-run diagnostics -- "show me the complete
+	// picture for this fleet right now" -- and is deliberately not the default.
+	//
+	// Two things change when it is set, and the caller owns both:
+	//
+	//   1. Cost. The sample is bounded by construction; the full table is not.
+	//      At the current table it is ~4.5x the bytes and ~4.5x the requests.
+	//   2. The anti-gaming property is LOST. A fixed, fully-enumerable
+	//      destination list is exactly what a provider can whitelist. Random
+	//      sampling is what makes that impractical, so scheduled production
+	//      passes must keep sampling; this is for on-demand inspection.
+	//
+	// Budget and Concurrency must be raised to match, or the run will be cut
+	// off mid-table and destinations will fail for a reason that has nothing
+	// to do with the provider. See BudgetForAllDestinations.
+	AllDestinations bool
 }
 
 // Defaults for Options. They are vars so tests can lower them.
@@ -1839,7 +1857,11 @@ var ErrNoBudget = errors.New("egresshealth: the context was already done before 
 // measures is that provider's willingness and ability to carry ordinary
 // traffic.
 func Check(ctx context.Context, client *http.Client, opts Options) (*Result, error) {
-	res, err := check(ctx, client, sampleDestinations(destinations, sampleSizes, opts.rng()), opts)
+	chosen := sampleDestinations(destinations, sampleSizes, opts.rng())
+	if opts.AllDestinations {
+		chosen = append([]Destination(nil), destinations...)
+	}
+	res, err := check(ctx, client, chosen, opts)
 	if res != nil {
 		res.TableTotal = len(destinations)
 	}
@@ -1853,6 +1875,25 @@ func Check(ctx context.Context, client *http.Client, opts Options) (*Result, err
 // deadline from it -- rounds = ceil(SamplePerRun()/DefaultConcurrency) -- and
 // using len(Destinations()) there would divide one probe timeout across the
 // whole 140-entry table and give every request a few hundred milliseconds.
+// BudgetForAllDestinations returns the Budget and Concurrency an
+// AllDestinations run needs so that no destination is cut off by the deadline.
+//
+// Same arithmetic as the sampled path, with the full table substituted:
+//
+//	rounds = ceil(len(destinations)/concurrency)
+//	budget = rounds * perRequest
+//
+// The concurrency is raised for the full run because otherwise the round count
+// -- and with it the wall clock -- grows linearly with the table. It is not
+// raised further than this: every request rides the SAME provider tunnel, so
+// concurrency here is load on the provider under test, and a diagnostic that
+// overloads its subject measures the overload.
+func BudgetForAllDestinations(perRequest time.Duration) (budget time.Duration, concurrency int) {
+	concurrency = 10
+	rounds := (len(destinations) + concurrency - 1) / concurrency
+	return time.Duration(rounds) * perRequest, concurrency
+}
+
 func SamplePerRun() int {
 	n := 0
 	for _, c := range tableClasses(destinations) {

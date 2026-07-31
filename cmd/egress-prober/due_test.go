@@ -147,7 +147,7 @@ func TestServerDrivenSchedulerIgnoresTheLocalTTL(t *testing.T) {
 // provider that always fails to probe stays at the head of the due queue
 // forever, and nothing about the pass output would say so.
 func TestNewProberReportsAttempts(t *testing.T) {
-	p := newProber(providertunnel.Config{}, time.Minute, &ingest.Client{ServerURL: "http://unused.invalid"})
+	p := newProber(providertunnel.Config{}, time.Minute, &ingest.Client{ServerURL: "http://unused.invalid"}, false)
 	if p.Attempts == nil {
 		t.Fatal("newProber built a Prober with no attempt reporter; the server-side due backoff would never be told a probe happened")
 	}

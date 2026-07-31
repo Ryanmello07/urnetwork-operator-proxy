@@ -1568,3 +1568,31 @@ func TestConnectivityClassIsCheapAndBroad(t *testing.T) {
 		t.Error("no connectivity destination uses ExpectStatus; the generate_204 endpoints are the reason the contract exists")
 	}
 }
+
+// AllDestinations is an operator diagnostic, so the property that matters is
+// that it really does run the WHOLE table -- a run that silently still sampled
+// would report a partial picture as if it were complete. The requests fail
+// here (no network in tests); only how many were attempted matters.
+func TestAllDestinationsRunsEveryDestination(t *testing.T) {
+	rt := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, errors.New("no network in tests")
+	})
+
+	perRequest := 50 * time.Millisecond
+	budget, concurrency := BudgetForAllDestinations(perRequest)
+	res, err := Check(context.Background(), &http.Client{Transport: rt}, Options{
+		AllDestinations:   true,
+		Budget:            budget,
+		Concurrency:       concurrency,
+		PerRequestTimeout: perRequest,
+	})
+	if err != nil {
+		t.Fatalf("Check err = %v", err)
+	}
+	if len(res.Checks) != len(destinations) {
+		t.Errorf("ran %d destinations, want the whole table of %d", len(res.Checks), len(destinations))
+	}
+	if len(res.Checks) <= SamplePerRun() {
+		t.Errorf("AllDestinations ran %d, no more than a sample (%d) -- it is still sampling", len(res.Checks), SamplePerRun())
+	}
+}
