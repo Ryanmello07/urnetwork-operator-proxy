@@ -1476,6 +1476,17 @@ func TestSuccessContractsAreDeclaredCoherently(t *testing.T) {
 			if d.Status < 200 || 400 <= d.Status {
 				t.Errorf("destination %q declares ExpectStatus with Status = %d; it must name the non-error status it actually answers", d.Name, d.Status)
 			}
+		case ExpectReachable:
+			// Any 2xx/3xx, so a declared Status would be ignored -- same trap as
+			// ExpectBody. Confined to ClassSite on purpose: it is the weakest
+			// contract, and letting dns/cdn/connectivity take it would put a
+			// hole in the classes where a body is the actual evidence.
+			if d.Status != 0 {
+				t.Errorf("destination %q is ExpectReachable but declares Status = %d, which is ignored; drop it", d.Name, d.Status)
+			}
+			if d.Class != ClassSite {
+				t.Errorf("destination %q is ExpectReachable in class %q; that contract is confined to %q", d.Name, d.Class, ClassSite)
+			}
 		case ExpectBody:
 			if d.Status != 0 {
 				t.Errorf("destination %q is ExpectBody but declares Status = %d, which is ignored; either drop it or declare ExpectStatus", d.Name, d.Status)
@@ -1594,5 +1605,33 @@ func TestAllDestinationsRunsEveryDestination(t *testing.T) {
 	}
 	if len(res.Checks) <= SamplePerRun() {
 		t.Errorf("AllDestinations ran %d, no more than a sample (%d) -- it is still sampling", len(res.Checks), SamplePerRun())
+	}
+}
+
+// ExpectReachable must accept the geo-redirect it exists for, and must still
+// reject a refusal -- otherwise it would be a hole in the blackhole rule rather
+// than a contract for sites whose status depends on the exit country.
+func TestExpectReachableAcceptsRedirectsButNotRefusals(t *testing.T) {
+	d := Destination{Name: "x", Class: ClassSite, Expect: ExpectReachable}
+	for _, tc := range []struct {
+		status int
+		ok     bool
+		why    string
+	}{
+		{200, true, "2xx with body"},
+		{204, true, "2xx empty"},
+		{302, true, "the measured microsoft case: locale redirect, empty body"},
+		{301, true, "permanent redirect"},
+		{403, false, "a refusal must stay a failure"},
+		{404, false, "not found is a failure"},
+		{500, false, "server error is a failure"},
+	} {
+		err := d.judge(tc.status, nil)
+		if tc.ok && err != nil {
+			t.Errorf("status %d (%s): got error %v, want success", tc.status, tc.why, err)
+		}
+		if !tc.ok && err == nil {
+			t.Errorf("status %d (%s): got success, want failure", tc.status, tc.why)
+		}
 	}
 }

@@ -311,6 +311,24 @@ const (
 	// destination that could be pointed at a url returning a real body is
 	// pointed there instead of being declared.
 	ExpectStatus
+	// ExpectReachable accepts ANY 2xx or 3xx, with or without a body. It exists
+	// for consumer sites that redirect based on the CLIENT'S GEOGRAPHY, which
+	// this probe sees from a different exit country on every provider.
+	//
+	// Measured: microsoft.com answers 206/1024B to a datacenter host in the US
+	// and in Germany, but 302/0B through 40 of 40 provider tunnels -- a locale
+	// redirect keyed on the exit ip. Declaring a fixed status for such a
+	// destination is impossible (the status is a function of where the provider
+	// exits) and pointing it at robots.txt only moves the problem, because that
+	// redirects too.
+	//
+	// This is the weakest contract and must stay confined to ClassSite, where
+	// the question being asked is "did the provider carry my request to this
+	// host and bring back a valid HTTP response" -- which is exactly the
+	// "basic functionality" bar. It does NOT weaken the blackhole rule: a
+	// blackholing provider returns no response at all, so it fails this too.
+	// A 4xx/5xx is still a failure here, so a refusal stays a refusal.
+	ExpectReachable
 )
 
 // Destination is one endpoint to check.
@@ -1114,9 +1132,12 @@ var destinations = []Destination{
 		MaxBytes: maxAssetBytes,
 	},
 	{
+		// 206/1024B to a datacenter host, 302/0B through all 40 provider
+		// tunnels: a locale redirect keyed on the exit ip. See ExpectReachable.
 		Name:     "microsoft",
 		Class:    ClassSite,
 		URL:      "https://www.microsoft.com",
+		Expect:   ExpectReachable,
 		Headers:  map[string]string{"Range": rangeFirst1KiB},
 		MaxBytes: maxAssetBytes,
 	},
@@ -1331,8 +1352,11 @@ var destinations = []Destination{
 		// Re-pointed for the same reason as sucuri-cdn: the bare host ignores
 		// Range and returns 31,388 B, which failed on 7 of 40 beta providers.
 		// robots.txt returns 886 B.
+		// Same geo-redirect shape as microsoft: fine from a datacenter host,
+		// failed on all 40 provider tunnels.
 		Name:     "openstreetmap",
 		Class:    ClassSite,
+		Expect:   ExpectReachable,
 		URL:      "https://www.openstreetmap.org/robots.txt",
 		Headers:  map[string]string{"Range": rangeFirst1KiB},
 		MaxBytes: maxAssetBytes,
@@ -2178,6 +2202,13 @@ func (d Destination) judge(status int, body []byte) error {
 			// Exact, not "any 2xx". A provider that synthesizes a bare 200 must
 			// not pass a destination that is supposed to answer 204.
 			return fmt.Errorf("status %d, want exactly %d", status, d.Status)
+		}
+	case ExpectReachable:
+		// Any 2xx or 3xx: the host answered through the provider. A 4xx/5xx is
+		// still a refusal and still fails, and a blackholing provider produces
+		// no response at all, so this remains a real liveness check.
+		if status < 200 || 400 <= status {
+			return fmt.Errorf("status %d, want any 2xx or 3xx", status)
 		}
 	default: // ExpectBody
 		if status < 200 || 300 <= status {
