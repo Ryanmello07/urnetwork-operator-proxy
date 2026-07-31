@@ -459,23 +459,29 @@ func measure(
 	var steadyBytes int64
 	var windowStart time.Time
 	var windowEnd time.Time
+	var firstErr error
 	for i := range streams {
-		if streams[i].err != nil {
-			// One stream's failure fails the measurement. A partial aggregate
-			// is not the figure this reports: it would be N-minus-something
-			// windows' worth of throughput published as if it were N.
-			return Sample{SampleByteCount: total, Streams: StreamCount}, streams[i].err
-		}
 		total += streams[i].total
 		steadyBytes += streams[i].steadyBytes
 		if windowEnd.Before(streams[i].end) {
 			windowEnd = streams[i].end
 		}
-		if start := streams[i].steadyStart; !start.IsZero() {
-			if windowStart.IsZero() || start.Before(windowStart) {
-				windowStart = start
+		if steadyStart := streams[i].steadyStart; !steadyStart.IsZero() {
+			if windowStart.IsZero() || steadyStart.Before(windowStart) {
+				windowStart = steadyStart
 			}
 		}
+		if firstErr == nil {
+			firstErr = streams[i].err
+		}
+	}
+	if firstErr != nil {
+		// One stream's failure fails the measurement. A partial aggregate is
+		// not the figure this reports: it would be N-minus-something windows'
+		// worth of throughput published as if it were N. The byte count is
+		// still the true total across every stream, so the caller is not told
+		// a smaller number moved than actually did.
+		return Sample{SampleByteCount: total, Streams: StreamCount}, firstErr
 	}
 
 	if total <= 0 {
