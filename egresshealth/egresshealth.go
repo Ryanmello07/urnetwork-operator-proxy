@@ -769,9 +769,15 @@ var destinations = []Destination{
 		MaxBytes: maxAssetBytes,
 	},
 	{
+		// Re-pointed at robots.txt: the bare host IGNORES Range and returns
+		// 399,407 B. Measured on the beta fleet it was the single largest source
+		// of failures (14 of 40 providers) -- not because those providers were
+		// unhealthy, but because moving 390 KB inside the per-request timeout is
+		// a bandwidth test wearing a health test's clothes. robots.txt honors
+		// Range (206, 24 B).
 		Name:     "sucuri-cdn",
 		Class:    ClassCDN,
-		URL:      "https://www.sucuri.net",
+		URL:      "https://www.sucuri.net/robots.txt",
 		Headers:  map[string]string{"Range": rangeFirst1KiB},
 		MaxBytes: maxAssetBytes,
 	},
@@ -1018,10 +1024,15 @@ var destinations = []Destination{
 		MaxBytes: maxAssetBytes,
 	},
 	{
-		// Re-pointed for the same reason: staged 302, measured here as 301.
+		// hulu answers 302-with-empty-body on BOTH the bare host and
+		// /robots.txt, so it can never satisfy ExpectBody. Declared as the
+		// redirect it actually is. Measured on the beta fleet: 4 of 40
+		// providers failed on this entry alone before the fix.
 		Name:     "hulu",
 		Class:    ClassSite,
-		URL:      "https://www.hulu.com/robots.txt",
+		URL:      "https://www.hulu.com",
+		Expect:   ExpectStatus,
+		Status:   302,
 		Headers:  map[string]string{"Range": rangeFirst1KiB},
 		MaxBytes: maxAssetBytes,
 	},
@@ -1317,9 +1328,12 @@ var destinations = []Destination{
 		MaxBytes: maxAssetBytes,
 	},
 	{
+		// Re-pointed for the same reason as sucuri-cdn: the bare host ignores
+		// Range and returns 31,388 B, which failed on 7 of 40 beta providers.
+		// robots.txt returns 886 B.
 		Name:     "openstreetmap",
 		Class:    ClassSite,
-		URL:      "https://www.openstreetmap.org",
+		URL:      "https://www.openstreetmap.org/robots.txt",
 		Headers:  map[string]string{"Range": rangeFirst1KiB},
 		MaxBytes: maxAssetBytes,
 	},
