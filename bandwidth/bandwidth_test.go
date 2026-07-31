@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -49,9 +50,15 @@ func TestMeasureStopsAtByteCap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Measure: %s", err)
 	}
-	if MaxSampleBytes < sampleBytes {
-		t.Errorf("sampleByteCount = %d, exceeded the %d byte cap (server offered %d)",
-			sampleBytes, MaxSampleBytes, offered)
+	// Exactly the cap, not merely at most: every stream is offered far more
+	// than its allowance, so all StreamCount of them must stop dead on
+	// StreamBytes. A "<=" assertion would pass while each stream overshot by
+	// up to one 32 KiB buffer -- StreamCount buffers of unreserved paid
+	// traffic through a provider's tunnel on every measurement, which is
+	// precisely the bug the per-read remaining-allowance clamp exists to stop.
+	if sampleBytes != MaxSampleBytes {
+		t.Errorf("sampleByteCount = %d, want exactly the %d byte cap (%d streams x %d, server offered %d per stream)",
+			sampleBytes, int64(MaxSampleBytes), StreamCount, StreamBytes, offered)
 	}
 	if bps <= 0 {
 		t.Errorf("bytesPerSecond = %f, want > 0", bps)
@@ -129,16 +136,16 @@ func TestMeasureExcludesWarmup(t *testing.T) {
 	}
 }
 
-// TestMeasureFastTransferInsideWarmupReportsLowerBound: 5 MiB at anything
-// above ~10 MB/s completes inside the 500ms warmup window, which is the normal
-// case for a datacenter-hosted provider. Reporting no rate there would make the
+// TestMeasureFastTransferInsideWarmupReportsLowerBound: 16 MiB at anything
+// above ~32 MiB/s completes inside the 500ms warmup window, which the fastest
+// datacenter-hosted providers clear. Reporting no rate there would make the
 // fastest providers -- the ones most worth measuring -- the only ones that
 // never produce a figure, because the server rejects a non-positive rate
 // outright. The warmup-inclusive rate is reported instead, flagged as the
 // lower bound it is.
 func TestMeasureFastTransferInsideWarmupReportsLowerBound(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(w, io.LimitReader(zeroReader{}, MaxSampleBytes))
+		_, _ = io.Copy(w, io.LimitReader(zeroReader{}, StreamBytes))
 	}))
 	defer srv.Close()
 
@@ -161,9 +168,9 @@ func TestMeasureFastTransferInsideWarmupReportsLowerBound(t *testing.T) {
 }
 
 // TestMeasureHonoursTheRequestedByteParameter: both targets are
-// size-parameterised the same way, and the measurement asks for exactly the
-// cap. A target that received no `bytes` parameter would stream its own
-// default instead.
+// size-parameterised the same way, and each stream asks for exactly
+// StreamBytes -- StreamCount of them add up to the cap. A target that received
+// no `bytes` parameter would stream its own default instead.
 func TestMeasureRequestsTheByteParameter(t *testing.T) {
 	var got atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -177,7 +184,7 @@ func TestMeasureRequestsTheByteParameter(t *testing.T) {
 		Target{Name: "test", URL: srv.URL}, 5*time.Second); err != nil {
 		t.Fatalf("MeasureTarget: %s", err)
 	}
-	if want := strconv.Itoa(MaxSampleBytes); got.Load() != want {
+	if want := strconv.Itoa(StreamBytes); got.Load() != want {
 		t.Errorf("bytes parameter = %v, want %s", got.Load(), want)
 	}
 }
@@ -232,6 +239,13 @@ func (r *recordingReserver) ReserveBandwidth(ctx context.Context, providerClient
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, byteCount)
 	return r.err
+}
+
+// reserved returns every byte count that was reserved, in call order.
+func (r *recordingReserver) reserved() []int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]int64(nil), r.calls...)
 }
 
 func (r *recordingReserver) count() int {
@@ -358,6 +372,16 @@ func TestSamplerReportsTargetsSeparately(t *testing.T) {
 
 	if reserver.count() != 2 {
 		t.Errorf("%d reservations, want one per target: each target pulls its own sample through the provider's tunnel", reserver.count())
+	}
+	// A reservation has to be for what the measurement actually moves. The
+	// server clamps a reservation to model.MaxProviderBandwidthBytesPerProbe,
+	// so if this figure ever drifts above that constant the deployment-wide
+	// budget silently under-counts every probe -- worse than having no budget.
+	for _, reserved := range reserver.reserved() {
+		if reserved != MaxSampleBytes {
+			t.Errorf("reserved %d bytes for a measurement that transfers up to %d: the byte budget must reserve what is actually pulled",
+				reserved, int64(MaxSampleBytes))
+		}
 	}
 }
 
@@ -540,5 +564,208 @@ func TestTargetHosts(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Errorf("TargetHosts() = %v, missing %q", hosts, want)
 		}
+	}
+}
+
+// barrierServer is an httptest server that counts the connections it accepts
+// and holds every request open until `want` of them are in flight at once.
+//
+// Connections, not requests: N requests multiplexed over one HTTP/2 connection
+// share one congestion window, which is exactly the failure this whole change
+// exists to fix. A request counter cannot see the difference; a connection
+// counter can.
+type barrierServer struct {
+	srv     *httptest.Server
+	conns   atomic.Int64
+	arrived atomic.Int64
+	all     chan struct{}
+	once    sync.Once
+}
+
+func newBarrierServer(t *testing.T, want int, body func(w http.ResponseWriter)) *barrierServer {
+	t.Helper()
+	b := &barrierServer{all: make(chan struct{})}
+	b.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if int(b.arrived.Add(1)) == want {
+			b.once.Do(func() { close(b.all) })
+		}
+		select {
+		case <-b.all:
+		case <-time.After(10 * time.Second):
+			t.Errorf("only %d of %d requests were ever in flight at once", b.arrived.Load(), want)
+			return
+		}
+		body(w)
+	}))
+	b.srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			b.conns.Add(1)
+		}
+	}
+	b.srv.Start()
+	t.Cleanup(b.srv.Close)
+	return b
+}
+
+// TestMeasureOpensStreamCountConnections: the measurement must actually open
+// StreamCount transport connections, simultaneously.
+//
+// This is the fix itself, asserted directly. A single TCP flow cannot exceed
+// (connect's 1 MiB MaxWindowSize / RTT) regardless of how much capacity the
+// provider has -- which is why the single-stream version of this package
+// reported ~1 MiB / RTT for eleven of twelve beta providers, and 4.8 MB/s for
+// a provider independently measured at 79 MB/s on its own host. N flows get N
+// windows; anything that quietly collapses them back to one (a serialised
+// loop, a connection pool of one, HTTP/2 multiplexing) restores the original
+// bug with every other test still green.
+func TestMeasureOpensStreamCountConnections(t *testing.T) {
+	b := newBarrierServer(t, StreamCount, func(w http.ResponseWriter) {
+		_, _ = io.Copy(w, io.LimitReader(zeroReader{}, StreamBytes))
+	})
+
+	sample, err := MeasureTarget(context.Background(), b.srv.Client(),
+		Target{Name: "test", URL: b.srv.URL}, 30*time.Second)
+	if err != nil {
+		t.Fatalf("MeasureTarget: %s", err)
+	}
+	if got := b.conns.Load(); got != StreamCount {
+		t.Fatalf("the server accepted %d connections, want %d: %d parallel streams are only %d congestion windows if they are %d connections",
+			got, StreamCount, StreamCount, StreamCount, StreamCount)
+	}
+	if sample.Streams != StreamCount {
+		t.Errorf("Sample.Streams = %d, want %d", sample.Streams, StreamCount)
+	}
+	if want := int64(MaxSampleBytes); sample.SampleByteCount != want {
+		t.Errorf("SampleByteCount = %d, want %d (%d streams x %d)",
+			sample.SampleByteCount, want, StreamCount, StreamBytes)
+	}
+}
+
+// TestMeasureAggregatesAcrossParallelStreams is the point of the change stated
+// as an assertion: against a target that rate-limits EACH CONNECTION to the
+// same figure -- which is what connect's per-flow window does to a real
+// provider -- the parallel measurement must report about StreamCount times
+// what one connection can carry, not one connection's worth.
+//
+// The single-stream baseline is measured from the same handler in the same
+// run, so the assertion does not depend on how fast this machine is.
+func TestMeasureAggregatesAcrossParallelStreams(t *testing.T) {
+	// ~1.6 MiB/s per connection: 32 KiB every 20 ms. StreamBytes then takes
+	// ~1.25 s per stream, comfortably past the 500 ms warmup, so the figure
+	// under test is a real steady-state one.
+	const chunk = 32 * 1024
+	const pause = 20 * time.Millisecond
+	srv := httptest.NewServer(throttledHandler(StreamBytes, chunk, pause))
+	defer srv.Close()
+
+	// baseline: one connection, StreamBytes, same handler, timed by hand
+	sizedOne, err := sizedURL(srv.URL, StreamBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	singleStart := time.Now()
+	resp, err := srv.Client().Get(sizedOne)
+	if err != nil {
+		t.Fatalf("baseline request: %s", err)
+	}
+	singleBytes, err := io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("baseline read: %s", err)
+	}
+	singleRate := float64(singleBytes) / time.Since(singleStart).Seconds()
+
+	sample, err := MeasureTarget(context.Background(), srv.Client(),
+		Target{Name: "test", URL: srv.URL}, 30*time.Second)
+	if err != nil {
+		t.Fatalf("MeasureTarget: %s", err)
+	}
+	if !sample.WarmupExcluded {
+		t.Fatalf("the transfer finished inside the warmup window (%s), so this run is not measuring the steady state it claims to", sample.Elapsed)
+	}
+
+	t.Logf("per-connection %.0f B/s, aggregate %.0f B/s over %s (%d streams, %d bytes)",
+		singleRate, sample.BytesPerSecond, sample.Elapsed, sample.Streams, sample.SampleByteCount)
+
+	// measurably higher than one stream. Half the theoretical StreamCount
+	// multiple is a wide margin that a serialised or multiplexed
+	// implementation cannot reach and a working one clears easily.
+	if floor := float64(StreamCount) / 2 * singleRate; sample.BytesPerSecond < floor {
+		t.Fatalf("aggregate = %.0f B/s against a per-connection rate of %.0f B/s, want at least %.0f. "+
+			"%d parallel streams are not adding up -- the measurement is still reporting one stream's throughput",
+			sample.BytesPerSecond, singleRate, floor, StreamCount)
+	}
+
+	// and it must be the SUM, not something larger: summing per-stream rates
+	// instead of dividing summed bytes by one common window would report
+	// throughput the link never simultaneously carried.
+	want := float64(StreamCount) * singleRate
+	if ratio := sample.BytesPerSecond / want; ratio < 0.6 || 1.4 < ratio {
+		t.Errorf("aggregate = %.0f B/s, want ~%.0f (%d x the %.0f B/s per-connection rate); ratio %.2f",
+			sample.BytesPerSecond, want, StreamCount, singleRate, ratio)
+	}
+}
+
+// unalignedBody yields exactly chunk bytes per Read, forever. A real
+// connection does the same thing -- a Read returns whatever happens to have
+// arrived, not a whole buffer -- and the sizes it returns are not multiples of
+// the read buffer. Over loopback an httptest server happens to fill the 32 KiB
+// buffer every time, which hides an off-by-one-buffer cap bug completely, so
+// this stubs the transport instead of relying on that accident.
+type unalignedBody struct{ chunk int }
+
+func (b unalignedBody) Read(p []byte) (int, error) {
+	n := b.chunk
+	if len(p) < n {
+		n = len(p)
+	}
+	for i := 0; i < n; i++ {
+		p[i] = 0
+	}
+	return n, nil
+}
+
+func (unalignedBody) Close() error { return nil }
+
+// stubTransport answers every request from an unalignedBody and counts the
+// requests it saw.
+type stubTransport struct {
+	chunk    int
+	requests atomic.Int64
+}
+
+func (t *stubTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	t.requests.Add(1)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       unalignedBody{chunk: t.chunk},
+		Request:    r,
+	}, nil
+}
+
+// TestMeasureCapsEachStreamOnItsRemainingAllowance: the byte cap is enforced
+// against what is left of a stream's allowance, not per read.
+//
+// Reading a whole buffer and checking the total afterwards overshoots by up to
+// one buffer PER STREAM -- StreamCount buffers of paid contract traffic
+// through a provider's tunnel that the server's byte budget never admitted, on
+// every single measurement. The stub delivers a chunk size that shares no
+// factor with either the read buffer or StreamBytes, so an overshoot cannot
+// hide behind an accidentally-aligned read.
+func TestMeasureCapsEachStreamOnItsRemainingAllowance(t *testing.T) {
+	tr := &stubTransport{chunk: 7000}
+	client := &http.Client{Transport: tr}
+
+	sample, err := MeasureTarget(context.Background(), client,
+		Target{Name: "test", URL: "https://stub.example/download"}, 30*time.Second)
+	if err != nil {
+		t.Fatalf("MeasureTarget: %s", err)
+	}
+	if want := int64(MaxSampleBytes); sample.SampleByteCount != want {
+		t.Errorf("SampleByteCount = %d, want exactly %d: %d bytes over the cap, across %d streams reading %d-byte chunks",
+			sample.SampleByteCount, want, sample.SampleByteCount-want, StreamCount, tr.chunk)
+	}
+	if got := tr.requests.Load(); got != StreamCount {
+		t.Errorf("%d requests, want %d", got, StreamCount)
 	}
 }

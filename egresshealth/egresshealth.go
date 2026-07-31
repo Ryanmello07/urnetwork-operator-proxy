@@ -126,9 +126,10 @@
 // body, which is the one place these figures can be exceeded on the wire.
 //
 // This rides the same budget as the server's active bandwidth probe, which
-// spends model.MaxProviderBandwidthBytesPerProbe = 5 MiB per probe and
-// model.MaxProviderBandwidthBytesPerBucket = 200 MiB per hourly bucket. A full
-// egress-health run is under 1% of one bandwidth probe.
+// spends model.MaxProviderBandwidthBytesPerProbe = 16 MiB per probe (8
+// parallel streams of 2 MiB -- see bandwidth.StreamCount for why one stream
+// measured the congestion window rather than the provider). A full
+// egress-health run is under 0.2% of one bandwidth probe.
 package egresshealth
 
 import (

@@ -225,7 +225,7 @@ recorded it clean.
   256 B for connectivity, 1 KiB for everything else, and never above 1 KiB), so
   a run costs at most **25,856 bytes ≈ 25 KiB** of body — *less* than the 33 KiB
   of the 31-destination table it replaces, from a table four and a half times
-  wider. Under 1% of one 5 MiB active bandwidth probe. A `Range` header holds
+  wider. Under 0.2% of one 16 MiB active bandwidth probe. A `Range` header holds
   the larger destinations to ~1 KiB where it is honoured, but several hosts
   ignore it (measured: `www.wikipedia.org`, `www.atlassian.com`,
   `cloud.google.com`, `apnews.com`, `www.baidu.com`; earlier, jsDelivr and
@@ -259,13 +259,56 @@ measurement — never a second tunnel — against **two independent targets**:
 | cdn | `https://speed.cloudflare.com/__down?bytes=N` | `active-cdn` |
 
 Both take the identical URL shape and run through the identical measurement
-code, so neither figure is advantaged by a different request shape. Each
-measurement streams until **5 s elapsed or 5 MiB transferred**, whichever comes
-first, discarding the first **500 ms** so TCP slow start does not depress the
-figure. A transfer that finishes inside that 500 ms (5 MiB at anything above
-~10 MB/s does) reports the warmup-inclusive rate instead, flagged
-`(lower-bound)` — reporting nothing there would exclude exactly the fastest
-providers, which are the ones most worth measuring.
+code, so neither figure is advantaged by a different request shape.
+
+**Each measurement opens 8 parallel streams of 2 MiB, and the figure is their
+aggregate.** This is not a throughput optimisation, it is the difference
+between measuring the provider and measuring nothing. A single TCP flow cannot
+exceed (send window ÷ RTT), and `connect`'s `MaxWindowSize` is
+`scaledPow2WindowSize(mib(1), …)` — so one flow ceilings at 1 MiB ÷ RTT, which
+is 11.2 MiB/s at the fleet's median 89 ms. The single-stream version of this
+probe measured exactly that ceiling: bandwidth-delay product (measured
+throughput × measured RTT) came out at ~1 MiB for **eleven of twelve** beta
+providers, and a provider independently measured at 79 MB/s on its own host
+reported 4.8 MB/s through the tunnel. Eleven independent providers on eleven
+hosts do not coincidentally have capacity equal to one window over their own
+RTT.
+
+One flow gets one window; N flows get N windows — the same reason Cloudflare
+and Ookla use 4–16 connections. Raising `connect`'s `MaxWindowSize` is *not*
+the fix: that is the data path every real user rides.
+
+All at 2 MiB per stream; a sweep is 40 providers × 2 targets = 80 reservations.
+
+| streams | ceiling at 89 ms RTT | per target | full 40-provider sweep | averaged over the hour |
+| --- | --- | --- | --- | --- |
+| 1 | 11.2 MiB/s | 2 MiB | 0.16 GiB | 0.04 MiB/s |
+| 4 | 44.9 MiB/s | 8 MiB | 0.62 GiB | 0.18 MiB/s |
+| **8** | **89.9 MiB/s** | **16 MiB** | **1.25 GiB** | **0.36 MiB/s** |
+| 16 | 179.8 MiB/s | 32 MiB | 2.50 GiB | 0.71 MiB/s |
+
+8 × 2 MiB puts the ceiling (89.9 MiB/s ≈ 94 MB/s) above the fastest provider
+capacity we have independently confirmed (79 MB/s), at 1.25 GiB per sweep —
+0.36 MiB/s averaged over the hour a sweep is spread across, against a measured
+28–120 MB/s uplink. 16 streams would double both the ceiling and the cost for
+no provider we can currently show is being clipped.
+
+The streams are only 8 windows if they are 8 *transport connections*: the
+tunnel's client sets `DisableKeepAlives` and offers no ALPN, so HTTP/2 can
+never multiplex them onto one. That is asserted directly, on accepted
+connections rather than on requests, in
+`TestHTTPClientForHostsOpensOneConnectionPerConcurrentRequest`.
+
+A measurement streams until **5 s elapsed or 16 MiB transferred**, whichever
+comes first, discarding the first **500 ms** so TCP slow start does not depress
+the figure. Throughput is the total bytes all streams moved inside one common
+wall-clock window divided by that window — per-stream rates are never summed,
+which would report throughput the link never simultaneously carried. A transfer
+that finishes inside the warmup window (16 MiB above ~32 MiB/s) reports the
+warmup-inclusive rate instead, flagged `(lower-bound)` — reporting nothing
+there would exclude exactly the fastest providers, which are the ones most
+worth measuring. Parallel streams make that case rarer than the single-stream
+probe's ~10 MiB/s threshold, not impossible.
 
 **The two figures are stored and logged separately and are never averaged.**
 That is the entire point of having two: a provider that prioritises one path
@@ -288,6 +331,15 @@ nothing. A full fleet is therefore covered across successive hours instead of
 in one expensive pass. Two targets consume two reservations per provider, so a
 given hourly budget covers half as many providers as a single-target probe
 would.
+
+**Concurrency, not only bytes.** A byte budget does not bound simultaneous
+transfers, and that is the dimension that loads the api. The fan-out is bounded
+explicitly at both ends: a measurement opens exactly `bandwidth.StreamCount`
+streams and this package has no path to more, and the prober runs
+`-concurrency` provider tunnels at a time. Worst case simultaneous transfers
+served by the api is therefore `StreamCount × -concurrency` — **8 × 2 = 16** at
+beta's deployed `-concurrency=2`, and 32 at the flag's default of 4. It scales
+with `-concurrency`, not with fleet size.
 
 Flags: `-skip-bandwidth` turns it off, `-bandwidth-timeout` (default 5s) is the
 per-target cap so the added wall clock per provider is at most twice it, and

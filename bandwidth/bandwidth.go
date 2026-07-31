@@ -4,9 +4,49 @@
 // It is deliberately adaptive rather than fixed-size: a fixed payload is either
 // too small to mean anything on a fast link (the whole transfer finishes inside
 // TCP slow start) or wastes budget on a slow one. Each measurement streams
-// until either bound is hit -- 5 s elapsed or 5 MiB transferred, whichever
-// comes first -- and reports the steady-state rate after discarding the first
-// 500 ms of slow-start noise.
+// until either bound is hit -- 5 s elapsed or MaxSampleBytes transferred,
+// whichever comes first -- and reports the steady-state rate after discarding
+// the first 500 ms of slow-start noise.
+//
+// # Why the measurement is parallel: it used to measure the window, not the link
+//
+// A single TCP flow cannot exceed (send window / RTT), no matter how fast the
+// far end is. connect's MaxWindowSize is scaledPow2WindowSize(mib(1), ...), so
+// one flow through a provider's tunnel ceilings at 1 MiB / RTT -- 11.2 MiB/s at
+// the fleet's ~89 ms.
+//
+// The single-stream version of this package measured exactly that ceiling and
+// nothing else. Across the beta fleet, bandwidth-delay product (measured
+// throughput x measured RTT = bytes in flight) came out at ~1 MiB for eleven of
+// twelve providers:
+//
+//	mib_s   rtt_ms   bdp_mib          mib_s   rtt_ms   bdp_mib
+//	 20.1      89     1.788            12.4      84     1.043
+//	 19.8      82     1.624            10.5      76     0.801
+//	 19.6      89     1.740             9.9      89     0.881
+//	 18.8      89     1.671             9.1     100     0.905
+//	 15.2      79     1.199            14.8      76     1.128
+//	 13.1      76     0.992
+//
+// Eleven independent providers on eleven different hosts do not coincidentally
+// have capacity equal to one window divided by their own RTT. Confirmed against
+// a box under our control: a German provider does 79 MB/s measured directly on
+// the host and the single-stream probe reported 4.8 MB/s through the tunnel.
+//
+// The fix is N parallel streams: one flow gets one window, N flows get N
+// windows. This is why Cloudflare and Ookla use 4-16 connections. Raising
+// connect's MaxWindowSize is NOT the fix -- that is the data path every real
+// user rides, and a far larger decision than this probe.
+//
+// # One TCP connection per stream is load-bearing
+//
+// N streams only buy N windows if they are N transport connections. Multiplexed
+// over one HTTP/2 connection they share one window and the probe measures
+// exactly what it measured before, with every test still green. The tunnel's
+// client (providertunnel.httpClientOverDialerWithHosts) guarantees this: it
+// offers no ALPN protocols and sets DisableKeepAlives, so every request is its
+// own HTTP/1.1 connection. Any *http.Client handed to this package must have
+// the same property.
 //
 // # Two targets, never averaged
 //
@@ -31,15 +71,60 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	// MaxSampleBytes bounds one measurement. It matches the operator download
-	// endpoint's own clamp and the per-probe figure the server's byte budget
-	// reserves against, so a measurement can never transfer more than it
-	// reserved.
-	MaxSampleBytes = 5 * 1024 * 1024
+	// StreamCount is how many parallel connections one measurement opens
+	// against one target. It is a constant, not a knob, and it is the ONLY
+	// thing that sets the fan-out: the measurement opens exactly this many
+	// streams and there is no path in this package to more.
+	//
+	// Why 8. The per-stream ceiling is one connect window over the RTT --
+	// 1 MiB / 89 ms = 11.2 MiB/s at the fleet's median. Streams multiply it:
+	//
+	//	streams   ceiling at 89 ms RTT
+	//	      1   11.2 MiB/s
+	//	      4   44.9 MiB/s
+	//	      8   89.9 MiB/s
+	//	     16  179.8 MiB/s
+	//
+	// 8 puts the ceiling above the fastest capacity we have independently
+	// confirmed on a real provider (79 MB/s, measured on the host itself), so
+	// the figure is the provider's rather than the probe's. 16 would double
+	// both the ceiling and the cost for no provider we can currently show is
+	// being clipped.
+	//
+	// Cost of the SERVER side of this: the api serves StreamCount transfers
+	// per probing worker, and the prober runs -concurrency provider tunnels at
+	// once. Beta runs -concurrency=2, so the worst case is 8 x 2 = 16
+	// simultaneous transfers. That figure scales with -concurrency, not with
+	// fleet size.
+	StreamCount = 8
+
+	// StreamBytes is what each stream requests and is capped at. It must stay
+	// at or below the operator download endpoint's per-request clamp
+	// (handlers.maxProviderBandwidthTestBytes), or the endpoint truncates the
+	// response and the aggregate falls short of what was reserved for it.
+	//
+	// 2 MiB per stream also keeps the transfer long enough to clear the
+	// warmup window on ordinary providers: 16 MiB aggregate takes longer than
+	// WarmupDuration for anything under 32 MiB/s, where the old 5 MiB single
+	// stream crossed that line at 10 MiB/s and therefore fell back to the
+	// lower-bound path on most of the fleet.
+	StreamBytes = 2 * 1024 * 1024
+
+	// MaxSampleBytes bounds one measurement across all of its streams. It is
+	// the figure the server's byte budget reserves against
+	// (model.MaxProviderBandwidthBytesPerProbe), so a measurement can never
+	// transfer more than it reserved -- the two must be changed together or
+	// the budget under-counts, which is worse than having no budget.
+	//
+	// 8 x 2 MiB = 16 MiB per target, 32 MiB per provider across both targets,
+	// 1.25 GiB for a full 40-provider sweep -- 0.36 MiB/s averaged over the
+	// hour a sweep is spread across, against a measured 28-120 MB/s uplink.
+	MaxSampleBytes = StreamCount * StreamBytes
 
 	// WarmupDuration is discarded from the head of a measurement. A TCP
 	// connection opens in slow start, so bytes carried in the first few round
@@ -124,12 +209,21 @@ type Target struct {
 
 // Sample is one measurement.
 type Sample struct {
-	BytesPerSecond  float64
+	// BytesPerSecond is the AGGREGATE rate across all streams: the total bytes
+	// they moved inside one common wall-clock window, divided by that window.
+	// Per-stream rates are never summed -- see measure for why that would
+	// inflate the figure.
+	BytesPerSecond float64
+	// SampleByteCount is the total across all streams.
 	SampleByteCount int64
+	// Streams is how many streams contributed, always StreamCount for a
+	// successful measurement. Recorded so a figure can be read back against
+	// the fan-out that produced it.
+	Streams int
 	// WarmupExcluded reports whether the rate was computed over the
 	// steady-state window only. It is false when the whole transfer finished
-	// inside WarmupDuration -- 5 MiB completes in under 500 ms on anything
-	// above ~10 MB/s, which datacenter-hosted providers clear routinely -- in
+	// inside WarmupDuration -- 16 MiB completes in under 500 ms above
+	// ~32 MiB/s, which the fastest datacenter-hosted providers clear -- in
 	// which case the rate is computed over the full transfer instead and is a
 	// LOWER BOUND on the real throughput, because it includes slow start.
 	//
@@ -211,25 +305,74 @@ func sizedURL(rawURL string, byteCount int64) (string, error) {
 	return u.String(), nil
 }
 
-// Measure streams from testURL and reports the throughput. It stops at
-// MaxSampleBytes or at timeout, whichever comes first.
+// Measure streams from testURL and reports the aggregate throughput of
+// StreamCount parallel streams. It stops at MaxSampleBytes or at timeout,
+// whichever comes first.
 //
 // This is the plain-url form used by tests and one-off diagnostics;
-// MeasureTarget is what production uses, and both run the same code beneath.
+// MeasureTarget is what production uses, and both run the same code beneath --
+// including the parallelism, so a diagnostic run reports the same figure the
+// fleet does.
 func Measure(ctx context.Context, client *http.Client, testURL string, timeout time.Duration) (float64, int64, error) {
 	sample, err := measure(ctx, client, testURL, nil, timeout)
 	return sample.BytesPerSecond, sample.SampleByteCount, err
 }
 
-// MeasureTarget measures one target, requesting exactly MaxSampleBytes.
+// MeasureTarget measures one target with StreamCount parallel streams of
+// StreamBytes each, which is MaxSampleBytes in total.
 func MeasureTarget(ctx context.Context, client *http.Client, target Target, timeout time.Duration) (Sample, error) {
-	sizedTargetURL, err := sizedURL(target.URL, MaxSampleBytes)
-	if err != nil {
-		return Sample{}, err
-	}
-	return measure(ctx, client, sizedTargetURL, target.Header, timeout)
+	return measure(ctx, client, target.URL, target.Header, timeout)
 }
 
+// stream is one parallel connection's state and outcome.
+type stream struct {
+	resp *http.Response
+	err  error
+	// total is what this stream read, capped at StreamBytes.
+	total int64
+	// steadyBytes is the part of total that landed at or after the common
+	// warmup boundary.
+	steadyBytes int64
+	// steadyStart is when this stream's first read at or after the warmup
+	// boundary completed. The aggregate window opens at the earliest of these
+	// across all streams -- see measure.
+	steadyStart time.Time
+	// end is when this stream's last read completed.
+	end time.Time
+}
+
+// measure runs StreamCount streams against testURL at once and reports their
+// aggregate rate.
+//
+// # Why the window is common to all streams
+//
+// The figure is (bytes all streams moved inside one wall-clock window) / (that
+// window). Per-stream rates are deliberately NOT computed and summed: a stream
+// that finishes early has a short denominator of its own, so its rate is high,
+// and adding it to streams that are still running reports throughput the link
+// never simultaneously carried.
+//
+// The window opens at the first read, on any stream, that completes at or
+// after start+WarmupDuration -- where start is taken after EVERY stream has
+// its response headers (see the barrier below), so connect, TLS and the
+// request round-trip are excluded for all streams uniformly.
+//
+// It opens at that first read rather than at the boundary instant itself
+// because a link that is still stalled when the boundary passes has not
+// started its steady state yet, and charging it for the gap would report a
+// rate for a period in which the link was, by construction, not the thing
+// being measured. The single-stream version of this package behaved the same
+// way; making the boundary a fixed instant instead quietly changed the figure
+// on any target that pauses across it.
+//
+// The window closes at the last stream's final read. A straggler therefore
+// leaves a tail during which fewer than StreamCount streams were running,
+// which pulls the aggregate DOWN. That is the safe direction and it is why
+// this is preferred over closing the window at the first stream's completion:
+// closing early would need in-flight reads cancelled, and would then have to
+// tell "cancelled because we chose to stop" apart from "cancelled because the
+// probe was abandoned", muddying the one classification below that has to stay
+// exactly right.
 func measure(
 	ctx context.Context,
 	client *http.Client,
@@ -240,93 +383,98 @@ func measure(
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
+	// Every stream asks for the same size. The URL shape is identical across
+	// both targets, so this is the one place the byte count is set.
+	sizedTargetURL, err := sizedURL(testURL, StreamBytes)
+	if err != nil {
+		return Sample{}, err
+	}
 	// parent is kept so a read cut short by THIS measurement's own time cap can
 	// be told apart from one cut short by the probe being cancelled: the former
 	// is the designed stopping condition, the latter is not a measurement.
 	parent := ctx
 	// WithTimeout never extends an earlier parent deadline, so a probe whose
-	// own budget is nearly spent still cannot be overrun by this.
+	// own budget is nearly spent still cannot be overrun by this. One deadline
+	// is shared by all streams, so they stop together.
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, testURL, nil)
-	if err != nil {
-		return Sample{}, err
-	}
-	for k, values := range header {
-		for _, v := range values {
-			req.Header.Add(k, v)
-		}
-	}
 	if client == nil {
 		client = http.DefaultClient
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return Sample{}, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return Sample{}, fmt.Errorf(
-			"bandwidth: %s answered %d: %s",
-			testURL, resp.StatusCode, strings.TrimSpace(string(msg)),
-		)
-	}
+	// measureStart is the wall clock the time cap is measured against, so the
+	// cap bounds the whole measurement including connection setup rather than
+	// only the reading part.
+	measureStart := time.Now()
 
-	start := time.Now()
-	end := start
-	var total int64
-	var steadyStart time.Time
-	var steadyBytes int64
-	buf := make([]byte, 32*1024)
+	// Fixed-size, indexed by stream: the fan-out is StreamCount and nothing
+	// here can grow it.
+	streams := make([]stream, StreamCount)
+	var setup sync.WaitGroup
+	var done sync.WaitGroup
+	// gun is the barrier. Every stream blocks on it after client.Do returns
+	// and before its first Body.Read, so the shared clock starts when all of
+	// them are actually ready to move bytes.
+	gun := make(chan struct{})
+	// Written before close(gun) and read only after <-gun, so the channel
+	// close carries the happens-before.
+	var start time.Time
+	var steadyFrom time.Time
+	abort := false
 
-	for {
-		// Read into no more than the cap allows. Reading a whole buffer and
-		// checking afterwards overshoots by up to one buffer -- 5243392 bytes
-		// against a 5242880 cap, measured -- which is a transfer larger than
-		// the reservation admitted, through a provider's tunnel, on every
-		// measurement.
-		readBuf := buf
-		if remaining := int64(MaxSampleBytes) - total; remaining < int64(len(readBuf)) {
-			readBuf = readBuf[:remaining]
-		}
-		n, readErr := resp.Body.Read(readBuf)
-		now := time.Now()
-		end = now
-		total += int64(n)
-		// The read that first crosses the warmup boundary opens the
-		// steady-state window; its own bytes count towards it, which is a
-		// fraction of one 32 KiB buffer either way.
-		if steadyStart.IsZero() && WarmupDuration <= now.Sub(start) {
-			steadyStart = now
-		}
-		if !steadyStart.IsZero() {
-			steadyBytes += int64(n)
-		}
-		if MaxSampleBytes <= total {
-			break
-		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			if errors.Is(readErr, context.DeadlineExceeded) && parent.Err() == nil {
-				// the time cap fired while a read was in flight. That is this
-				// measurement's designed stopping condition, reached a few
-				// milliseconds before the loop's own check would have reached
-				// it, so the bytes already timed are a valid (smaller) sample
-				// rather than a failure.
-				break
+	for i := range streams {
+		setup.Add(1)
+		done.Add(1)
+		go func(s *stream) {
+			defer done.Done()
+			s.err = openStream(ctx, client, sizedTargetURL, header, s)
+			setup.Done()
+
+			<-gun
+			if s.resp == nil {
+				return
 			}
-			// Anything else -- including the probe itself being cancelled --
-			// leaves a window shaped by something other than the link, so no
-			// figure is reported.
-			return Sample{SampleByteCount: total}, readErr
-		}
-		if timeout <= now.Sub(start) {
+			defer s.resp.Body.Close()
+			if abort || s.err != nil {
+				return
+			}
+			s.err = readStream(s, parent, measureStart, steadyFrom, timeout)
+		}(&streams[i])
+	}
+
+	setup.Wait()
+	for i := range streams {
+		if streams[i].err != nil {
+			abort = true
 			break
+		}
+	}
+	start = time.Now()
+	steadyFrom = start.Add(WarmupDuration)
+	close(gun)
+	done.Wait()
+
+	var total int64
+	var steadyBytes int64
+	var windowStart time.Time
+	var windowEnd time.Time
+	for i := range streams {
+		if streams[i].err != nil {
+			// One stream's failure fails the measurement. A partial aggregate
+			// is not the figure this reports: it would be N-minus-something
+			// windows' worth of throughput published as if it were N.
+			return Sample{SampleByteCount: total, Streams: StreamCount}, streams[i].err
+		}
+		total += streams[i].total
+		steadyBytes += streams[i].steadyBytes
+		if windowEnd.Before(streams[i].end) {
+			windowEnd = streams[i].end
+		}
+		if start := streams[i].steadyStart; !start.IsZero() {
+			if windowStart.IsZero() || start.Before(windowStart) {
+				windowStart = start
+			}
 		}
 	}
 
@@ -334,31 +482,131 @@ func measure(
 		return Sample{}, ErrNoSample
 	}
 
-	if steadyElapsed := end.Sub(steadyStart); !steadyStart.IsZero() && 0 < steadyElapsed && 0 < steadyBytes {
+	if steadyElapsed := windowEnd.Sub(windowStart); !windowStart.IsZero() && 0 < steadyElapsed && 0 < steadyBytes {
 		return Sample{
 			BytesPerSecond:  float64(steadyBytes) / steadyElapsed.Seconds(),
 			SampleByteCount: total,
+			Streams:         StreamCount,
 			WarmupExcluded:  true,
 			Elapsed:         steadyElapsed,
 		}, nil
 	}
 
-	// The whole transfer finished inside the warmup window. Rather than report
-	// no rate at all -- which would silently exclude every fast provider, since
-	// 5 MiB at 10 MB/s takes 500 ms exactly -- fall back to the warmup-inclusive
-	// rate over the full transfer. That figure includes slow start, so it
+	// Every stream finished inside the warmup window. Rather than report no
+	// rate at all -- which would silently exclude the fastest providers, the
+	// ones most worth measuring -- fall back to the warmup-inclusive aggregate
+	// over the full transfer. That figure includes slow start, so it
 	// understates the link: it is a lower bound, and WarmupExcluded=false says
-	// so.
-	totalElapsed := end.Sub(start)
+	// so. Parallel streams make this rarer than it was (the threshold moves
+	// from ~10 MiB/s to ~32 MiB/s) but not impossible, and it must stay honest
+	// when it happens.
+	totalElapsed := windowEnd.Sub(start)
 	if totalElapsed <= 0 {
-		return Sample{SampleByteCount: total}, ErrNoSample
+		return Sample{SampleByteCount: total, Streams: StreamCount}, ErrNoSample
 	}
 	return Sample{
 		BytesPerSecond:  float64(total) / totalElapsed.Seconds(),
 		SampleByteCount: total,
+		Streams:         StreamCount,
 		WarmupExcluded:  false,
 		Elapsed:         totalElapsed,
 	}, nil
+}
+
+// openStream issues one stream's request and leaves the body open and unread,
+// ready for the barrier to release.
+func openStream(
+	ctx context.Context,
+	client *http.Client,
+	sizedTargetURL string,
+	header http.Header,
+	s *stream,
+) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sizedTargetURL, nil)
+	if err != nil {
+		return err
+	}
+	for k, values := range header {
+		for _, v := range values {
+			req.Header.Add(k, v)
+		}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		resp.Body.Close()
+		return fmt.Errorf(
+			"bandwidth: %s answered %d: %s",
+			sizedTargetURL, resp.StatusCode, strings.TrimSpace(string(msg)),
+		)
+	}
+	s.resp = resp
+	return nil
+}
+
+// readStream drains one stream up to StreamBytes, recording what it moved and
+// how much of that landed inside the common steady-state window.
+func readStream(
+	s *stream,
+	parent context.Context,
+	measureStart time.Time,
+	steadyFrom time.Time,
+	timeout time.Duration,
+) error {
+	buf := make([]byte, 32*1024)
+	for {
+		// Read into no more than this stream's remaining allowance. Reading a
+		// whole buffer and checking afterwards overshoots by up to one buffer
+		// per stream -- with StreamCount streams that is StreamCount buffers
+		// past a cap that the server already reserved budget against, on every
+		// measurement. The cap is therefore enforced on the remaining
+		// allowance, not per read.
+		readBuf := buf
+		if remaining := int64(StreamBytes) - s.total; remaining < int64(len(readBuf)) {
+			readBuf = readBuf[:remaining]
+		}
+		n, readErr := s.resp.Body.Read(readBuf)
+		now := time.Now()
+		s.end = now
+		s.total += int64(n)
+		// A read that completes at or after the common warmup boundary counts
+		// towards the steady-state window. The read that first crosses the
+		// boundary carries a fraction of one 32 KiB buffer from before it,
+		// which is under a thousandth of the sample.
+		if !now.Before(steadyFrom) {
+			if s.steadyStart.IsZero() {
+				s.steadyStart = now
+			}
+			s.steadyBytes += int64(n)
+		}
+		if StreamBytes <= s.total {
+			return nil
+		}
+		if readErr == io.EOF {
+			return nil
+		}
+		if readErr != nil {
+			if errors.Is(readErr, context.DeadlineExceeded) && parent.Err() == nil {
+				// the time cap fired while a read was in flight. That is this
+				// measurement's designed stopping condition, reached a few
+				// milliseconds before the loop's own check would have reached
+				// it, so the bytes already timed are a valid (smaller) sample
+				// rather than a failure. Every stream shares the one deadline,
+				// so they all take this path together.
+				return nil
+			}
+			// Anything else -- including the probe itself being cancelled --
+			// leaves a window shaped by something other than the link, so no
+			// figure is reported.
+			return readErr
+		}
+		if timeout <= now.Sub(measureStart) {
+			return nil
+		}
+	}
 }
 
 // Reserver takes deployment-wide byte budget for one active probe. In

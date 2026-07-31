@@ -290,6 +290,27 @@ func httpClientOverDialerWithHosts(dial dialContextFunc, pins map[string][]strin
 		// so connections are never pooled or reused idle in the first
 		// place -- there is nothing for an idle timeout to expire.
 		DisableKeepAlives: true,
+
+		// HTTP/2 is refused, explicitly rather than by accident.
+		//
+		// The bandwidth probe measures a provider by opening
+		// bandwidth.StreamCount requests at once, because a single TCP flow
+		// cannot exceed (connect's 1 MiB window / RTT) and N flows get N
+		// windows. That only holds if N requests are N TRANSPORT connections.
+		// Multiplexed as N h2 streams over one connection they share one
+		// window and the probe silently goes back to measuring 1 MiB / RTT --
+		// with every test still green, because the requests are all still
+		// made.
+		//
+		// Today h2 does not happen here for two separate incidental reasons:
+		// this transport sets DialTLSContext, and http.Transport only attempts
+		// h2 with a custom dialer when ForceAttemptHTTP2 is set; and
+		// PinnedTLSConfigForHost offers no ALPN protocols, so no server can
+		// select h2 anyway. Both are load-bearing for a measurement in another
+		// package and neither says so where someone would change it. A
+		// non-nil empty TLSNextProto is the direct statement, and it holds
+		// regardless of what those two later become.
+		TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{},
 	}
 	tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, _, err := net.SplitHostPort(addr)

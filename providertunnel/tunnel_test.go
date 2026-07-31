@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -19,6 +20,8 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -936,5 +939,114 @@ func TestHTTPClientForHostsDoesNotUnpinAPinnedHost(t *testing.T) {
 	}
 	if !errors.Is(err, ErrPinMismatch) {
 		t.Fatalf("err = %v, want it to wrap ErrPinMismatch", err)
+	}
+}
+
+// countingListener counts every connection the server accepts. Connections,
+// not requests: the thing the bandwidth probe depends on is that N concurrent
+// requests are N transport connections, and a request counter cannot tell that
+// apart from N HTTP/2 streams sharing one.
+type countingListener struct {
+	net.Listener
+	conns atomic.Int64
+}
+
+func (l *countingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		l.conns.Add(1)
+	}
+	return c, err
+}
+
+// TestHTTPClientForHostsOpensOneConnectionPerConcurrentRequest is the
+// regression test for the whole point of the parallel bandwidth probe.
+//
+// bandwidth.measure opens bandwidth.StreamCount requests at once because one
+// TCP flow cannot exceed (connect's 1 MiB window / RTT), and N flows get N
+// windows. If those requests were multiplexed over a single connection --
+// HTTP/2 does exactly this -- they would share one window and the probe would
+// go straight back to reporting 1 MiB / RTT for every provider on the fleet,
+// with every test in the bandwidth package still passing, because the requests
+// really are all being made.
+//
+// So this asserts on ACCEPTED CONNECTIONS, and the test server advertises h2
+// first in ALPN: if this client ever starts offering ALPN protocols, the
+// server selects h2, the connection count collapses to 1, and this fails.
+func TestHTTPClientForHostsOpensOneConnectionPerConcurrentRequest(t *testing.T) {
+	const bandwidthHost = "bandwidth.example"
+	const streams = 8
+
+	serverCert, serverKey := issueLeaf(t, bandwidthHost)
+	raw, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{{
+			Certificate: [][]byte{serverCert.Raw},
+			PrivateKey:  serverKey,
+		}},
+		// h2 offered FIRST, so a client that negotiates ALPN at all will end
+		// up multiplexing. This is the trap the assertion below is set for.
+		NextProtos: []string{"h2", "http/1.1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln := &countingListener{Listener: raw}
+
+	// The handler holds every request open until all of them have arrived, so
+	// they are unambiguously simultaneous. Without this the client could serve
+	// them one after another on one reused connection and still be correct.
+	var arrived atomic.Int64
+	allArrived := make(chan struct{})
+	var once sync.Once
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if int(arrived.Add(1)) == streams {
+			once.Do(func() { close(allArrived) })
+		}
+		select {
+		case <-allArrived:
+		case <-time.After(10 * time.Second):
+			t.Errorf("only %d of %d requests were in flight at once", arrived.Load(), streams)
+		}
+		_, _ = w.Write([]byte("ok"))
+	})}
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+	defer func() { _ = raw.Close() }()
+
+	client := httpClientOverDialerWithHosts(
+		dialerToAddr(raw.Addr().String()),
+		map[string][]string{"pinned.example": {"some-pin"}},
+		[]string{bandwidthHost},
+		30*time.Second,
+	)
+
+	var wg sync.WaitGroup
+	errs := make([]error, streams)
+	for i := 0; i < streams; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp, err := client.Get("https://" + bandwidthHost + "/stream")
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			defer resp.Body.Close()
+			_, _ = io.Copy(io.Discard, resp.Body)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("stream %d failed: %v", i, err)
+		}
+	}
+	if got := ln.conns.Load(); got != streams {
+		t.Fatalf("the server accepted %d connections for %d concurrent requests, want %d. "+
+			"Multiplexed requests share one congestion window, so the bandwidth probe would "+
+			"measure one window over the RTT no matter how many streams it opens",
+			got, streams, streams)
 	}
 }
