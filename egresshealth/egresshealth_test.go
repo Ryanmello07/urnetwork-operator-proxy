@@ -42,6 +42,15 @@ func emptyBody200() handler {
 	}
 }
 
+// status204 is a healthy connectivity check: an empty body is the CORRECT
+// answer, and it is only distinguishable from the blackhole above by the status
+// the destination declared it expects.
+func status204() handler {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
 // statusWithBody models a content provider REFUSING the request -- the
 // datacenter-IP-rejection case. Bytes flow in both directions; the answer is no.
 func statusWithBody(code int, body string) handler {
@@ -62,22 +71,36 @@ func hangs(done <-chan struct{}) handler {
 	}
 }
 
+// spec is one stub destination: a name, a class, a handler, and the parts of
+// the success contract a test wants to exercise. The contract fields are keyed
+// and optional, so the common case stays a three-field literal.
+type spec struct {
+	name   string
+	class  Class
+	h      handler
+	expect Expect
+	status int
+	verify func([]byte) error
+}
+
 // stubDestinations stands up one httptest server multiplexing every named
 // destination and returns the table pointing at it. Order is preserved so
 // assertions can index by position.
-func stubDestinations(t *testing.T, specs []struct {
-	name  string
-	class Class
-	h     handler
-},
-) []Destination {
+func stubDestinations(t *testing.T, specs []spec) []Destination {
 	t.Helper()
 	mux := http.NewServeMux()
 	dests := make([]Destination, 0, len(specs))
 	for _, s := range specs {
 		path := "/" + s.name
 		mux.HandleFunc(path, s.h)
-		dests = append(dests, Destination{Name: s.name, Class: s.class, URL: path})
+		dests = append(dests, Destination{
+			Name:   s.name,
+			Class:  s.class,
+			URL:    path,
+			Expect: s.expect,
+			Status: s.status,
+			Verify: s.verify,
+		})
 	}
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -87,25 +110,25 @@ func stubDestinations(t *testing.T, specs []struct {
 	return dests
 }
 
-type spec = struct {
-	name  string
-	class Class
-	h     handler
-}
-
-// healthyTable is three classes of three, all working.
+// healthyTable is every scored class, three deep, all working. The
+// connectivity entries deliberately mix both success contracts: two 204s where
+// an empty body is correct, and one small body, which is exactly the shape of
+// the production class.
 func healthyTable(t *testing.T) []Destination {
 	t.Helper()
 	return stubDestinations(t, []spec{
-		{"dns-a", ClassDNS, okBody(`{"Status":0}`)},
-		{"dns-b", ClassDNS, okBody(`{"Status":0}`)},
-		{"dns-c", ClassDNS, okBody(`{"Status":0}`)},
-		{"cdn-a", ClassCDN, okBody("/* css */")},
-		{"cdn-b", ClassCDN, okBody("/* css */")},
-		{"cdn-c", ClassCDN, okBody("/* css */")},
-		{"site-a", ClassSite, okBody("User-agent: *")},
-		{"site-b", ClassSite, okBody("User-agent: *")},
-		{"site-c", ClassSite, okBody("User-agent: *")},
+		{name: "dns-a", class: ClassDNS, h: okBody(`{"Status":0}`)},
+		{name: "dns-b", class: ClassDNS, h: okBody(`{"Status":0}`)},
+		{name: "dns-c", class: ClassDNS, h: okBody(`{"Status":0}`)},
+		{name: "conn-a", class: ClassConnectivity, h: status204(), expect: ExpectStatus, status: http.StatusNoContent},
+		{name: "conn-b", class: ClassConnectivity, h: status204(), expect: ExpectStatus, status: http.StatusNoContent},
+		{name: "conn-c", class: ClassConnectivity, h: okBody("success\n")},
+		{name: "cdn-a", class: ClassCDN, h: okBody("/* css */")},
+		{name: "cdn-b", class: ClassCDN, h: okBody("/* css */")},
+		{name: "cdn-c", class: ClassCDN, h: okBody("/* css */")},
+		{name: "site-a", class: ClassSite, h: okBody("User-agent: *")},
+		{name: "site-b", class: ClassSite, h: okBody("User-agent: *")},
+		{name: "site-c", class: ClassSite, h: okBody("User-agent: *")},
 	})
 }
 
@@ -118,11 +141,18 @@ func TestCheckAllHealthy(t *testing.T) {
 	if res.OKCount != res.Total || res.Total != len(dests) {
 		t.Fatalf("OKCount/Total = %d/%d, want %d/%d", res.OKCount, res.Total, len(dests), len(dests))
 	}
+	byName := map[string]Destination{}
+	for _, d := range dests {
+		byName[d.Name] = d
+	}
 	for _, c := range res.Checks {
 		if !c.OK {
 			t.Errorf("%s not OK: status=%d bytes=%d err=%q", c.Name, c.StatusCode, c.ByteCount, c.Err)
 		}
-		if c.ByteCount == 0 {
+		// Only an ExpectBody destination owes us bytes. Asserting it for the
+		// whole table would make the 204 entries -- where an empty body is the
+		// correct answer -- unrepresentable in a healthy table.
+		if byName[c.Name].Expect == ExpectBody && c.ByteCount == 0 {
 			t.Errorf("%s reported OK with zero bytes", c.Name)
 		}
 		if c.Err != "" {
@@ -135,14 +165,14 @@ func TestCheckAllHealthy(t *testing.T) {
 			t.Errorf("ByClass[%s] = %d/%d, want 3/3", class, s.OK, s.Total)
 		}
 	}
-	if got, want := res.Summary(), "ok=9/9 dns=3/3 cdn=3/3 site=3/3"; got != want {
+	if got, want := res.Summary(), "ok=12/12 dns=3/3 connectivity=3/3 cdn=3/3 site=3/3"; got != want {
 		t.Errorf("Summary = %q, want %q", got, want)
 	}
 }
 
 // TestCheckTotalBlackhole is the case this package exists for, and it asserts
 // BOTH halves of the requirement in one place: a blackhole is a successful run
-// reporting 0/9 (err == nil), while a run that could not happen at all is an
+// reporting 0/12 (err == nil), while a run that could not happen at all is an
 // error and no Result. If those two collapsed into each other, "this provider
 // delivers nothing" would be indistinguishable from "the prober was
 // misconfigured", and the whole signal would be unusable.
@@ -152,16 +182,25 @@ func TestCheckTotalBlackhole(t *testing.T) {
 
 	dests := stubDestinations(t, []spec{
 		// Half swallow the request entirely, half return a status line with no
-		// body -- the two shapes a blackholing provider produces.
-		{"dns-a", ClassDNS, hangs(done)},
-		{"dns-b", ClassDNS, emptyBody200()},
-		{"dns-c", ClassDNS, hangs(done)},
-		{"cdn-a", ClassCDN, emptyBody200()},
-		{"cdn-b", ClassCDN, hangs(done)},
-		{"cdn-c", ClassCDN, emptyBody200()},
-		{"site-a", ClassSite, hangs(done)},
-		{"site-b", ClassSite, emptyBody200()},
-		{"site-c", ClassSite, hangs(done)},
+		// body -- the two shapes a blackholing provider produces. Note the
+		// connectivity entries: a bare 200 where the destination declared 204 is
+		// the synthesized-status-line case, and it must fail.
+		{name: "dns-a", class: ClassDNS, h: hangs(done)},
+		{name: "dns-b", class: ClassDNS, h: emptyBody200()},
+		{name: "dns-c", class: ClassDNS, h: hangs(done)},
+		{name: "conn-a", class: ClassConnectivity, h: emptyBody200(), expect: ExpectStatus, status: http.StatusNoContent},
+		{name: "conn-b", class: ClassConnectivity, h: hangs(done), expect: ExpectStatus, status: http.StatusNoContent},
+		{name: "conn-c", class: ClassConnectivity, h: emptyBody200()},
+		{name: "cdn-a", class: ClassCDN, h: emptyBody200()},
+		{name: "cdn-b", class: ClassCDN, h: hangs(done)},
+		{name: "cdn-c", class: ClassCDN, h: emptyBody200()},
+		{name: "site-a", class: ClassSite, h: hangs(done)},
+		{name: "site-b", class: ClassSite, h: emptyBody200()},
+		{name: "site-c", class: ClassSite, h: hangs(done)},
+		// A blackhole takes the reputation class down too, and that must show as
+		// reputation=0/2 without touching ok=N/M.
+		{name: "rep-a", class: ClassReputation, h: hangs(done)},
+		{name: "rep-b", class: ClassReputation, h: emptyBody200()},
 	})
 
 	res, err := check(context.Background(), http.DefaultClient, dests, fastOptions())
@@ -171,15 +210,18 @@ func TestCheckTotalBlackhole(t *testing.T) {
 	if res.OKCount != 0 {
 		t.Fatalf("OKCount = %d, want 0 for a total blackhole (%+v)", res.OKCount, res.Checks)
 	}
-	if res.Total != len(dests) {
-		t.Fatalf("Total = %d, want %d; every destination must be attempted", res.Total, len(dests))
+	if res.Total != 12 {
+		t.Fatalf("Total = %d, want the 12 scored destinations", res.Total)
+	}
+	if len(res.Checks) != len(dests) {
+		t.Fatalf("len(Checks) = %d, want %d; every destination must be attempted", len(res.Checks), len(dests))
 	}
 	for _, class := range Classes {
 		if s := res.ByClass[class]; s.OK != 0 || s.Total != 3 {
 			t.Errorf("ByClass[%s] = %d/%d, want 0/3; a wholly failing class must still be reported", class, s.OK, s.Total)
 		}
 	}
-	if got, want := res.Summary(), "ok=0/9 dns=0/3 cdn=0/3 site=0/3"; got != want {
+	if got, want := res.Summary(), "ok=0/12 dns=0/3 connectivity=0/3 cdn=0/3 site=0/3 reputation=0/2"; got != want {
 		t.Errorf("Summary = %q, want %q", got, want)
 	}
 
@@ -214,22 +256,25 @@ func TestCheckTotalBlackhole(t *testing.T) {
 // "ok=6/9" would be indistinguishable from six random flakes.
 func TestCheckSelectiveFailure(t *testing.T) {
 	dests := stubDestinations(t, []spec{
-		{"dns-a", ClassDNS, okBody(`{"Status":0}`)},
-		{"dns-b", ClassDNS, okBody(`{"Status":0}`)},
-		{"dns-c", ClassDNS, okBody(`{"Status":0}`)},
-		{"cdn-a", ClassCDN, statusWithBody(http.StatusForbidden, "error 1015: rate limited")},
-		{"cdn-b", ClassCDN, statusWithBody(http.StatusServiceUnavailable, "denied: datacenter range")},
-		{"cdn-c", ClassCDN, statusWithBody(http.StatusForbidden, "access denied")},
-		{"site-a", ClassSite, okBody("User-agent: *")},
-		{"site-b", ClassSite, okBody("User-agent: *")},
-		{"site-c", ClassSite, okBody("User-agent: *")},
+		{name: "dns-a", class: ClassDNS, h: okBody(`{"Status":0}`)},
+		{name: "dns-b", class: ClassDNS, h: okBody(`{"Status":0}`)},
+		{name: "dns-c", class: ClassDNS, h: okBody(`{"Status":0}`)},
+		{name: "conn-a", class: ClassConnectivity, h: status204(), expect: ExpectStatus, status: http.StatusNoContent},
+		{name: "conn-b", class: ClassConnectivity, h: status204(), expect: ExpectStatus, status: http.StatusNoContent},
+		{name: "conn-c", class: ClassConnectivity, h: okBody("success\n")},
+		{name: "cdn-a", class: ClassCDN, h: statusWithBody(http.StatusForbidden, "error 1015: rate limited")},
+		{name: "cdn-b", class: ClassCDN, h: statusWithBody(http.StatusServiceUnavailable, "denied: datacenter range")},
+		{name: "cdn-c", class: ClassCDN, h: statusWithBody(http.StatusForbidden, "access denied")},
+		{name: "site-a", class: ClassSite, h: okBody("User-agent: *")},
+		{name: "site-b", class: ClassSite, h: okBody("User-agent: *")},
+		{name: "site-c", class: ClassSite, h: okBody("User-agent: *")},
 	})
 
 	res, err := check(context.Background(), http.DefaultClient, dests, fastOptions())
 	if err != nil {
 		t.Fatalf("check err = %v", err)
 	}
-	if got, want := res.Summary(), "ok=6/9 dns=3/3 cdn=0/3 site=3/3"; got != want {
+	if got, want := res.Summary(), "ok=9/12 dns=3/3 connectivity=3/3 cdn=0/3 site=3/3"; got != want {
 		t.Fatalf("Summary = %q, want %q", got, want)
 	}
 	if s := res.ByClass[ClassCDN]; s.OK != 0 || s.Total != 3 {
@@ -282,7 +327,7 @@ func TestEmptyBodyIs200Failure(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			dests := stubDestinations(t, []spec{{"d", ClassDNS, tc.h}})
+			dests := stubDestinations(t, []spec{{name: "d", class: ClassDNS, h: tc.h}})
 			res, err := check(context.Background(), http.DefaultClient, dests, fastOptions())
 			if err != nil {
 				t.Fatalf("check err = %v", err)
@@ -314,7 +359,7 @@ func TestEmptyBodyIs200Failure(t *testing.T) {
 func TestBodyCapHonoured(t *testing.T) {
 	const streamed = 64 * MaxBodyBytes
 
-	dests := stubDestinations(t, []spec{{"flood", ClassCDN, func(w http.ResponseWriter, r *http.Request) {
+	dests := stubDestinations(t, []spec{{name: "flood", class: ClassCDN, h: func(w http.ResponseWriter, r *http.Request) {
 		chunk := make([]byte, 4096)
 		for i := range chunk {
 			chunk[i] = 'x'
@@ -347,9 +392,9 @@ func TestBodyCapHonoured(t *testing.T) {
 // attempted.
 func TestOneFailureDoesNotAbortTheRun(t *testing.T) {
 	dests := stubDestinations(t, []spec{
-		{"first", ClassDNS, okBody("ok")},
-		{"broken", ClassCDN, statusWithBody(http.StatusInternalServerError, "boom")},
-		{"last", ClassSite, okBody("ok")},
+		{name: "first", class: ClassDNS, h: okBody("ok")},
+		{name: "broken", class: ClassCDN, h: statusWithBody(http.StatusInternalServerError, "boom")},
+		{name: "last", class: ClassSite, h: okBody("ok")},
 	})
 	res, err := check(context.Background(), http.DefaultClient, dests, fastOptions())
 	if err != nil {
@@ -372,7 +417,7 @@ func TestOneFailureDoesNotAbortTheRun(t *testing.T) {
 func TestRequestShape(t *testing.T) {
 	var mu sync.Mutex
 	var gotMethod, gotAccept, gotRange, gotUA string
-	dests := stubDestinations(t, []spec{{"d", ClassDNS, func(w http.ResponseWriter, r *http.Request) {
+	dests := stubDestinations(t, []spec{{name: "d", class: ClassDNS, h: func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		gotMethod, gotAccept, gotRange = r.Method, r.Header.Get("Accept"), r.Header.Get("Range")
 		gotUA = r.Header.Get("User-Agent")
@@ -429,7 +474,7 @@ func TestConcurrencyIsBounded(t *testing.T) {
 	inFlight, peak := 0, 0
 	specs := make([]spec, 0, 9)
 	for i := 0; i < 9; i++ {
-		specs = append(specs, spec{fmt.Sprintf("d%d", i), ClassDNS, func(w http.ResponseWriter, r *http.Request) {
+		specs = append(specs, spec{name: fmt.Sprintf("d%d", i), class: ClassDNS, h: func(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
 			inFlight++
 			if peak < inFlight {
@@ -465,7 +510,7 @@ func TestBudgetBoundsTheRun(t *testing.T) {
 	t.Cleanup(func() { close(done) })
 	specs := make([]spec, 0, 9)
 	for i := 0; i < 9; i++ {
-		specs = append(specs, spec{fmt.Sprintf("d%d", i), ClassDNS, hangs(done)})
+		specs = append(specs, spec{name: fmt.Sprintf("d%d", i), class: ClassDNS, h: hangs(done)})
 	}
 	dests := stubDestinations(t, specs)
 
@@ -508,7 +553,11 @@ func TestDestinationsTable(t *testing.T) {
 	if len(destinations) < 8 {
 		t.Fatalf("len(destinations) = %d; the table is meant to span several classes and operators", len(destinations))
 	}
-	declared := map[Class]bool{}
+	// ClassReputation is declared here but deliberately NOT in Classes: it is a
+	// real class of the table that is kept out of the health score. Everything
+	// else must be in Classes or it would sort after the declared ones in every
+	// summary.
+	declared := map[Class]bool{ClassReputation: true}
 	for _, c := range Classes {
 		declared[c] = true
 	}
@@ -735,8 +784,24 @@ func TestCheckProductionTableIsWiredUp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Check err = %v", err)
 	}
-	if res.Total != len(destinations) {
-		t.Fatalf("Total = %d, want len(destinations) = %d", res.Total, len(destinations))
+	// Total counts the SCORED destinations, not the whole table: the reputation
+	// entries are attempted and reported, but never scored.
+	scoredCount, reputationCount := 0, 0
+	for _, d := range destinations {
+		if scored(d.Class) {
+			scoredCount++
+		} else {
+			reputationCount++
+		}
+	}
+	if res.Total != scoredCount {
+		t.Fatalf("Total = %d, want the %d scored destinations", res.Total, scoredCount)
+	}
+	if res.Reputation.Total != reputationCount {
+		t.Fatalf("Reputation.Total = %d, want %d", res.Reputation.Total, reputationCount)
+	}
+	if len(res.Checks) != len(destinations) {
+		t.Fatalf("len(Checks) = %d, want the whole table %d; a reputation destination must still be ATTEMPTED and recorded", len(res.Checks), len(destinations))
 	}
 	names := map[string]bool{}
 	for _, c := range res.Checks {
@@ -748,13 +813,16 @@ func TestCheckProductionTableIsWiredUp(t *testing.T) {
 		}
 	}
 
-	// Sorted class tallies must still cover the whole table.
+	// Sorted class tallies must still cover every scored destination.
 	total := 0
 	for _, s := range res.ByClass {
 		total += s.Total
 	}
-	if total != len(destinations) {
-		t.Fatalf("ByClass totals sum to %d, want %d", total, len(destinations))
+	if total != scoredCount {
+		t.Fatalf("ByClass totals sum to %d, want %d", total, scoredCount)
+	}
+	if _, present := res.ByClass[ClassReputation]; present {
+		t.Fatal("ByClass carries a reputation entry; reputation is reported in Result.Reputation and must not appear among the scored classes")
 	}
 }
 
@@ -805,5 +873,402 @@ func TestDestinationsReturnsACopy(t *testing.T) {
 		if v == "mutated" {
 			t.Fatalf("mutating a returned entry's Headers changed the production table (%s)", k)
 		}
+	}
+}
+
+// TestExpectStatusAcceptsAnEmptyBody is the new half of the success contract.
+// Every generate_204 connectivity endpoint answers 204 with zero bytes -- that
+// is the CORRECT answer, and 21 of 143 endpoints measured from a real
+// datacenter host behave this way. Under the ExpectBody rule they would all be
+// scored as failures.
+//
+// Read this together with TestEmptyBodyIs200Failure: the same handler, an empty
+// 204, is a success here and a failure there. The only difference is what the
+// destination declared, which is the whole point of Expect.
+func TestExpectStatusAcceptsAnEmptyBody(t *testing.T) {
+	dests := stubDestinations(t, []spec{
+		{name: "c204", class: ClassConnectivity, h: status204(), expect: ExpectStatus, status: http.StatusNoContent},
+	})
+	res, err := check(context.Background(), http.DefaultClient, dests, fastOptions())
+	if err != nil {
+		t.Fatalf("check err = %v", err)
+	}
+	c := res.Checks[0]
+	if !c.OK {
+		t.Fatalf("a 204 with an empty body FAILED an ExpectStatus 204 destination (%+v); every generate_204 endpoint would read as a blackhole", c)
+	}
+	if c.StatusCode != http.StatusNoContent {
+		t.Errorf("StatusCode = %d, want 204", c.StatusCode)
+	}
+	if c.ByteCount != 0 {
+		t.Errorf("ByteCount = %d, want 0", c.ByteCount)
+	}
+	if c.Err != "" {
+		t.Errorf("Err = %q, want empty", c.Err)
+	}
+	if res.OKCount != 1 || res.Total != 1 {
+		t.Fatalf("OKCount/Total = %d/%d, want 1/1", res.OKCount, res.Total)
+	}
+}
+
+// TestExpectStatusIsExactNotAny2xx keeps ExpectStatus from becoming a hole in
+// the blackhole rule. A provider that terminates connections itself and
+// synthesizes a bare status line produces a 200 with no body; if ExpectStatus
+// accepted "any 2xx", every connectivity destination would pass for exactly the
+// provider this package exists to catch. The match is EXACT, which makes these
+// entries stricter than ExpectBody, not looser.
+func TestExpectStatusIsExactNotAny2xx(t *testing.T) {
+	cases := []struct {
+		name string
+		h    handler
+	}{
+		{"bare 200, no body -- the synthesized status line", emptyBody200()},
+		{"200 with a body -- a portal answering instead", okBody("<html>sign in</html>")},
+		{"206, still not the declared status", statusWithBody(http.StatusPartialContent, "partial")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dests := stubDestinations(t, []spec{
+				{name: "c204", class: ClassConnectivity, h: tc.h, expect: ExpectStatus, status: http.StatusNoContent},
+			})
+			res, err := check(context.Background(), http.DefaultClient, dests, fastOptions())
+			if err != nil {
+				t.Fatalf("check err = %v", err)
+			}
+			c := res.Checks[0]
+			if c.OK {
+				t.Fatalf("status %d passed an ExpectStatus 204 destination; ExpectStatus must be an exact match, or a synthesized status line passes the check", c.StatusCode)
+			}
+			if !strings.Contains(c.Err, "want exactly") {
+				t.Errorf("Err = %q, want it to say the status was not the declared one", c.Err)
+			}
+		})
+	}
+}
+
+// TestExpectStatusWithoutAStatusFails: an entry that declares ExpectStatus and
+// forgets the status must not silently accept anything that comes back.
+// TestDestinationsTable keeps the production table free of this, and this keeps
+// the runtime honest if one ever slips through.
+func TestExpectStatusWithoutAStatusFails(t *testing.T) {
+	dests := stubDestinations(t, []spec{{name: "broken", class: ClassConnectivity, h: okBody("anything"), expect: ExpectStatus}})
+	res, err := check(context.Background(), http.DefaultClient, dests, fastOptions())
+	if err != nil {
+		t.Fatalf("check err = %v", err)
+	}
+	if res.Checks[0].OK {
+		t.Fatal("a destination declaring ExpectStatus with no Status accepted the response; a misconfigured entry must fail, not pass everything")
+	}
+}
+
+// TestVerifyRejectsAnInterceptedDNSAnswer is the captive-portal case. A 200
+// with a body is NOT proof that a name was resolved: a portal, a transparent
+// proxy or an interception box all return exactly that. Only an answer section
+// proves resolution, which is why every DoH entry carries Verify.
+func TestVerifyRejectsAnInterceptedDNSAnswer(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"a captive portal login page", "<html><body>Please sign in to continue</body></html>"},
+		{"valid json that is not a dns answer", `{"result":"ok","message":"welcome"}`},
+		{"a dns document with no answer section", `{"Status":3,"Question":[{"name":"example.com.","type":1}]}`},
+		{"an answer section with empty data", `{"Status":0,"Answer":[{"name":"example.com.","type":1,"data":""}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dests := stubDestinations(t, []spec{
+				{name: "doh", class: ClassDNS, h: okBody(tc.body), verify: verifyDNSJSON},
+			})
+			res, err := check(context.Background(), http.DefaultClient, dests, fastOptions())
+			if err != nil {
+				t.Fatalf("check err = %v", err)
+			}
+			c := res.Checks[0]
+			if c.OK {
+				t.Fatalf("a 200 carrying %q passed a DoH destination; a status and some bytes are not proof a name was resolved", tc.body)
+			}
+			if c.StatusCode != http.StatusOK || c.ByteCount == 0 {
+				t.Errorf("status=%d bytes=%d; the response DID arrive and must be recorded as such, so this is distinguishable from a blackhole", c.StatusCode, c.ByteCount)
+			}
+			if !strings.Contains(c.Err, "did not verify") {
+				t.Errorf("Err = %q, want it to name the verification failure", c.Err)
+			}
+			if res.OKCount != 0 {
+				t.Errorf("OKCount = %d, want 0", res.OKCount)
+			}
+		})
+	}
+}
+
+// TestVerifyDNSJSONAcceptsEveryOperatorsShape is the other side of the same
+// rule, and it is not hypothetical: the seven operators in the table disagree
+// about the document AROUND the answer section. dns.alidns.com returns Question
+// as an OBJECT where the others return an array, and dns.adguard-dns.com omits
+// Status entirely. A validator that decoded either field would reject a working
+// resolver as a captive portal -- for AliDNS on every single pass.
+//
+// The bodies below are the shapes captured from the live endpoints on
+// 2026-07-31, trimmed.
+func TestVerifyDNSJSONAcceptsEveryOperatorsShape(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"google/cloudflare/nextdns/dns.sb/doh.pub: Question is an array", `{"Status":0,"TC":false,"RD":true,"RA":true,"Question":[{"name":"example.com.","type":1}],"Answer":[{"name":"example.com.","type":1,"TTL":300,"data":"172.66.147.243"}]}`},
+		{"alidns: Question is an OBJECT", `{"Status":0,"TC":false,"RD":true,"RA":true,"Question":{"name":"example.com","type":1},"Answer":[{"name":"example.com.","TTL":127,"type":1,"data":"104.20.23.154"}]}`},
+		{"adguard: no Status field at all", `{"Question":[{"name":"example.com.","type":1}],"Answer":[{"name":"example.com.","data":"172.66.147.243","TTL":101,"type":1,"class":1}]}`},
+		{"dns.sb: extra per-record fields", `{"Status":0,"Answer":[{"name":"example.com.","type":1,"TTL":21,"Expires":"Fri, 31 Jul 2026 08:57:28 UTC","data":"172.66.147.243"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := verifyDNSJSON([]byte(tc.body)); err != nil {
+				t.Fatalf("verifyDNSJSON rejected a real, working answer: %s\nbody: %s", err, tc.body)
+			}
+		})
+	}
+}
+
+// TestVerifyContainsToleratesTrailingWhitespace: detectportal.firefox.com
+// serves "success\n" -- eight bytes for a seven-character word. An equality
+// check would fail for every provider forever, which is noise dressed as
+// signal, exactly the failure the UserAgent comment warns about.
+func TestVerifyContainsToleratesTrailingWhitespace(t *testing.T) {
+	if err := verifyContains("success")([]byte("success\n")); err != nil {
+		t.Fatalf("verifyContains rejected the real 8-byte body %q: %s", "success\n", err)
+	}
+	if err := verifyContains("Success")([]byte("<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>")); err != nil {
+		t.Fatalf("verifyContains rejected captive.apple.com's real body: %s", err)
+	}
+	if err := verifyContains("success")([]byte("<html>Please sign in</html>")); err == nil {
+		t.Fatal("verifyContains accepted a captive portal page")
+	}
+}
+
+// TestVerifyIPText: the echo endpoints answer with an address and a newline
+// (checkip.amazonaws.com) and may answer in v6 (icanhazip did, from the
+// measuring host). A portal answers with html.
+func TestVerifyIPText(t *testing.T) {
+	for _, body := range []string{"74.50.11.113", "74.50.11.113\n", "2602:f7a3:0:2600::a\n"} {
+		if err := verifyIPText([]byte(body)); err != nil {
+			t.Errorf("verifyIPText(%q) = %s, want nil", body, err)
+		}
+	}
+	for _, body := range []string{"", "<html>Please sign in</html>", "not-an-ip"} {
+		if err := verifyIPText([]byte(body)); err == nil {
+			t.Errorf("verifyIPText(%q) accepted a body that is not an address", body)
+		}
+	}
+}
+
+// TestReputationIsNotInTheHealthScore is the rule most likely to be "fixed"
+// into a bug later, so it is asserted on its own.
+//
+// Every reputation destination refusing this exit is the NORMAL case for a
+// hosted provider: those endpoints block datacenter ranges by policy. If that
+// moved OKCount or Total, every hosted provider in the fleet would read as
+// degraded and the health signal -- which is about whether the tunnel carries
+// traffic at all -- would be buried under it.
+func TestReputationIsNotInTheHealthScore(t *testing.T) {
+	healthy := []spec{
+		{name: "dns-a", class: ClassDNS, h: okBody(`{"Status":0}`)},
+		{name: "dns-b", class: ClassDNS, h: okBody(`{"Status":0}`)},
+		{name: "conn-a", class: ClassConnectivity, h: status204(), expect: ExpectStatus, status: http.StatusNoContent},
+		{name: "conn-b", class: ClassConnectivity, h: okBody("success\n")},
+		{name: "cdn-a", class: ClassCDN, h: okBody("/* css */")},
+		{name: "cdn-b", class: ClassCDN, h: okBody("/* css */")},
+		{name: "site-a", class: ClassSite, h: okBody("User-agent: *")},
+		{name: "site-b", class: ClassSite, h: okBody("User-agent: *")},
+	}
+
+	// First: the health classes alone, so the baseline score is unambiguous.
+	baseline, err := check(context.Background(), http.DefaultClient, stubDestinations(t, healthy), fastOptions())
+	if err != nil {
+		t.Fatalf("check err = %v", err)
+	}
+	if baseline.OKCount != 8 || baseline.Total != 8 {
+		t.Fatalf("baseline OKCount/Total = %d/%d, want 8/8", baseline.OKCount, baseline.Total)
+	}
+
+	// Now the same health classes plus a reputation class that refuses
+	// EVERYTHING -- the datacenter provider's normal day.
+	withReputation := append(append([]spec{}, healthy...), []spec{
+		{name: "rep-a", class: ClassReputation, h: statusWithBody(http.StatusForbidden, "Access Denied")},
+		{name: "rep-b", class: ClassReputation, h: statusWithBody(http.StatusForbidden, "Access Denied")},
+		{name: "rep-c", class: ClassReputation, h: statusWithBody(http.StatusUnauthorized, "unauthorized")},
+		{name: "rep-d", class: ClassReputation, h: okBody("<html>a real page</html>")},
+	}...)
+	res, err := check(context.Background(), http.DefaultClient, stubDestinations(t, withReputation), fastOptions())
+	if err != nil {
+		t.Fatalf("check err = %v", err)
+	}
+
+	if res.OKCount != baseline.OKCount || res.Total != baseline.Total {
+		t.Fatalf("adding a wholly failing reputation class moved the score to %d/%d (was %d/%d); reputation must not be scored -- a hosted provider failing all of it is still fully healthy",
+			res.OKCount, res.Total, baseline.OKCount, baseline.Total)
+	}
+	if res.Reputation.OK != 1 || res.Reputation.Total != 4 {
+		t.Errorf("Reputation = %d/%d, want 1/4; the class must still be measured and reported", res.Reputation.OK, res.Reputation.Total)
+	}
+	if _, present := res.ByClass[ClassReputation]; present {
+		t.Error("ByClass carries a reputation entry; it must be reported separately, or a caller summing ByClass gets the contaminated total the split exists to prevent")
+	}
+	if got, want := res.Summary(), "ok=8/8 dns=2/2 connectivity=2/2 cdn=2/2 site=2/2 reputation=1/4"; got != want {
+		t.Fatalf("Summary = %q, want %q; the reputation figure must ride alongside ok=N/M, never inside it", got, want)
+	}
+
+	// The failing reputation destinations must be reported -- separately. Which
+	// vendor refused is the whole content of the signal, but it must not land in
+	// the same list as a health failure.
+	if names := res.FailedNames(); len(names) != 0 {
+		t.Errorf("FailedNames = %v, want none; no health destination failed", names)
+	}
+	if got, want := strings.Join(res.ReputationFailedNames(), ","), "rep-a,rep-b,rep-c"; got != want {
+		t.Errorf("ReputationFailedNames = %q, want %q", got, want)
+	}
+
+	// ...and every reputation check is still ATTEMPTED and recorded in full.
+	for _, c := range res.Checks {
+		if c.Class != ClassReputation || c.OK {
+			continue
+		}
+		if c.StatusCode == 0 || c.ByteCount == 0 {
+			t.Errorf("%s: status=%d bytes=%d; a refusal must be recorded as a refusal, not as silence", c.Name, c.StatusCode, c.ByteCount)
+		}
+	}
+}
+
+// TestWorstCaseBytesPerRunFitsTheBudget is the arithmetic the package documents,
+// asserted rather than asserted-in-prose. The point of the wider table is that
+// it is also a CHEAPER one; a destination added without a MaxBytes, or with a
+// generous one, would quietly undo that.
+func TestWorstCaseBytesPerRunFitsTheBudget(t *testing.T) {
+	// The previous nine-entry table's worst case, and the ceiling the package
+	// promises not to exceed.
+	const budget = 9 * MaxBodyBytes // 36 KiB
+
+	perClass := map[Class]int64{}
+	var worst int64
+	for _, d := range destinations {
+		if d.MaxBytes <= 0 {
+			t.Errorf("destination %q sets no MaxBytes; it would take the %d-byte default and the budget below stops being arithmetic", d.Name, MaxBodyBytes)
+		}
+		if d.MaxBytes > MaxBodyBytes {
+			t.Errorf("destination %q has MaxBytes = %d, above the package ceiling %d; no single entry may raise the documented budget", d.Name, d.MaxBytes, MaxBodyBytes)
+		}
+		worst += d.maxBytes()
+		perClass[d.Class] += d.maxBytes()
+	}
+	if worst > budget {
+		t.Fatalf("worst-case body bytes per run = %d, above the documented budget %d", worst, budget)
+	}
+	t.Logf("worst case %d bytes (%.2f KiB) across %d destinations, budget %d", worst, float64(worst)/1024, len(destinations), budget)
+	for _, c := range append(append([]Class{}, Classes...), ClassReputation) {
+		t.Logf("  %-12s %5d bytes", c, perClass[c])
+	}
+}
+
+// TestSuccessContractsAreDeclaredCoherently guards the table against the two
+// ways an entry can be self-contradictory: an ExpectStatus with no status (it
+// would accept nothing and fail every pass), and a status declared on an
+// ExpectBody entry (it would be silently ignored, so the author's intent would
+// not be what runs).
+func TestSuccessContractsAreDeclaredCoherently(t *testing.T) {
+	for _, d := range destinations {
+		switch d.Expect {
+		case ExpectStatus:
+			if d.Status < 200 || 400 <= d.Status {
+				t.Errorf("destination %q declares ExpectStatus with Status = %d; it must name the non-error status it actually answers", d.Name, d.Status)
+			}
+		case ExpectBody:
+			if d.Status != 0 {
+				t.Errorf("destination %q is ExpectBody but declares Status = %d, which is ignored; either drop it or declare ExpectStatus", d.Name, d.Status)
+			}
+		default:
+			t.Errorf("destination %q has an unknown Expect %d", d.Name, d.Expect)
+		}
+	}
+}
+
+// TestEveryDNSDestinationVerifiesItsAnswer: a 200 with bytes from a DoH
+// endpoint is not evidence of resolution, and this is the class where that
+// distinction matters most -- name resolution is the shared precondition for
+// every other destination in the table.
+func TestEveryDNSDestinationVerifiesItsAnswer(t *testing.T) {
+	for _, d := range destinations {
+		if d.Class != ClassDNS {
+			continue
+		}
+		if d.Verify == nil {
+			t.Errorf("dns destination %q has no Verify; a captive portal returning 200 with a body would pass it", d.Name)
+			continue
+		}
+		if err := d.Verify([]byte(`{"Status":0,"Answer":[{"name":"example.com.","type":1,"data":"93.184.216.34"}]}`)); err != nil {
+			t.Errorf("dns destination %q rejects a well-formed answer: %s", d.Name, err)
+		}
+		if err := d.Verify([]byte(`<html>sign in</html>`)); err == nil {
+			t.Errorf("dns destination %q accepts a portal page", d.Name)
+		}
+	}
+	// Every DoH url must ask a question. A url without one answers 400 (or an
+	// empty answer) for every provider forever.
+	for _, d := range destinations {
+		if d.Class == ClassDNS && !strings.Contains(d.URL, "name=") {
+			t.Errorf("dns destination %q carries no name= query: %s", d.Name, d.URL)
+		}
+	}
+}
+
+// TestClassesExcludesReputation states the exclusion in the one place a future
+// reader is most likely to look before "fixing" it.
+func TestClassesExcludesReputation(t *testing.T) {
+	for _, c := range Classes {
+		if c == ClassReputation {
+			t.Fatal("ClassReputation is in Classes; it is not part of the health score and must be rendered separately (see its doc comment -- folding it in makes every hosted provider read as broken)")
+		}
+	}
+	if scored(ClassReputation) {
+		t.Fatal("scored(ClassReputation) is true; reputation failures would move OKCount")
+	}
+	for _, c := range Classes {
+		if !scored(c) {
+			t.Errorf("class %q is declared in Classes but not scored", c)
+		}
+	}
+	var reputation int
+	for _, d := range destinations {
+		if d.Class == ClassReputation {
+			reputation++
+		}
+	}
+	if reputation < 2 {
+		t.Errorf("the table has %d reputation destination(s); with fewer than two, one vendor's policy change reads as an exit's reputation changing", reputation)
+	}
+}
+
+// TestConnectivityClassIsCheapAndBroad: this class is the cheapest useful
+// signal in the table, and it is only cheap if it stays that way.
+func TestConnectivityClassIsCheapAndBroad(t *testing.T) {
+	var n, status204Count int
+	for _, d := range destinations {
+		if d.Class != ClassConnectivity {
+			continue
+		}
+		n++
+		if d.Expect == ExpectStatus {
+			status204Count++
+		}
+		if d.MaxBytes > 512 {
+			t.Errorf("connectivity destination %q caps at %d bytes; this class answers in tens of bytes and a large cap gives that up", d.Name, d.MaxBytes)
+		}
+		if d.Expect == ExpectBody && d.Verify == nil {
+			t.Errorf("connectivity destination %q reads a body but does not verify it; these endpoints exist to detect captive portals, which answer 200 with a page", d.Name)
+		}
+	}
+	if n < 5 {
+		t.Errorf("the connectivity class has %d destination(s), want a broad spread of operators", n)
+	}
+	if status204Count == 0 {
+		t.Error("no connectivity destination uses ExpectStatus; the generate_204 endpoints are the reason the contract exists")
 	}
 }

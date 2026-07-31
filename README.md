@@ -107,6 +107,14 @@ truth for the second half). Resolution is then skipped
 and exactly those addresses are dialed. The host part must be an IP literal — a
 name there would put the same hole back.
 
+That list is **34 endpoints** since the egress-health table widened (3
+geolocation sources + 31 destinations), and the self-check dials them
+**sequentially** with `-confinement-timeout` each. Against a firewall that
+DROPs rather than rejects, startup therefore costs up to 34 × the timeout
+(~100s at the 3s default) before the first probe. It is a one-time startup
+cost, and it is the price of the check covering every endpoint the process can
+reach.
+
 `-skip-confinement-check` disables it. It defaults to **false**, logs two
 `WARNING` lines when set, and exists only for an operator running a one-shot
 manual probe from a host that is not the operator's. Do not set it in a
@@ -122,23 +130,46 @@ stays selectable — observed on mainnet: one provider accepted 87 KB and return
 0 bytes with `connected = true AND valid = true`.
 
 So each pass also runs an **egress-health check over the same tunnel** the
-geolocation probe already opened (never a second one), against nine well-known
-destinations in three classes, and logs one line per provider:
+geolocation probe already opened (never a second one), against 31 well-known
+destinations — 25 scored, across four classes, plus six that are measured and
+deliberately not scored — and logs one line per provider:
 
 ```
-egress-health: provider=<id> ok=7/9 dns=3/3 cdn=1/3 site=3/3 failed=fastly-jquery,cloudfront-awssdk
+egress-health: provider=<id> ok=23/25 dns=7/7 connectivity=8/8 cdn=3/5 site=5/5 reputation=1/6 failed=fastly-jquery,cloudfront-awssdk reputation-failed=akamai,etsy,epicgames,canva,reuters
 ```
 
-The classes are what make a partial failure diagnosable. `dns=3/3 cdn=0/3` is a
+The classes are what make a partial failure diagnosable. `dns=7/7 cdn=0/5` is a
 provider whose egress range is refused by CDNs — the client-visible failure the
 geolocation probe cannot see, since geolocation APIs do not care where a request
-came from. `ok=0/9` is a blackhole. A flat count could not tell them apart, and
+came from. `ok=0/25` is a blackhole. A flat count could not tell them apart, and
 neither could a probe that only ever talks to three geolocation APIs.
 
-Whether the site-class destinations actually discriminate against datacenter
-ranges is **not yet validated in the field**: from one datacenter host, both
-`amazon` and `reddit` answered normally. That is the first thing the field data
-should settle.
+| class | n | what it proves |
+| --- | --- | --- |
+| `dns` | 7 | DoH JSON across seven operators, two of them Chinese. The **answer is parsed**: a 200 with a body proves nothing, since a captive portal returns exactly that. |
+| `connectivity` | 8 | The OS captive-portal endpoints (`generate_204`, `success.txt`, …). Unauthenticated, no anti-bot, 0–69 bytes — the cheapest useful signal in the table. |
+| `cdn` | 5 | Five distinct CDN operators. The class that fails when an egress range is on a CDN blocklist. |
+| `site` | 5 | Ordinary sites verified reachable on four consecutive runs. `site=0/5` means the tunnel is not carrying ordinary web traffic. |
+| `reputation` | 6 | **Not scored.** See below. |
+
+Each destination declares what success means. The default is a 2xx **and a
+non-empty body** — the rule that catches a blackhole, since a status line with
+no data behind it is exactly what a blackholing provider produces. Endpoints
+where an empty body is *correct* (every `generate_204`) declare an exact status
+instead, which is stricter, not looser: a provider that synthesizes a bare `200`
+fails them.
+
+**`reputation` is measured and never scored.** Its six destinations refuse a
+datacenter IP outright (403, or 401 for Reuters) and are expected to return
+clean from a residential or cellular exit, so a failure says "this exit looks
+like a datacenter to bot-management vendors", not "this provider is broken".
+Folding it into `ok=N/M` would make every hosted provider read as degraded and
+bury the health signal. One caveat is recorded in the code and constrains how
+far it can be read: `www.reddit.com` answered **403** to curl's default agent,
+**200** to the Go prober, and **206** to curl carrying the prober's user-agent —
+same host, same address, same day. That is client fingerprinting as much as IP
+reputation, so the class needs field data before anyone treats it as an
+IP-quality score.
 
 - **Nothing is submitted and there is no server endpoint yet.** Storage and the
   "healthy enough to select" verdict are separate work; shipping a verdict
@@ -146,15 +177,18 @@ should settle.
   de-listing working providers.
 - Destinations are spread across **different operators within each class**, so a
   provider that whitelists one vendor cannot pass a class.
-- Each check is a small GET with the body read capped at 4 KiB, so a full run
-  costs at most 36 KiB of body — under 1% of one 5 MiB active bandwidth probe.
-  A full run against a completely unresponsive provider costs at most one extra
-  `-probe-timeout` of wall clock per provider (the whole run shares that one
-  budget across three concurrent rounds), so a blackholing provider costs about
-  2× `-probe-timeout` in total rather than 4×.
+- Each check is a small GET with a **per-destination** body cap (768 B for DoH,
+  256 B for connectivity, 2 KiB for assets, 1 KiB for reputation), so a full run
+  costs at most **34,048 bytes ≈ 33 KiB** of body — *less* than the 36 KiB of
+  the nine-destination table it replaces, because the connectivity endpoints are
+  ~100× smaller than the old flat 4 KiB cap. Under 1% of one 5 MiB active
+  bandwidth probe. A full run against a completely unresponsive provider costs
+  at most one extra `-probe-timeout` of wall clock per provider (the whole run
+  shares that one budget across six concurrent rounds), so a blackholing
+  provider costs about 2× `-probe-timeout` in total rather than 4×.
 - The health destinations are reached **unpinned** but under ordinary WebPKI
-  verification. Pinning nine leaves that rotate on nine schedules would turn
-  every routine certificate rotation into a failure indistinguishable from the
+  verification. Pinning 31 leaves that rotate on 31 schedules would turn every
+  routine certificate rotation into a failure indistinguishable from the
   provider blackholing the destination. The geolocation sources stay pinned.
 - A run is skipped, and logged as skipped, when the probe has no budget left: a
   run on an expired deadline would fail every destination and read as a

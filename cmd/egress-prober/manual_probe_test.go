@@ -17,7 +17,7 @@ package main
 // behind the verdict, and then runs the egress-health check over the SAME
 // tunnel and prints every destination's outcome. That second half is the
 // end-to-end proof for the health signal: the same client, the same session,
-// against nine real destinations the geolocation probe never touches.
+// against every real destination the geolocation probe never touches.
 
 import (
 	"context"
@@ -52,7 +52,15 @@ func TestManualProbeOneProvider(t *testing.T) {
 		t.Fatalf("parse by-jwt client id: %s", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	// This one deadline bounds BOTH halves, so it has to cover the health
+	// check's worst case as well as geolocation's: geolocation is three sources
+	// in parallel at 45s, and the health run is
+	// ceil(31 destinations / DefaultConcurrency 6) = 6 rounds x 45s = 4m30s.
+	// Ten minutes leaves both room. A deadline that expired mid-run would cut
+	// off the trailing destinations and print them as failures the provider had
+	// nothing to do with -- in the one tool an operator uses to eyeball a single
+	// provider by hand.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
 	// the same pins the real CLI uses, so this exercises the shipped
@@ -99,9 +107,16 @@ func TestManualProbeOneProvider(t *testing.T) {
 	}
 
 	// Egress health over the SAME tunnel -- never a second one.
+	//
+	// Budget is rounds x PerRequestTimeout, the same arithmetic
+	// egressHealthOptions holds for the shipped path: 6 rounds x 45s = 4m30s,
+	// so 6 minutes fits with room. A 3-minute budget (what this carried while
+	// the table held nine destinations and concurrency was 3) would now cut off
+	// the last round every time. The per-request timeout stays deliberately
+	// generous because this runs once, interactively, over a cold tunnel.
 	health, err := egresshealth.Check(ctx, client, egresshealth.Options{
 		PerRequestTimeout: 45 * time.Second,
-		Budget:            3 * time.Minute,
+		Budget:            6 * time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("egress health through provider %s did not run: %s", providerId, err)

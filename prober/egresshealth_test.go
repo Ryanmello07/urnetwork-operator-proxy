@@ -29,26 +29,37 @@ func captureLog(t *testing.T) *bytes.Buffer {
 	return buf
 }
 
+// healthResult is a provider whose tunnel works, which two CDNs refuse, and
+// which two reputation vendors treat as a datacenter -- the ordinary shape of a
+// hosted provider. The reputation failures must show in the log line and must
+// NOT be inside ok=N/M.
 func healthResult() *egresshealth.Result {
 	return &egresshealth.Result{
 		Checks: []egresshealth.CheckResult{
 			{Name: "cloudflare-doh", Class: egresshealth.ClassDNS, OK: true},
 			{Name: "google-doh", Class: egresshealth.ClassDNS, OK: true},
 			{Name: "adguard-doh", Class: egresshealth.ClassDNS, OK: true},
+			{Name: "google-204", Class: egresshealth.ClassConnectivity, OK: true},
+			{Name: "cloudflare-204", Class: egresshealth.ClassConnectivity, OK: true},
 			{Name: "cloudflare-cdnjs", Class: egresshealth.ClassCDN, OK: true},
 			{Name: "fastly-jquery", Class: egresshealth.ClassCDN},
 			{Name: "cloudfront-awssdk", Class: egresshealth.ClassCDN},
 			{Name: "wikipedia", Class: egresshealth.ClassSite, OK: true},
-			{Name: "amazon", Class: egresshealth.ClassSite, OK: true},
-			{Name: "reddit", Class: egresshealth.ClassSite, OK: true},
+			{Name: "github", Class: egresshealth.ClassSite, OK: true},
+			{Name: "example-com", Class: egresshealth.ClassSite, OK: true},
+			{Name: "akamai", Class: egresshealth.ClassReputation},
+			{Name: "etsy", Class: egresshealth.ClassReputation},
+			{Name: "reddit", Class: egresshealth.ClassReputation, OK: true},
 		},
-		OKCount: 7,
-		Total:   9,
+		OKCount: 9,
+		Total:   11,
 		ByClass: map[egresshealth.Class]egresshealth.ClassSummary{
-			egresshealth.ClassDNS:  {OK: 3, Total: 3},
-			egresshealth.ClassCDN:  {OK: 1, Total: 3},
-			egresshealth.ClassSite: {OK: 3, Total: 3},
+			egresshealth.ClassDNS:          {OK: 3, Total: 3},
+			egresshealth.ClassConnectivity: {OK: 2, Total: 2},
+			egresshealth.ClassCDN:          {OK: 1, Total: 3},
+			egresshealth.ClassSite:         {OK: 3, Total: 3},
 		},
+		Reputation: egresshealth.ClassSummary{OK: 1, Total: 3},
 	}
 }
 
@@ -87,7 +98,10 @@ func TestEgressHealthRunsOnTheSameTunnelClient(t *testing.T) {
 		t.Fatal("the health check ran on a different client than the tunnel's")
 	}
 
-	want := "egress-health: provider=provider-1 ok=7/9 dns=3/3 cdn=1/3 site=3/3 failed=fastly-jquery,cloudfront-awssdk"
+	// The reputation figure rides alongside ok=N/M and its failures are listed
+	// under their own key: 9/11 is the health verdict, and the two vendors that
+	// refused the exit do not subtract from it.
+	want := "egress-health: provider=provider-1 ok=9/11 dns=3/3 connectivity=2/2 cdn=1/3 site=3/3 reputation=1/3 failed=fastly-jquery,cloudfront-awssdk reputation-failed=akamai,etsy"
 	if got := strings.TrimSpace(logs.String()); got != want {
 		t.Fatalf("log line =\n%q\nwant\n%q", got, want)
 	}

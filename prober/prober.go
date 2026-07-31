@@ -193,9 +193,19 @@ func (p *Prober) checkEgressHealth(ctx context.Context, providerClientId string,
 		return
 	}
 
+	// Summary carries the scored classes as ok=N/M plus the per-class tallies,
+	// and the reputation figure alongside them -- never inside ok=N/M. The two
+	// failure lists are kept apart for the same reason: "failed=" is a list of
+	// things that mean the provider is not carrying traffic, while
+	// "reputation-failed=" is a list of vendors that treat the exit as a
+	// datacenter, which is the normal state of a hosted provider and not a
+	// fault. Merging them would read as one longer failure list.
 	line := fmt.Sprintf("egress-health: provider=%s %s", providerClientId, res.Summary())
 	if failed := res.FailedNames(); 0 < len(failed) {
 		line += " failed=" + strings.Join(failed, ",")
+	}
+	if refused := res.ReputationFailedNames(); 0 < len(refused) {
+		line += " reputation-failed=" + strings.Join(refused, ",")
 	}
 	log.Print(line)
 }
