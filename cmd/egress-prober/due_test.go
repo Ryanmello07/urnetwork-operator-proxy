@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/urnetwork/urnetwork-operator-proxy/bandwidth"
 	"github.com/urnetwork/urnetwork-operator-proxy/ingest"
 	"github.com/urnetwork/urnetwork-operator-proxy/prober"
 	"github.com/urnetwork/urnetwork-operator-proxy/providertunnel"
@@ -147,12 +148,36 @@ func TestServerDrivenSchedulerIgnoresTheLocalTTL(t *testing.T) {
 // provider that always fails to probe stays at the head of the due queue
 // forever, and nothing about the pass output would say so.
 func TestNewProberReportsAttempts(t *testing.T) {
-	p := newProber(providertunnel.Config{}, time.Minute, &ingest.Client{ServerURL: "http://unused.invalid"}, false)
+	operator := &ingest.Client{ServerURL: "http://unused.invalid"}
+	p := newProber(providertunnel.Config{}, time.Minute, operator, false, nil, nil)
 	if p.Attempts == nil {
 		t.Fatal("newProber built a Prober with no attempt reporter; the server-side due backoff would never be told a probe happened")
 	}
 	if p.Submit == nil || p.Open == nil || p.Locate == nil {
 		t.Fatal("newProber left a dependency unset")
+	}
+	if p.Bandwidth != nil {
+		t.Error("a nil sampler (-skip-bandwidth) must leave the bandwidth hook unset, not install one that measures nothing")
+	}
+}
+
+// TestNewProberWiresBandwidthWhenEnabled: with a sampler configured the hook
+// has to be installed, or every provider is probed for geolocation and none is
+// ever measured -- silently, since nothing else in the pass output would say so.
+func TestNewProberWiresBandwidthWhenEnabled(t *testing.T) {
+	operator := &ingest.Client{ServerURL: "http://unused.invalid"}
+	targets := bandwidth.DefaultTargets("https://api.example.net", "secret")
+	sampler := &bandwidth.Sampler{Targets: targets, Reserve: operator, Submit: operator}
+
+	p := newProber(providertunnel.Config{}, time.Minute, operator, false, sampler, bandwidth.TargetHosts(targets))
+	if p.Bandwidth == nil {
+		t.Fatal("newProber did not install the bandwidth hook, so no provider would ever be measured")
+	}
+	if len(sampler.Targets) != 2 {
+		t.Fatalf("the production sampler has %d targets, want 2 (operator and cdn) -- one target cannot show a provider prioritising one path over the other", len(sampler.Targets))
+	}
+	if sampler.Targets[0].Source == sampler.Targets[1].Source {
+		t.Errorf("both targets carry source %q; they must be stored separately", sampler.Targets[0].Source)
 	}
 }
 

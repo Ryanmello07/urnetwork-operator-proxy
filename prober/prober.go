@@ -27,6 +27,18 @@ type TunnelOpener func(ctx context.Context, providerClientId string) (*http.Clie
 // this is egresshealth.Check, wired in cmd/egress-prober.
 type EgressHealthChecker func(ctx context.Context, client *http.Client) (*egresshealth.Result, error)
 
+// BandwidthSampler measures the provider's throughput over the tunnel the
+// geolocation probe already opened, and records what it measured. In
+// production this is bandwidth.Sampler.Sample plus the log line, wired in
+// cmd/egress-prober.
+//
+// It returns nothing, deliberately. Bandwidth is a diagnostic riding along on
+// a probe whose product is the geolocation: no outcome of the measurement --
+// not a skipped budget reservation, not a dead target, not a zero sample --
+// may change whether the probe succeeded or what failure class was reported
+// for it.
+type BandwidthSampler func(ctx context.Context, providerClientId string, client *http.Client)
+
 // Submitter records a probed location.
 type Submitter interface {
 	Submit(ctx context.Context, providerClientId string, loc *geolocate.ConsensusLocation) error
@@ -81,6 +93,18 @@ type Prober struct {
 	// field is how a probe starts de-listing working providers. This step
 	// produces the signal and proves it end to end.
 	Health EgressHealthChecker
+	// Bandwidth measures throughput over the SAME tunnel, after the location
+	// has been submitted. Optional -- a nil sampler skips it entirely.
+	//
+	// It runs last, and only after a probe that succeeded, for two reasons.
+	// Last, because the location is the product this pass exists to deliver
+	// and must never lose budget or fail because of a diagnostic. Only after
+	// success, because the deployment-wide byte budget it spends is scarce
+	// (each measurement pulls megabytes of real, paid contract traffic through
+	// the provider's tunnel), and spending it on a tunnel that has already
+	// demonstrated it cannot carry three small geolocation lookups buys a
+	// number that describes the failure rather than the link.
+	Bandwidth BandwidthSampler
 	// Attempts reports every probe attempt. Optional -- a nil reporter simply
 	// skips reporting -- but production must set it: see ProbeOne.
 	Attempts AttemptReporter
@@ -161,6 +185,13 @@ func (p *Prober) probeOne(ctx context.Context, providerClientId string) (string,
 			return FailureNotConfident, err
 		}
 		return FailureSubmit, err
+	}
+
+	// The bandwidth sample rides the tunnel that is still open, never a second
+	// one, and cannot change what this function returns: the probe has already
+	// succeeded by the time it runs.
+	if p.Bandwidth != nil {
+		p.Bandwidth(ctx, providerClientId, client)
 	}
 	return "", nil
 }

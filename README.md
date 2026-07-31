@@ -248,6 +248,63 @@ recorded it clean.
 written down — the confinement check and `-confinement-address` guidance both
 derive from it.
 
+### Active bandwidth measurement
+
+After a successful geolocation probe, the same tunnel carries a throughput
+measurement — never a second tunnel — against **two independent targets**:
+
+| target | url | source tag |
+| --- | --- | --- |
+| operator | `<api-url>/network/provider-bandwidth-test?bytes=N` | `active-operator` |
+| cdn | `https://speed.cloudflare.com/__down?bytes=N` | `active-cdn` |
+
+Both take the identical URL shape and run through the identical measurement
+code, so neither figure is advantaged by a different request shape. Each
+measurement streams until **5 s elapsed or 5 MiB transferred**, whichever comes
+first, discarding the first **500 ms** so TCP slow start does not depress the
+figure. A transfer that finishes inside that 500 ms (5 MiB at anything above
+~10 MB/s does) reports the warmup-inclusive rate instead, flagged
+`(lower-bound)` — reporting nothing there would exclude exactly the fastest
+providers, which are the ones most worth measuring.
+
+**The two figures are stored and logged separately and are never averaged.**
+That is the entire point of having two: a provider that prioritises one path
+and not the other is invisible in a combined number and obvious in a pair. The
+server row is keyed on `(client_id, source)`, so each target keeps its own row.
+
+One line per provider:
+
+```
+bandwidth: provider=<id> operator=12.4MB/s cdn=11.8MB/s
+bandwidth: provider=<id> operator=41.2MB/s(lower-bound) cdn=skipped(no byte budget this hour)
+```
+
+Every provider is measured, not only those without passive history. The spend
+is regulated server-side by an **hourly byte budget**: the prober reserves
+before it measures (`POST /network/provider-bandwidth-reserve`), and once the
+current hour's bucket is full the server answers 429 and that provider is
+skipped cleanly — explicitly, in the log, rather than silently reporting
+nothing. A full fleet is therefore covered across successive hours instead of
+in one expensive pass. Two targets consume two reservations per provider, so a
+given hourly budget covers half as many providers as a single-target probe
+would.
+
+Flags: `-skip-bandwidth` turns it off, `-bandwidth-timeout` (default 5s) is the
+per-target cap so the added wall clock per provider is at most twice it, and
+`-bandwidth-cdn-url` points the second target elsewhere.
+
+Two other CDN targets were measured and rejected: `proof.ovh.net` at 1.0 MB/s
+would dominate the time budget and measure the target rather than the provider,
+and `cachefly.cachefly.net/10mb.test` is fast (81 MB/s) but fixed-size with no
+byte parameter, so it could not share the byte cap.
+
+Both target hosts are added to the tunnel's host allowlist. Note that the
+operator target carries `X-UR-Operator-Secret` through a provider-controlled
+path; the connection is ordinary WebPKI-verified TLS (a provider on the path
+cannot read it without a mis-issued certificate for the operator's own api
+host), but that secret gates location ingest fleet-wide, so pinning the api
+host is the way to close it if a deployment wants to.
+
 ### Which providers get probed
 
 When the server implements `GET /network/provider-egress-due`, it chooses: those

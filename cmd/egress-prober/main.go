@@ -6,6 +6,14 @@
 // logged only -- nothing is submitted and there is no server endpoint for them
 // yet.
 //
+// The same tunnel then carries an active bandwidth measurement (see
+// bandwidth/) against two independent targets -- the operator's own download
+// endpoint and a public CDN -- reported and stored separately, never averaged.
+// Every provider is measured, not only those without passive history: the
+// server's hourly byte budget is what regulates the spend, answering 429 once
+// the current hour's bucket is full, so a full fleet is covered across
+// successive hours rather than in one expensive pass.
+//
 // The prober host never contacts a geolocation api or a health destination
 // directly: every request egresses through a provider tunnel. The only direct
 // calls are to the operator's own server (provider list, ingest).
@@ -31,6 +39,7 @@ import (
 	gojwt "github.com/golang-jwt/jwt/v5"
 	"github.com/urnetwork/connect"
 
+	"github.com/urnetwork/urnetwork-operator-proxy/bandwidth"
 	"github.com/urnetwork/urnetwork-operator-proxy/confinement"
 	"github.com/urnetwork/urnetwork-operator-proxy/egresshealth"
 	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
@@ -63,6 +72,9 @@ func main() {
 	flag.Var(&confinementAddrs, "confinement-address", "ip:port the confinement self-check should dial instead of resolving the probe hosts; repeatable. For a jail where dns is legitimately blocked: supply the address of every geolocation source AND every egress-health destination here and the check stays real. The host part must be an ip literal, not a name")
 	dueURL := flag.String("due-url", "", "url of the server's due-provider endpoint; empty derives <api-url>/network/provider-egress-due")
 	dueLimit := flag.Int("due-limit", 100, "how many due providers to ask the server for per pass; the server clamps this to its own maximum (500)")
+	skipBandwidth := flag.Bool("skip-bandwidth", false, "do not measure provider bandwidth. The measurement rides the tunnel the geolocation probe already opened and is regulated by the server's hourly byte budget, so leaving it on is the intended mode; this is for a pass where the extra wall clock per provider matters more than the data")
+	bandwidthTimeout := flag.Duration("bandwidth-timeout", bandwidth.DefaultTimeout, "per-target wall-clock cap for one bandwidth measurement. There are two targets, so this bounds the added time per provider at twice this value")
+	bandwidthCDNURL := flag.String("bandwidth-cdn-url", bandwidth.CDNTestURL, "the second bandwidth target: a size-parameterised public download (<url>?bytes=N). Measured separately from the operator target and never averaged with it -- a provider prioritising one path and not the other is only visible in two figures")
 	flag.Parse()
 
 	// Env fallback, applied only after parsing so the secret is never a flag
@@ -137,6 +149,15 @@ func main() {
 		os.Exit(2)
 	}
 
+	// A non-positive bandwidth timeout would hand context.WithTimeout an
+	// already-expired deadline, so every measurement would fail instantly and
+	// still have spent a byte reservation getting there.
+	if *bandwidthTimeout <= 0 {
+		fmt.Fprintf(os.Stderr, "egress-prober: -bandwidth-timeout must be positive (got %s)\n\n", *bandwidthTimeout)
+		flag.Usage()
+		os.Exit(2)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -179,7 +200,39 @@ func main() {
 		HTTP:           &http.Client{Timeout: 30 * time.Second},
 	}
 
-	dueScheduler, enumScheduler := newSchedulers(newProber(tunnelCfg, *probeTimeout, operator, *egressHealthAll), *concurrency, *cacheTTL)
+	// Both bandwidth targets are reached THROUGH the provider tunnel, so both
+	// their hosts have to be in the tunnel's allowlist (see newProber) or the
+	// dialer refuses them before a byte moves.
+	//
+	// Note what this means for the operator target: the X-UR-Operator-Secret
+	// header now traverses a provider-controlled path. The connection is
+	// ordinary WebPKI-verified TLS, so a provider on the path cannot read it
+	// without a mis-issued certificate for the operator's own api host -- the
+	// same protection any https client has, and the same one the egress-health
+	// destinations rely on. It is called out because the consequence differs:
+	// that secret gates location ingest for the whole fleet, where an
+	// egress-health destination gates nothing. Pinning the api host would close
+	// it, but the pin is deployment-specific and not knowable here.
+	bandwidthSampler := (*bandwidth.Sampler)(nil)
+	bandwidthTargets := []bandwidth.Target{}
+	if !*skipBandwidth {
+		bandwidthTargets = []bandwidth.Target{
+			bandwidth.OperatorTarget(*apiURL, *operatorSecret),
+			{Name: "cdn", Source: bandwidth.SourceCDN, URL: *bandwidthCDNURL},
+		}
+		bandwidthSampler = &bandwidth.Sampler{
+			Targets: bandwidthTargets,
+			Reserve: operator,
+			Submit:  operator,
+			Timeout: *bandwidthTimeout,
+		}
+	}
+
+	dueScheduler, enumScheduler := newSchedulers(
+		newProber(tunnelCfg, *probeTimeout, operator, *egressHealthAll, bandwidthSampler, bandwidth.TargetHosts(bandwidthTargets)),
+		*concurrency,
+		*cacheTTL,
+	)
 
 	// I3: a single-shot run (-interval 0) is the mode the README recommends
 	// for external cron/systemd scheduling, which decides success or
@@ -237,8 +290,19 @@ func main() {
 // the due queue when a probe was recently ATTEMPTED, not only when one
 // succeeded, so a prober that does not report leaves every unprobeable
 // provider at the head of the queue forever -- see prober.ProbeOne.
-func newProber(tunnelCfg providertunnel.Config, probeTimeout time.Duration, operator *ingest.Client, allDestinations bool) *prober.Prober {
-	return &prober.Prober{
+func newProber(
+	tunnelCfg providertunnel.Config,
+	probeTimeout time.Duration,
+	operator *ingest.Client,
+	allDestinations bool,
+	bandwidthSampler *bandwidth.Sampler,
+	bandwidthHosts []string,
+) *prober.Prober {
+	// One allowlist for every unpinned host the probe reaches through the
+	// tunnel: the egress-health destinations and the two bandwidth targets.
+	extraHosts := append(egresshealth.DestinationHosts(), bandwidthHosts...)
+
+	p := &prober.Prober{
 		Open: func(ctx context.Context, providerClientId string) (*http.Client, func() error, error) {
 			id, err := connect.ParseId(providerClientId)
 			if err != nil {
@@ -248,14 +312,14 @@ func newProber(tunnelCfg providertunnel.Config, probeTimeout time.Duration, oper
 			if err != nil {
 				return nil, nil, err
 			}
-			// ONE client, for both the geolocation lookups and the
-			// egress-health check, so both measure the same tunnel and the
-			// provider is only put under contract once. The geolocation hosts
-			// stay pinned; the egress-health destinations are allowed under
-			// ordinary WebPKI verification -- see
-			// providertunnel.HTTPClientForHosts for why pinning them would make
-			// the health signal worse rather than better.
-			return t.HTTPClientForHosts(probeTimeout, egresshealth.DestinationHosts()), t.Close, nil
+			// ONE client, for the geolocation lookups, the egress-health check
+			// and the bandwidth measurement, so all three measure the same
+			// tunnel and the provider is only put under contract once. The
+			// geolocation hosts stay pinned; the egress-health destinations and
+			// the bandwidth targets are allowed under ordinary WebPKI
+			// verification -- see providertunnel.HTTPClientForHosts for why
+			// pinning them would make the signal worse rather than better.
+			return t.HTTPClientForHosts(probeTimeout, extraHosts), t.Close, nil
 		},
 		// -probe-timeout must govern the per-source deadline too, not just
 		// the http.Client's overall timeout. geolocate caps each source fetch
@@ -290,6 +354,21 @@ func newProber(tunnelCfg providertunnel.Config, probeTimeout time.Duration, oper
 		Submit:   operator,
 		Attempts: operator,
 	}
+
+	if bandwidthSampler != nil {
+		// The two figures are always logged side by side, on one line, in
+		// target order -- that side-by-side view is the whole reason there is
+		// a second target, and a divergence between them is only visible when
+		// they are never combined. A target that was skipped says so, with
+		// which reason: "skipped for budget" is the byte budget working as
+		// designed, and reads very differently from a target that failed.
+		p.Bandwidth = func(ctx context.Context, providerClientId string, client *http.Client) {
+			results := bandwidthSampler.Sample(ctx, providerClientId, client)
+			log.Printf("bandwidth: provider=%s %s", providerClientId, bandwidth.Summary(results))
+		}
+	}
+
+	return p
 }
 
 // egressHealthOptions derives the health check's bounds from -probe-timeout so
