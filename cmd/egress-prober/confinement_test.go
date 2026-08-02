@@ -19,6 +19,7 @@ import (
 	"github.com/urnetwork/urnetwork-operator-proxy/confinement"
 	"github.com/urnetwork/urnetwork-operator-proxy/egresshealth"
 	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
+	"github.com/urnetwork/urnetwork-operator-proxy/ingest"
 )
 
 // lookupFails is a resolver that cannot resolve anything. That is both a
@@ -267,36 +268,6 @@ func TestConfinementAddressFlagRejectsANonAddress(t *testing.T) {
 	}
 }
 
-// TestGeolocatePinsCoverEveryGeolocationHost: the pin allowlist is the other
-// place the endpoint list is written down. providertunnel refuses any host
-// that is not a key in it, so a source added to geolocate without a pin here
-// fails every probe against that source; and a pin left behind for a removed
-// source silently widens the allowlist. geolocatePins is a hand-written map --
-// it cannot be derived, since the pins themselves are captured per host -- so
-// this drift test is the only thing keeping it aligned with
-// geolocate.SourceHosts().
-func TestGeolocatePinsCoverEveryGeolocationHost(t *testing.T) {
-	pins := geolocatePins()
-	hosts := geolocate.SourceHosts()
-	if len(pins) != len(hosts) {
-		t.Fatalf("geolocatePins has %d hosts, geolocate.SourceHosts has %d; the two lists have drifted apart (%v vs %v)", len(pins), len(hosts), keysOf(pins), hosts)
-	}
-	for _, host := range hosts {
-		if len(pins[host]) == 0 {
-			t.Fatalf("geolocate source host %q has no entry in geolocatePins; every probe against it would be refused by providertunnel", host)
-		}
-	}
-}
-
-func keysOf(m map[string][]string) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // TestSkipConfinementCheckIsOffByDefault: a check that is off by default is not
 // a check. This asserts on the built binary's own -h output, so it holds
 // regardless of how the flag is wired internally.
@@ -433,10 +404,27 @@ func TestProbeHostsCoversBothTables(t *testing.T) {
 // it. Ordinary WebPKI verification still applies, which is what a provider on
 // the path cannot forge.
 func TestEgressHealthDestinationsAreNotPinned(t *testing.T) {
-	pins := geolocatePins()
+	// Built the way the running prober builds it: from a served set, through
+	// the one validation gate. The served set here is deliberately hostile --
+	// it offers a pin for every egress-health destination as well as every
+	// geolocation source, which is exactly what a server-side mistake would
+	// look like -- and the gate must still hand back a map covering only the
+	// geolocation sources.
+	served := map[string]ingest.GeolocationPin{}
+	for _, h := range geolocate.SourceHosts() {
+		served[h] = ingest.GeolocationPin{Leaf: "leaf-" + h, Intermediate: "int-" + h}
+	}
+	for _, h := range egresshealth.DestinationHosts() {
+		served[h] = ingest.GeolocationPin{Leaf: "leaf-" + h, Intermediate: "int-" + h}
+	}
+
+	pins, err := validateGeolocationPins(served)
+	if err != nil {
+		t.Fatalf("validateGeolocationPins: %s", err)
+	}
 	for _, h := range egresshealth.DestinationHosts() {
 		if _, pinned := pins[h]; pinned {
-			t.Errorf("egress-health destination %q has a certificate pin; routine leaf rotation would then read as the provider blackholing it", h)
+			t.Errorf("egress-health destination %q has a certificate pin; routine leaf rotation would then read as the provider blackholing it -- and a pin map fetched over the network must not be able to widen the tunnel's allowlist", h)
 		}
 	}
 }
@@ -496,41 +484,5 @@ func TestEgressHealthAllDefaultsOn(t *testing.T) {
 	}
 	if !*all {
 		t.Error("-egress-health-all defaults off; every provider test must run the full table")
-	}
-}
-
-// Every geolocation SOURCE HOST must have pins declared for it.
-//
-// This exists because of a real outage on 2026-08-02: the ip.pn json endpoint
-// moved to a different HOST (api.i.pn), and a rename that updated the source
-// table without adding pins for the new host would fail closed on every
-// request -- silently, because the source set degrades to "fewer sources"
-// rather than erroring. Combined with an unrelated ipinfo.io cert rotation it
-// left ONE working source against MinSources = 2 and failed every provider in
-// the fleet with no_consensus.
-//
-// The unit tests could not catch it: they point the sources at httptest
-// servers, so they never exercise a pin. This checks the one thing that IS
-// checkable offline -- that the two tables agree on the host set.
-func TestEveryGeolocationSourceHostHasPins(t *testing.T) {
-	pins := geolocatePins()
-	for _, host := range geolocate.SourceHosts() {
-		if _, ok := pins[host]; !ok {
-			t.Errorf("geolocation source host %q has no pins in geolocatePins(); "+
-				"a pinned request to it would fail closed and silently shrink the source set", host)
-		}
-	}
-	for host := range pins {
-		found := false
-		for _, h := range geolocate.SourceHosts() {
-			if h == host {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("geolocatePins() declares %q, which is not a geolocation source host; "+
-				"a stale pin entry means the real host is probably unpinned", host)
-		}
 	}
 }

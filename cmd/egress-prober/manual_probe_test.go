@@ -21,6 +21,7 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -28,6 +29,7 @@ import (
 	"github.com/urnetwork/connect"
 	"github.com/urnetwork/urnetwork-operator-proxy/egresshealth"
 	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
+	"github.com/urnetwork/urnetwork-operator-proxy/ingest"
 	"github.com/urnetwork/urnetwork-operator-proxy/providertunnel"
 )
 
@@ -39,8 +41,13 @@ func TestManualProbeOneProvider(t *testing.T) {
 	byJwt := os.Getenv("UR_PROBER_BY_JWT")
 	apiURL := os.Getenv("MANUAL_PROBE_API_URL")
 	platformURL := os.Getenv("MANUAL_PROBE_PLATFORM_URL")
-	if byJwt == "" || apiURL == "" || platformURL == "" {
-		t.Fatal("UR_PROBER_BY_JWT, MANUAL_PROBE_API_URL and MANUAL_PROBE_PLATFORM_URL are all required")
+	// The operator secret is required now that the pins come from the server:
+	// this probe fetches the same set the CLI does, from the same endpoint,
+	// with the same validation, so it keeps exercising the shipped path rather
+	// than a permissive one of its own.
+	operatorSecret := os.Getenv("UR_OPERATOR_SECRET")
+	if byJwt == "" || apiURL == "" || platformURL == "" || operatorSecret == "" {
+		t.Fatal("UR_PROBER_BY_JWT, UR_OPERATOR_SECRET, MANUAL_PROBE_API_URL and MANUAL_PROBE_PLATFORM_URL are all required")
 	}
 
 	providerId, err := connect.ParseId(providerStr)
@@ -63,14 +70,25 @@ func TestManualProbeOneProvider(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	// the same pins the real CLI uses, so this exercises the shipped
-	// pinning path rather than a permissive one
+	// The same pins the real CLI uses, fetched the same way: from the server's
+	// observed set, through the same validation, which fails here rather than
+	// probing unpinned if the server cannot cover every geolocation source.
+	pins, err := fetchGeolocationPins(ctx, &ingest.Client{
+		ServerURL:      apiURL,
+		OperatorSecret: operatorSecret,
+		HTTP:           &http.Client{Timeout: 30 * time.Second},
+	})
+	if err != nil {
+		t.Fatalf("fetch the geolocation certificate pins from %s: %s", apiURL, err)
+	}
+	t.Logf("geolocation pins    %d host(s) from the server", len(pins))
+
 	tun, err := providertunnel.Open(ctx, providertunnel.Config{
 		ApiURL:            apiURL,
 		PlatformURL:       platformURL,
 		ByJwt:             byJwt,
 		ClientId:          selfId,
-		Pins:              geolocatePins(),
+		Pins:              pins,
 		DeviceDescription: "manual egress probe",
 		DeviceSpec:        "egress-prober",
 		Version:           "0.0.0",

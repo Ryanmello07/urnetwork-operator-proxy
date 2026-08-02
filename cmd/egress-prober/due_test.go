@@ -149,7 +149,7 @@ func TestServerDrivenSchedulerIgnoresTheLocalTTL(t *testing.T) {
 // forever, and nothing about the pass output would say so.
 func TestNewProberReportsAttempts(t *testing.T) {
 	operator := &ingest.Client{ServerURL: "http://unused.invalid"}
-	p := newProber(providertunnel.Config{}, time.Minute, operator, false, nil, nil)
+	p := newProber(providertunnel.Config{}, &pinSet{}, time.Minute, operator, false, nil, nil)
 	if p.Attempts == nil {
 		t.Fatal("newProber built a Prober with no attempt reporter; the server-side due backoff would never be told a probe happened")
 	}
@@ -169,7 +169,7 @@ func TestNewProberWiresBandwidthWhenEnabled(t *testing.T) {
 	targets := bandwidth.DefaultTargets("https://api.example.net", "secret")
 	sampler := &bandwidth.Sampler{Targets: targets, Reserve: operator, Submit: operator}
 
-	p := newProber(providertunnel.Config{}, time.Minute, operator, false, sampler, bandwidth.TargetHosts(targets))
+	p := newProber(providertunnel.Config{}, &pinSet{}, time.Minute, operator, false, sampler, bandwidth.TargetHosts(targets))
 	if p.Bandwidth == nil {
 		t.Fatal("newProber did not install the bandwidth hook, so no provider would ever be measured")
 	}

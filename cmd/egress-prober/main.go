@@ -32,7 +32,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -75,6 +77,7 @@ func main() {
 	dueLimit := flag.Int("due-limit", 100, "how many due providers to ask the server for per pass; the server clamps this to its own maximum (500)")
 	skipBandwidth := flag.Bool("skip-bandwidth", false, "do not measure provider bandwidth. The measurement rides the tunnel the geolocation probe already opened and is regulated by the server's hourly byte budget, so leaving it on is the intended mode; this is for a pass where the extra wall clock per provider matters more than the data")
 	bandwidthTimeout := flag.Duration("bandwidth-timeout", bandwidth.DefaultTimeout, "per-target wall-clock cap for one bandwidth measurement. There are two targets, so this bounds the added time per provider at twice this value")
+	pinRefreshInterval := flag.Duration("pin-refresh-interval", time.Hour, "how often to re-fetch the geolocation certificate pins from the server. The server re-observes them every 6h, so an hour is ample. A refresh that fails keeps the last good set -- the prober never degrades to unpinned -- but a set that is never refreshed goes stale, so this is not disableable")
 	bandwidthCDNURL := flag.String("bandwidth-cdn-url", bandwidth.CDNTestURL, "the second bandwidth target: a size-parameterised public download (<url>?bytes=N). Measured separately from the operator target and never averaged with it -- a provider prioritising one path and not the other is only visible in two figures")
 	flag.Parse()
 
@@ -150,6 +153,17 @@ func main() {
 		os.Exit(2)
 	}
 
+	// A non-positive -pin-refresh-interval would make every pass re-fetch the
+	// pin set (<= 0 elapsed is always true), turning a control-plane call the
+	// server expects hourly into one per pass, and a zero value reads like
+	// "off" -- which it must never be, since a set that is never refreshed is
+	// exactly the stale-pin problem this replaced.
+	if *pinRefreshInterval <= 0 {
+		fmt.Fprintf(os.Stderr, "egress-prober: -pin-refresh-interval must be positive (got %s)\n\n", *pinRefreshInterval)
+		flag.Usage()
+		os.Exit(2)
+	}
+
 	// A non-positive bandwidth timeout would hand context.WithTimeout an
 	// already-expired deadline, so every measurement would fail instantly and
 	// still have spent a byte reservation getting there.
@@ -183,12 +197,14 @@ func main() {
 		log.Fatalf("parse by-jwt client id: %s", err)
 	}
 
+	// Pins is deliberately NOT set here: it is fetched from the server below
+	// and read afresh on every tunnel Open, so an hourly refresh reaches the
+	// next provider rather than only the next process.
 	tunnelCfg := providertunnel.Config{
 		ApiURL:            *apiURL,
 		PlatformURL:       *platformURL,
 		ByJwt:             *byJwt,
 		ClientId:          clientId,
-		Pins:              geolocatePins(),
 		DeviceDescription: "egress prober",
 		DeviceSpec:        "egress-prober",
 		Version:           "0.0.0",
@@ -200,6 +216,28 @@ func main() {
 		DueURL:         *dueURL,
 		HTTP:           &http.Client{Timeout: 30 * time.Second},
 	}
+
+	// The startup fetch. This is a separate call site from the refresh in the
+	// pass loop below, and the difference between them is the whole fail-closed
+	// property: THIS one exits, the other one keeps the last good set. Folding
+	// them into one helper with a "tolerate failure" flag would put both
+	// behaviours one wrong argument apart.
+	//
+	// No pin set means no probing. Not an empty map (providertunnel.Open
+	// refuses that, and it must keep refusing it), not the hardcoded set this
+	// replaced, and above all not unpinned: the geolocation lookup is issued
+	// through the provider under test, so an unpinned probe lets that provider
+	// substitute a certificate and forge its own apparent location. It would
+	// still look like a successful pass.
+	pins := &pinSet{}
+	initialPins, err := fetchGeolocationPins(ctx, operator)
+	if err != nil {
+		log.Printf("egress-prober: %s", err)
+		log.Printf("egress-prober: refusing to start. The geolocation lookups ride the tunnel of the provider being measured, and the certificate pins are what stop that provider forging its own location -- so no pin set means no probing, never an unpinned probe. Check -api-url and -operator-secret, and that the server has observed the pins (its refresh job runs every 6h).")
+		os.Exit(1)
+	}
+	pins.set(initialPins)
+	log.Printf("egress-prober: geolocation pins fetched from the server for %d host(s): %s", len(initialPins), strings.Join(sortedHosts(initialPins), " "))
 
 	// Both bandwidth targets are reached THROUGH the provider tunnel, so both
 	// their hosts have to be in the tunnel's allowlist (see newProber) or the
@@ -240,7 +278,7 @@ func main() {
 	}
 
 	dueScheduler, enumScheduler := newSchedulers(
-		newProber(tunnelCfg, *probeTimeout, operator, *egressHealthAll, bandwidthSampler, bandwidth.TargetHosts(bandwidthTargets)),
+		newProber(tunnelCfg, pins, *probeTimeout, operator, *egressHealthAll, bandwidthSampler, bandwidth.TargetHosts(bandwidthTargets)),
 		*concurrency,
 		*cacheTTL,
 	)
@@ -262,6 +300,13 @@ func main() {
 	// log clearly so the failure is visible (e.g. via journalctl) even
 	// though the process itself stays up.
 	for {
+		// The refresh call site. Unlike the startup fetch it never exits and
+		// never clears the set: a server blip must not be able to stop the
+		// fleet, and a stale-but-valid pin still fails closed on a real MITM.
+		// The intermediate pin is what keeps a set usable across routine leaf
+		// rotation in the meantime.
+		refreshGeolocationPins(ctx, operator, pins, *pinRefreshInterval)
+
 		providers, serverDriven, err := selectProviders(ctx, operator, *dueLimit, *apiURL, *byJwt)
 		if err != nil {
 			log.Printf("select providers: %s", err)
@@ -301,8 +346,15 @@ func main() {
 // the due queue when a probe was recently ATTEMPTED, not only when one
 // succeeded, so a prober that does not report leaves every unprobeable
 // provider at the head of the queue forever -- see prober.ProbeOne.
+// The pin set is passed in rather than baked into tunnelCfg because it is
+// refreshed while the process runs: every Open takes a copy of tunnelCfg and
+// fills Pins from the CURRENT set, so an hourly refresh takes effect on the
+// next provider instead of the next restart. providertunnel.Open's
+// ErrPinsRequired stays the last-ditch guard on that path and is deliberately
+// not pre-empted here.
 func newProber(
 	tunnelCfg providertunnel.Config,
+	pins *pinSet,
 	probeTimeout time.Duration,
 	operator *ingest.Client,
 	allDestinations bool,
@@ -319,7 +371,9 @@ func newProber(
 			if err != nil {
 				return nil, nil, err
 			}
-			t, err := providertunnel.Open(ctx, tunnelCfg, id)
+			cfg := tunnelCfg
+			cfg.Pins = pins.get()
+			t, err := providertunnel.Open(ctx, cfg, id)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -655,82 +709,164 @@ func envFallback(value *string, envName string) {
 	}
 }
 
-// geolocatePins are the SPKI (subject public key info) pins for the
-// geolocation endpoints probed by geolocate/sources.go. providertunnel.Open
-// refuses to run with an empty pin map (see providertunnel.ErrPinsRequired),
-// and any https host dialed through a tunnel that isn't a key in this map is
-// refused outright -- so this set must stay in sync with geolocate/sources.go.
+// pinSet holds the geolocation certificate pins currently in force.
 //
-// Each host lists two pins: the current leaf certificate's key, and the
-// issuing intermediate CA's key.
+// One writer (the pass loop's refresh) and one reader per tunnel Open, which
+// runs on the scheduler's worker goroutines, so the mutex is load-bearing
+// rather than decorative even though the refresh happens between passes today.
 //
-// providertunnel's checkPin (providertunnel/pinning.go) accepts a match
-// against ANY certificate in the presented chain, not just the leaf. That
-// means the intermediate pin below DOES provide rotation resilience: when a
-// host's leaf certificate rotates (routine -- Let's Encrypt roughly every 90
-// days, Google Trust Services on its own schedule), the new leaf is still
-// signed by the same intermediate, so its SPKI still matches the
-// intermediate pin and probing keeps working with no redeploy needed. The
-// tradeoff is that pinning an intermediate trusts that whole CA for this
-// host, not one specific certificate -- any certificate that CA issues for
-// this host will pass. If a host's probing DOES start failing with a
-// pin-mismatch error, that means the issuing intermediate itself changed
-// (e.g. the CA rotated its intermediate, or the host switched CAs), and
-// both pins should be re-captured and redeployed; see "Re-capturing" below.
-//
-// Captured 2026-07-25 from this sandbox, all three hosts reachable:
-//
-//	ip.pn               leaf: yNlfgRK6eIeC9nTBewXbeThe8SgisnFxPeeDB5yua20=
-//	                     intermediate (Let's Encrypt YE2): s/tdAOmUzd8syaTuqfgGvFcn6DzA5Cmb+Vby1ST+U3Y=
-//	free.freeipapi.com  leaf: 4RRfWDm6iNKBzkDWqytoa+NbLnfcBMicnrll6MgYJLA=
-//	                     intermediate (Google Trust Services WE1): kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=
-//	ipinfo.io            leaf: NnbPrbmZhsiaZL6QwNFVdj9ALZAi9/lUKbPSbGij/xY=
-//	                     intermediate (Let's Encrypt YR1): LoMHBotttiDko50Gi13uXW71eIy7LAttI+rYT8wXF4w=
-//
-// Re-capturing: leaf certificates rotate (Let's Encrypt roughly every 90
-// days; Google Trust Services on its own schedule), so operators should
-// expect to refresh the leaf pins periodically -- if probing for a host
-// starts failing with an x509/pin error, re-run the capture below and update
-// the map. To recapture the leaf pin for a host:
-//
-//	openssl s_client -connect <host>:443 -servername <host> </dev/null 2>/dev/null \
-//	  | openssl x509 -pubkey -noout \
-//	  | openssl pkey -pubin -outform der \
-//	  | openssl dgst -sha256 -binary | base64
-//
-// To recapture the issuing intermediate's pin, get the full chain and pin
-// the second certificate (the first is the leaf, the last is usually the
-// root, which is not pinned here):
-//
-//	openssl s_client -connect <host>:443 -servername <host> -showcerts </dev/null 2>/dev/null \
-//	  | awk '/BEGIN CERTIFICATE/{n++} {print > ("cert."n".pem")}'
-//	openssl x509 -in cert.2.pem -pubkey -noout \
-//	  | openssl pkey -pubin -outform der \
-//	  | openssl dgst -sha256 -binary | base64
-func geolocatePins() map[string][]string {
-	return map[string][]string{
-		// api.i.pn -- the old https://ip.pn/json returned 404 (the host still
-		// serves its root, only the json endpoint moved). Different HOST, so
-		// these are its own pins, not a rotation of the old ones.
-		"api.i.pn": {
-			"xtMJZ6gSMKphJmKO0c1I1MZsDMW/O1quVqGS1dx30Hk=", // leaf
-			"brzvtCELCIZUo4sD/qPX0ccRtPsd3DY6RfmxpOU9oB4=", // intermediate
-		},
-		"free.freeipapi.com": {
-			"4RRfWDm6iNKBzkDWqytoa+NbLnfcBMicnrll6MgYJLA=", // leaf
-			"kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=", // intermediate: Google Trust Services WE1
-		},
-		// Rotated 2026-08-02. BOTH the leaf and the intermediate changed, so
-		// the pin failed closed and ipinfo dropped out of the source set --
-		// which, with ip.pn's endpoint gone at the same time, left ONE working
-		// source against MinSources = 2 and failed every provider with
-		// no_consensus. Routine rotation, expected; the cost is that it is
-		// silent until the fleet stops reaching consensus.
-		"ipinfo.io": {
-			"3MB9heJhe8jyNK8Z6hN6BJra6kxT0xH0VyUu6OFu3Vc=", // leaf
-			"nWN7PSep5XDQdge5zK24CnCRXHr3KvzhKEGxsdqCX9E=", // intermediate
-		},
+// It is only ever written with a set that has already passed
+// validateGeolocationPins: there is exactly one path from the wire into this
+// struct, and it refuses anything that does not cover every geolocation source
+// host. A caller cannot half-populate it.
+type pinSet struct {
+	mu        sync.Mutex
+	pins      map[string][]string
+	fetchedAt time.Time
+}
+
+// get returns a copy, so a refresh cannot mutate the map a tunnel is already
+// verifying against mid-probe.
+func (s *pinSet) get() map[string][]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string][]string, len(s.pins))
+	for host, allowed := range s.pins {
+		out[host] = append([]string(nil), allowed...)
 	}
+	return out
+}
+
+func (s *pinSet) set(pins map[string][]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pins = pins
+	s.fetchedAt = time.Now()
+}
+
+// age reports how long ago the set was last successfully fetched.
+func (s *pinSet) age() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return time.Since(s.fetchedAt)
+}
+
+// fetchGeolocationPins gets the observed pin set from the server and validates
+// it, returning the map providertunnel.Config.Pins takes.
+//
+// This is the ONLY path from the server's answer into a pin set the prober will
+// use, and it is a gate rather than a filter: an answer that does not cover
+// every host in geolocate.SourceHosts() is an error, not a smaller set. That
+// distinction is the entire lesson of the outage this replaced. A pin that
+// fails is invisible in the result -- providertunnel refuses the host, the
+// source drops out, and the fleet reports "no_consensus", which is
+// indistinguishable from "fewer sources answered". Logging a warning and
+// carrying on with the hosts that did arrive would reproduce exactly that, with
+// the added twist that checkPin returns nil for a host absent from the map: the
+// missing source would not merely be unavailable, it would be probed UNPINNED.
+func fetchGeolocationPins(ctx context.Context, client *ingest.Client) (map[string][]string, error) {
+	served, err := client.GeolocationPins(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return validateGeolocationPins(served)
+}
+
+// validateGeolocationPins turns the served set into the prober's pin map, or
+// refuses.
+//
+// It refuses when: a host in geolocate.SourceHosts() is absent from the served
+// set, or its leaf or intermediate is empty (half a pin is not a pin, and the
+// server never writes an empty one -- see the observation job, which errors
+// rather than storing a chain it could not take an issuer from), or there are
+// no source hosts at all.
+//
+// Hosts the server serves that are NOT geolocation sources are dropped, with a
+// log line. Nothing dials them, so they are dead weight -- but the map is also
+// providertunnel's allowlist of pinned hosts, and a set fetched over the
+// network must not be able to widen it. This is the direction that costs
+// nothing to be strict about: the dangerous drift (a source with no pin) is the
+// one that raises.
+func validateGeolocationPins(served map[string]ingest.GeolocationPin) (map[string][]string, error) {
+	hosts := geolocate.SourceHosts()
+	if len(hosts) == 0 {
+		// unreachable while geolocate/sources.go has entries; an empty pin map
+		// would be refused by providertunnel.Open anyway, and this says why
+		return nil, fmt.Errorf("no geolocation source hosts to pin")
+	}
+
+	pins := make(map[string][]string, len(hosts))
+	var missing []string
+	for _, host := range hosts {
+		pin, ok := served[host]
+		if !ok || pin.Leaf == "" || pin.Intermediate == "" {
+			missing = append(missing, host)
+			continue
+		}
+		pins[host] = []string{pin.Leaf, pin.Intermediate}
+	}
+	if 0 < len(missing) {
+		return nil, fmt.Errorf(
+			"the server served no usable certificate pin for geolocation source host(s) %s (it served %d host(s): %s). "+
+				"The prober will not probe an unpinned geolocation source: the lookup rides the tunnel of the provider being measured, so unpinned means that provider can forge its own location. "+
+				"Either the server's observation job has not run for that host, or geolocate/sources.go and the server's host list have drifted apart",
+			strings.Join(missing, " "), len(served), strings.Join(sortedServedHosts(served), " "))
+	}
+
+	for host := range served {
+		if _, wanted := pins[host]; !wanted {
+			log.Printf("egress-prober: the server serves a pin for %q, which is not a geolocation source host; ignoring it (the pin map is also the tunnel's allowlist, and a set fetched over the network must not widen it)", host)
+		}
+	}
+	return pins, nil
+}
+
+// refreshGeolocationPins re-fetches the pin set once pinRefreshInterval has
+// elapsed since the last SUCCESSFUL fetch.
+//
+// A failure here keeps the previous set and logs; it never clears it, never
+// substitutes an empty map, and never returns an error the caller could mistake
+// for "carry on unpinned". The startup fetch in main is the one that refuses to
+// continue -- deliberately a different call site, because the two must never be
+// one parameter apart.
+//
+// Keeping a stale set is the right trade and not merely the convenient one: the
+// pins were observed by the server on a direct WebPKI-validated connection, so
+// an old one still rejects a provider substituting its own certificate. What it
+// eventually stops doing is matching the legitimate host after a CA change --
+// which fails closed, loudly, in the same place a fresh set would.
+func refreshGeolocationPins(ctx context.Context, client *ingest.Client, pins *pinSet, pinRefreshInterval time.Duration) {
+	if pins.age() < pinRefreshInterval {
+		return
+	}
+	refreshed, err := fetchGeolocationPins(ctx, client)
+	if err != nil {
+		log.Printf("egress-prober: geolocation pin refresh failed, keeping the set fetched %s ago (NOT degrading to unpinned): %s", pins.age().Round(time.Second), err)
+		return
+	}
+	pins.set(refreshed)
+}
+
+// sortedHosts is the host list of a validated pin map, for a stable log line.
+func sortedHosts(pins map[string][]string) []string {
+	out := make([]string, 0, len(pins))
+	for host := range pins {
+		out = append(out, host)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// sortedServedHosts is the same for the raw served set, used in the error that
+// names what the server DID send -- an operator diagnosing a missing host needs
+// to see the other side of the comparison.
+func sortedServedHosts(served map[string]ingest.GeolocationPin) []string {
+	out := make([]string, 0, len(served))
+	for host := range served {
+		out = append(out, host)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // findProvidersCountPerLocation is the count requested in each per-location

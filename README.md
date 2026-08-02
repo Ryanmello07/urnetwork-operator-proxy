@@ -15,7 +15,8 @@ a consensus, and submits the result to the operator's server.
   egresses through a provider, so the api reports *that provider's* location.
   The prober refuses to start unless it has verified it *cannot* reach those
   apis directly (see "Confinement" below).
-- The lookups are TLS-pinned, so a provider on the path cannot forge a location.
+- The lookups are TLS-pinned (to pins the server observed directly), so a
+  provider on the path cannot forge a location.
 - Country is the trusted output. City is recorded only when at least two sources
   agree (free sources disagree on city often), otherwise the location is
   country-granular.
@@ -51,7 +52,13 @@ a broken state.
 
 The prober needs its own network client identity (`-by-jwt`), provisioned like
 any other client. `-operator-secret` must match `ingest_secret` in the server's
-`provider_egress.yml` vault resource.
+`provider_egress.yml` vault resource — it authenticates the pin fetch as well as
+ingest, so a wrong secret now stops the prober at startup rather than only
+having its submissions rejected.
+
+The server must have observed the geolocation certificate pins before the
+prober can start: it fetches them at startup and **refuses to run without a
+complete set** (see "Certificate pinning" below).
 
 Run `./egress-prober -h` for the full flag list, including `-probe-timeout`
 (per-provider probe timeout, must be positive) and `-interval 0` (run a
@@ -402,27 +409,54 @@ server blip rather than die.
 
 ### Certificate pinning
 
-The prober's outbound geolocation requests are TLS-pinned to `ip.pn`,
-`free.freeipapi.com`, and `ipinfo.io` — see `geolocatePins()` in
-`cmd/egress-prober/main.go` for the current pins, how they were captured, and
-how to re-capture them. This is a closed allowlist enforced by the
-`providertunnel` package: a tunnel opened with an empty pin set refuses to
-open at all, and any https host reached through a tunnel that isn't one of
-these three is refused outright.
+The prober's outbound geolocation requests are TLS-pinned to the geolocation
+source hosts (`geolocate/sources.go`: `api.i.pn`, `free.freeipapi.com`,
+`ipinfo.io`). This is a closed allowlist enforced by the `providertunnel`
+package: a tunnel opened with an empty pin set refuses to open at all, and any
+https host reached through a tunnel that isn't in the pin map is refused
+outright.
+
+**The pins come from the server, not from this repository.** At startup the
+prober fetches them from `GET /network/geolocation-source-pins` (operator
+secret, the same header as the due list) and re-fetches every
+`-pin-refresh-interval` (default 1h). The server observes them itself, every
+six hours, by connecting to each host **directly** — its own network, no
+provider anywhere in the path — under full WebPKI, and recording the leaf and
+issuing-intermediate SPKI from the *verified* chain. That is what makes a
+server-chosen pin trustworthy for a lookup that rides a provider's tunnel: a
+provider cannot influence what the server saw.
+
+This replaced a hardcoded map in `cmd/egress-prober/main.go`, which took the
+whole fleet's probing offline on 2026-08-02 when two sources changed at once
+(`ip.pn` moved its json endpoint to `api.i.pn`, and `ipinfo.io` rotated both its
+leaf and its intermediate). Routine CA changes now self-heal within six hours
+instead of needing a redeploy.
+
+**It fails closed, in every direction:**
+
+- No pin set at startup — server unreachable, 404, 401, 500, or an empty table
+  — and the prober **does not start probing**. It exits; it does not fall back
+  to unpinned, to an empty map, or to any built-in set.
+- A source host in `geolocate.SourceHosts()` with no usable pin in the served
+  set is a **hard error**, not a silently-unpinned host. This matters because
+  `providertunnel`'s pin check skips a host that is not a key in the map: a
+  partial set would not merely leave that source unprotected, it would probe it
+  unpinned, and the source would go on answering normally.
+- A **refresh** failure keeps the last good set and logs. It never blanks the
+  set and never degrades to unpinned. A stale pin still rejects a provider
+  substituting its own certificate; what it eventually stops doing is matching
+  the legitimate host after a CA change, which fails closed and loudly.
+- A host the server serves that is **not** a geolocation source is dropped: the
+  pin map is also the tunnel's allowlist, and a set fetched over the network
+  must not be able to widen it.
 
 Each host's entry lists a leaf pin and an intermediate-CA pin, and
 `providertunnel`'s pin check accepts a match against **either** — it walks
-every certificate in the presented chain (leaf and any intermediates) and
-accepts as soon as one matches an allowed pin. That makes the intermediate
-entry a real safety net: a routine leaf-certificate rotation (Let's Encrypt
-roughly every 90 days) still chains to the same intermediate, so the
-intermediate pin keeps matching and probing keeps working with no redeploy.
-The tradeoff is that pinning an intermediate trusts that CA, not one
-specific certificate, for that host. In practice: if probing for a host
-starts failing with a pin-mismatch error, that means the *issuing
-intermediate* changed (the CA rotated it, or the host switched CAs
-entirely), and the fix is to re-capture and redeploy **both pins** for that
-host (see the recipe in `geolocatePins()`'s doc comment).
+every certificate in the verified chain and accepts as soon as one matches an
+allowed pin. That makes the intermediate entry a real safety net between two
+server observations: a routine leaf rotation still chains to the same
+intermediate, so probing keeps working. The tradeoff is that pinning an
+intermediate trusts that CA, not one specific certificate, for that host.
 
 ### Design
 
