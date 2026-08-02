@@ -498,3 +498,39 @@ func TestEgressHealthAllDefaultsOn(t *testing.T) {
 		t.Error("-egress-health-all defaults off; every provider test must run the full table")
 	}
 }
+
+// Every geolocation SOURCE HOST must have pins declared for it.
+//
+// This exists because of a real outage on 2026-08-02: the ip.pn json endpoint
+// moved to a different HOST (api.i.pn), and a rename that updated the source
+// table without adding pins for the new host would fail closed on every
+// request -- silently, because the source set degrades to "fewer sources"
+// rather than erroring. Combined with an unrelated ipinfo.io cert rotation it
+// left ONE working source against MinSources = 2 and failed every provider in
+// the fleet with no_consensus.
+//
+// The unit tests could not catch it: they point the sources at httptest
+// servers, so they never exercise a pin. This checks the one thing that IS
+// checkable offline -- that the two tables agree on the host set.
+func TestEveryGeolocationSourceHostHasPins(t *testing.T) {
+	pins := geolocatePins()
+	for _, host := range geolocate.SourceHosts() {
+		if _, ok := pins[host]; !ok {
+			t.Errorf("geolocation source host %q has no pins in geolocatePins(); "+
+				"a pinned request to it would fail closed and silently shrink the source set", host)
+		}
+	}
+	for host := range pins {
+		found := false
+		for _, h := range geolocate.SourceHosts() {
+			if h == host {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("geolocatePins() declares %q, which is not a geolocation source host; "+
+				"a stale pin entry means the real host is probably unpinned", host)
+		}
+	}
+}

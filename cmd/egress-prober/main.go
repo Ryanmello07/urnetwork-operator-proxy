@@ -709,17 +709,26 @@ func envFallback(value *string, envName string) {
 //	  | openssl dgst -sha256 -binary | base64
 func geolocatePins() map[string][]string {
 	return map[string][]string{
-		"ip.pn": {
-			"yNlfgRK6eIeC9nTBewXbeThe8SgisnFxPeeDB5yua20=", // leaf
-			"s/tdAOmUzd8syaTuqfgGvFcn6DzA5Cmb+Vby1ST+U3Y=", // intermediate: Let's Encrypt YE2
+		// api.i.pn -- the old https://ip.pn/json returned 404 (the host still
+		// serves its root, only the json endpoint moved). Different HOST, so
+		// these are its own pins, not a rotation of the old ones.
+		"api.i.pn": {
+			"xtMJZ6gSMKphJmKO0c1I1MZsDMW/O1quVqGS1dx30Hk=", // leaf
+			"brzvtCELCIZUo4sD/qPX0ccRtPsd3DY6RfmxpOU9oB4=", // intermediate
 		},
 		"free.freeipapi.com": {
 			"4RRfWDm6iNKBzkDWqytoa+NbLnfcBMicnrll6MgYJLA=", // leaf
 			"kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=", // intermediate: Google Trust Services WE1
 		},
+		// Rotated 2026-08-02. BOTH the leaf and the intermediate changed, so
+		// the pin failed closed and ipinfo dropped out of the source set --
+		// which, with ip.pn's endpoint gone at the same time, left ONE working
+		// source against MinSources = 2 and failed every provider with
+		// no_consensus. Routine rotation, expected; the cost is that it is
+		// silent until the fleet stops reaching consensus.
 		"ipinfo.io": {
-			"NnbPrbmZhsiaZL6QwNFVdj9ALZAi9/lUKbPSbGij/xY=", // leaf
-			"LoMHBotttiDko50Gi13uXW71eIy7LAttI+rYT8wXF4w=", // intermediate: Let's Encrypt YR1
+			"3MB9heJhe8jyNK8Z6hN6BJra6kxT0xH0VyUu6OFu3Vc=", // leaf
+			"nWN7PSep5XDQdge5zK24CnCRXHr3KvzhKEGxsdqCX9E=", // intermediate
 		},
 	}
 }

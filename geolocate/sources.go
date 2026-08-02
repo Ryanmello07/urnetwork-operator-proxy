@@ -18,7 +18,7 @@ type source struct {
 // "my location" form, so a request routed through a provider returns that
 // provider's egress location.
 var sources = []source{
-	{Name: "ip.pn", URL: "https://ip.pn/json", Parse: parseIpPn},
+	{Name: "ip.pn", URL: "https://api.i.pn/json", Parse: parseIpPn},
 	{Name: "freeipapi", URL: "https://free.freeipapi.com/api/json", Parse: parseFreeIpApi},
 	{Name: "ipinfo", URL: "https://ipinfo.io/json", Parse: parseIpInfo},
 }
