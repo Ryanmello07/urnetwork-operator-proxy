@@ -364,6 +364,11 @@ func newProber(
 		},
 		Submit:   operator,
 		Attempts: operator,
+		// The health result now outlives the log line. Fire-and-forget: a
+		// server that has not shipped the endpoint answers 404, which the
+		// prober treats as a clean skip, and no submission failure of any kind
+		// can fail a probe.
+		HealthResults: operator,
 	}
 
 	if bandwidthSampler != nil {

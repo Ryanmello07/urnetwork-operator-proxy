@@ -1851,6 +1851,17 @@ var ErrNoDestinations = errors.New("egresshealth: at least one destination is re
 // verdict.
 var ErrNoBudget = errors.New("egresshealth: the context was already done before any check ran")
 
+// ErrUnsupported reports that the server does not implement the egress-health
+// ingest endpoint (it answers 404). It lives here rather than in ingest for the
+// same reason bandwidth.ErrUnsupported lives in bandwidth: the prober
+// classifies the outcome, and it must be able to tell "this deployment has not
+// shipped the endpoint yet" from a real submission failure without importing
+// the submitter implementation its interfaces exist to keep out.
+//
+// It is a clean SKIP, not a failure. A prober pointed at an older server keeps
+// probing and keeps logging health; it simply records none.
+var ErrUnsupported = errors.New("egresshealth: the server does not implement the provider egress health endpoint")
+
 // Check runs a random sample of the production destinations through client and
 // returns the full pattern of what worked.
 //

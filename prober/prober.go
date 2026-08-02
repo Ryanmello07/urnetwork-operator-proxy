@@ -44,6 +44,16 @@ type Submitter interface {
 	Submit(ctx context.Context, providerClientId string, loc *geolocate.ConsensusLocation) error
 }
 
+// HealthReporter records one egress-health run. In production this is
+// *ingest.Client.
+//
+// It is an interface on the Prober, like Submitter and AttemptReporter, so
+// this package never imports the submitter implementation and a test can drive
+// the whole flow without a server.
+type HealthReporter interface {
+	SubmitEgressHealth(ctx context.Context, providerClientId string, res *egresshealth.Result) error
+}
+
 // AttemptReporter records that a probe was tried, whether or not it produced a
 // location. In production this is *ingest.Client.
 type AttemptReporter interface {
@@ -87,12 +97,20 @@ type Prober struct {
 	// Health runs the egress-health check over the SAME tunnel the geolocation
 	// lookup used. Optional -- a nil checker skips it entirely.
 	//
-	// Nothing is submitted anywhere: the result is logged and dropped. Storage
-	// and the "is this provider healthy enough to select" verdict are separate
-	// work, and shipping a verdict before the signal has been watched in the
-	// field is how a probe starts de-listing working providers. This step
-	// produces the signal and proves it end to end.
+	// The result is logged and, if HealthResults is set, submitted. It is still
+	// only a signal: no verdict is derived from it here, and nothing about the
+	// outcome may de-list a provider. Shipping a verdict before the signal has
+	// been watched in the field is how a probe starts de-listing working
+	// providers.
 	Health EgressHealthChecker
+	// HealthResults records each egress-health run so it outlives the log line.
+	// Optional -- a nil reporter simply skips submitting.
+	//
+	// Fire-and-forget, exactly like Attempts: a submission failure is logged
+	// once per distinct error and never changes the probe's outcome. The
+	// product of this pass is the geolocation, and a diagnostic that could fail
+	// it would be worse than no diagnostic.
+	HealthResults HealthReporter
 	// Bandwidth measures throughput over the SAME tunnel, after the location
 	// has been submitted. Optional -- a nil sampler skips it entirely.
 	//
@@ -116,6 +134,20 @@ type Prober struct {
 	// identical line per provider, every pass.
 	attemptErrMu     sync.Mutex
 	attemptErrLogged map[string]bool
+
+	// healthErrLogged deduplicates health-submission error messages, for the
+	// same reason attemptErrLogged does: whatever stops the submissions getting
+	// through -- an older server with no health endpoint, a wrong secret, a
+	// dead network -- stops them for every provider, so logging per provider
+	// would bury the pass's real output under one identical line per provider,
+	// every pass.
+	//
+	// A separate pair rather than a shared generic helper: the two reporters
+	// fail for different reasons and say different things about what is lost,
+	// and a shared map would let a noisy attempt error suppress the first
+	// health error (or the reverse).
+	healthErrMu     sync.Mutex
+	healthErrLogged map[string]bool
 }
 
 // ProbeOne probes a single provider. The tunnel is always closed, and nothing
@@ -253,6 +285,55 @@ func (p *Prober) checkEgressHealth(ctx context.Context, providerClientId string,
 		line += " reputation-failed=" + strings.Join(refused, ",")
 	}
 	log.Print(line)
+
+	// Submitted only on this path, after a run that actually produced a result.
+	// Neither early return above has one, and sending a zero for them would be
+	// indistinguishable from a total blackhole -- a false accusation against a
+	// provider whose check was skipped for the prober's own exhausted deadline.
+	p.reportEgressHealth(ctx, providerClientId, res)
+}
+
+// reportEgressHealth submits one health run, fire-and-forget. It returns
+// nothing and can fail nothing: the probe's product is the geolocation, and a
+// diagnostic must never be able to change whether a location was recorded.
+//
+// A server that does not implement the endpoint answers
+// egresshealth.ErrUnsupported, which is a clean skip rather than an error --
+// the prober keeps working against an older deployment, it just records no
+// health. Every other failure is logged once per distinct message, because it
+// will be the same failure for every provider in the pass.
+func (p *Prober) reportEgressHealth(ctx context.Context, providerClientId string, res *egresshealth.Result) {
+	if p.HealthResults == nil {
+		return
+	}
+	err := p.HealthResults.SubmitEgressHealth(ctx, providerClientId, res)
+	if err == nil {
+		return
+	}
+	if errors.Is(err, egresshealth.ErrUnsupported) {
+		// not a failure: this deployment has not shipped the endpoint. Still
+		// deduplicated, since it holds for every provider in the pass.
+		p.logHealthErrOnce(err, fmt.Sprintf("prober: this server does not store egress-health results (%s) -- health is logged but not persisted. Logged once.", err))
+		return
+	}
+	p.logHealthErrOnce(err, fmt.Sprintf("prober: could not submit an egress-health result (provider=%s): %s -- while this persists, the health signal exists only in these logs and rolls off with them. Logged once per distinct error.", providerClientId, err))
+}
+
+func (p *Prober) logHealthErrOnce(err error, line string) {
+	msg := err.Error()
+	p.healthErrMu.Lock()
+	logged := p.healthErrLogged[msg]
+	if !logged {
+		if p.healthErrLogged == nil {
+			p.healthErrLogged = map[string]bool{}
+		}
+		p.healthErrLogged[msg] = true
+	}
+	p.healthErrMu.Unlock()
+
+	if !logged {
+		log.Print(line)
+	}
 }
 
 func (p *Prober) reportAttempt(ctx context.Context, providerClientId string, failure string) {
