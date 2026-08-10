@@ -931,15 +931,29 @@ func listProviders(ctx context.Context, apiURL string, byJwt string) ([]string, 
 	}
 
 	seen := make(map[string]struct{})
+	succeeded := 0
+	var lastErr error
 	for _, locationId := range locationIds {
 		clientIds, err := findProvidersAtLocation(ctx, httpClient, apiURL, byJwt, locationId)
 		if err != nil {
 			log.Printf("egress-prober: find-providers2 for location %s: %s (skipping this location for this pass)", locationId, err)
+			lastErr = err
 			continue
 		}
+		succeeded++
 		for _, id := range clientIds {
 			seen[id] = struct{}{}
 		}
+	}
+	// Skipping SOME locations is resilience; skipping ALL of them is a
+	// failed enumeration wearing a success return. The two endpoints can
+	// genuinely diverge -- provider-locations is unauthenticated GET,
+	// find-providers2 is an authenticated POST -- and an empty nil-error
+	// result here flows into the "nothing to do (no providers, no failures)"
+	// exit-0 path, which the exit-code contract explicitly promises an
+	// external cron will never see from a pass that accomplished nothing.
+	if len(locationIds) > 0 && succeeded == 0 {
+		return nil, fmt.Errorf("find-providers2 failed for all %d locations (last: %w)", len(locationIds), lastErr)
 	}
 
 	ids := make([]string, 0, len(seen))
