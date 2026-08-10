@@ -298,3 +298,63 @@ func TestTruncateNameListCutsOnElementBoundaries(t *testing.T) {
 		t.Errorf("truncateNameList = %q (%d bytes), want at most 40", got, len(got))
 	}
 }
+
+// A single-prober client must not send the shard parameters at all. That is
+// what keeps this prober working against a server that predates them, and it
+// means an unsharded deployment issues the identical request it always did.
+func TestDueOmitsShardParamsWhenUnsharded(t *testing.T) {
+	var gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		_, _ = w.Write([]byte(`{"client_ids":[]}`))
+	}))
+	defer srv.Close()
+
+	for _, count := range []int{0, 1} {
+		c := &Client{ServerURL: srv.URL, OperatorSecret: "s", ShardCount: count}
+		if _, err := c.Due(context.Background(), 10); err != nil {
+			t.Fatalf("shard count %d: %v", count, err)
+		}
+		if strings.Contains(gotQuery, "shard_") {
+			t.Fatalf("shard count %d: sent shard params when unsharded: %q", count, gotQuery)
+		}
+	}
+}
+
+// A sharded client sends both parameters, so the server hands it its own slice
+// rather than the whole queue.
+func TestDueSendsShardParams(t *testing.T) {
+	var gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		_, _ = w.Write([]byte(`{"client_ids":[]}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{ServerURL: srv.URL, OperatorSecret: "s", ShardIndex: 4, ShardCount: 6}
+	if _, err := c.Due(context.Background(), 10); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"shard_count=6", "shard_index=4"} {
+		if !strings.Contains(gotQuery, want) {
+			t.Fatalf("query %q missing %q", gotQuery, want)
+		}
+	}
+}
+
+// An out-of-range shard is rejected before the request is issued. The server
+// would answer 400, but a prober that silently probed nothing on every pass
+// would look exactly like a fleet that was already fully probed.
+func TestDueRejectsOutOfRangeShard(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("Due should not have issued a request for an out-of-range shard")
+	}))
+	defer srv.Close()
+
+	for _, tc := range []struct{ index, count int }{{6, 6}, {-1, 6}, {9, 6}} {
+		c := &Client{ServerURL: srv.URL, OperatorSecret: "s", ShardIndex: tc.index, ShardCount: tc.count}
+		if _, err := c.Due(context.Background(), 10); err == nil {
+			t.Fatalf("index %d of %d: expected an error", tc.index, tc.count)
+		}
+	}
+}

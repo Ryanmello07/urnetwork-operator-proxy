@@ -75,7 +75,9 @@ func main() {
 	egressHealthAll := flag.Bool("egress-health-all", false, "run EVERY destination in the egress-health table instead of a random sample. The full table is the only way this exercises CONCURRENCY, since a sample never asks the provider to carry the full parallel load a real client would -- but the whole health run must still fit inside one -probe-timeout, and spreading it over the full table's rounds leaves each request far less than the cold-tunnel floor unless -probe-timeout is raised to match. The prober refuses to start rather than run below that floor and charge honest providers with cold-start timeouts, so setting this requires a longer -probe-timeout; it names the value")
 	flag.Var(&confinementAddrs, "confinement-address", "ip:port the confinement self-check should dial instead of resolving the probe hosts; repeatable. For a jail where dns is legitimately blocked: supply the address of every geolocation source AND every egress-health destination here and the check stays real. The host part must be an ip literal, not a name")
 	dueURL := flag.String("due-url", "", "url of the server's due-provider endpoint; empty derives <api-url>/network/provider-egress-due")
-	dueLimit := flag.Int("due-limit", 100, "how many due providers to ask the server for per pass; the server clamps this to its own maximum (500)")
+	dueLimit := flag.Int("due-limit", 100, "how many due providers to ask the server for per pass; the server clamps this to its own configured maximum, which defaults to 500 but is raised per deployment (provider_egress_due.yml)")
+	shardCount := flag.Int("shard-count", 1, "number of probers sharing this server's due queue. 1 (the default) means this prober takes the whole queue. Above 1 the server hands this prober only the slice matching -shard-index, so N probers divide the fleet instead of each probing all of it -- without this the queue hands the SAME rows to every prober and adding hosts buys nothing")
+	shardIndex := flag.Int("shard-index", 0, "which slice of the due queue this prober takes, 0 <= index < -shard-count. Ignored when -shard-count is 1")
 	skipBandwidth := flag.Bool("skip-bandwidth", false, "do not measure provider bandwidth. The measurement rides the tunnel the geolocation probe already opened and is regulated by the server's hourly byte budget, so leaving it on is the intended mode; this is for a pass where the extra wall clock per provider matters more than the data")
 	bandwidthTimeout := flag.Duration("bandwidth-timeout", bandwidth.DefaultTimeout, "per-target wall-clock cap for one bandwidth measurement. There are two targets, so this bounds the added time per provider at twice this value")
 	pinRefreshInterval := flag.Duration("pin-refresh-interval", time.Hour, "how often to re-fetch the geolocation certificate pins from the server. The server re-observes them every 6h, so an hour is ample. A refresh that fails keeps the last good set -- the prober never degrades to unpinned -- but a set that is never refreshed goes stale, so this is not disableable")
@@ -150,6 +152,25 @@ func main() {
 	// "nothing is due". Fail here instead of once per pass.
 	if *dueLimit < 1 {
 		fmt.Fprintf(os.Stderr, "egress-prober: -due-limit must be positive (got %d)\n\n", *dueLimit)
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	// Same reasoning as -due-limit. A shard outside the range makes the server
+	// return an empty slice on every pass, which reads as "nothing is due"
+	// rather than as a misconfiguration, so a prober would sit probing nothing
+	// indefinitely. Fail at startup instead.
+	if *shardCount < 1 {
+		fmt.Fprintf(os.Stderr, "egress-prober: -shard-count must be at least 1 (got %d)\n\n", *shardCount)
+		flag.Usage()
+		os.Exit(2)
+	}
+	if *shardIndex < 0 || *shardCount <= *shardIndex {
+		fmt.Fprintf(
+			os.Stderr,
+			"egress-prober: -shard-index must satisfy 0 <= index < -shard-count (got index %d, count %d)\n\n",
+			*shardIndex, *shardCount,
+		)
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -252,6 +273,8 @@ func main() {
 		ServerURL:      *apiURL,
 		OperatorSecret: *operatorSecret,
 		DueURL:         *dueURL,
+		ShardIndex:     *shardIndex,
+		ShardCount:     *shardCount,
 		HTTP:           &http.Client{Timeout: 30 * time.Second},
 	}
 

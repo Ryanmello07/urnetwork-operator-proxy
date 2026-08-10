@@ -69,6 +69,20 @@ type Client struct {
 	// DueURL overrides the due endpoint derived from ServerURL. Empty means
 	// "<ServerURL>/network/provider-egress-due".
 	DueURL string
+	// ShardIndex/ShardCount claim one slice of the due queue for this prober.
+	//
+	// The queue hands work out but does not claim it: the server's dedupe only
+	// bites once an attempt row lands, which is at submit time, minutes after a
+	// batch went out. So every prober polling inside that window receives the
+	// SAME rows, and N probers repeat one prober's work instead of dividing it.
+	// Sharding on the server's hash of client_id gives each prober a disjoint
+	// slice.
+	//
+	// A zero ShardCount (or 1) is the single-prober case: the parameters are
+	// omitted from the request entirely, so this is also safe against a server
+	// that predates them.
+	ShardIndex int
+	ShardCount int
 }
 
 type submitBody struct {
