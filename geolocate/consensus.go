@@ -294,7 +294,13 @@ func consensus(ok []SourceResult) ConsensusLocation {
 		}
 	}
 
-	// asn: plurality over non-zero ASNs (a single vote is enough; it's a bonus signal).
+	// asn: plurality over non-zero ASNs, adopted only at >= MinSources votes.
+	// A plurality of one is not a plurality, it is whichever source answered:
+	// with three independent free apis, one compromised or simply wrong
+	// source would otherwise dictate the ASN and Org for every provider the
+	// fleet probes. This is the same bar the country clears, and it fails the
+	// same way -- empty rather than wrong.
+	//
 	// Tie-break note: on an exact vote-count tie this picks the numerically
 	// smaller ASN (map iteration order plus "a < bestASN" below), not the
 	// most-trusted source as country/city do via SourcePriority. This
@@ -317,15 +323,36 @@ func consensus(ok []SourceResult) ConsensusLocation {
 			bestASN, bestASNN = a, n
 		}
 	}
-	loc.ASN = bestASN
-	loc.Org = asnOrg[bestASN]
-
-	// net_type flags: OR across sources.
-	for _, r := range ok {
-		loc.Hosting = loc.Hosting || r.Hosting
-		loc.Proxy = loc.Proxy || r.Proxy
-		loc.Mobile = loc.Mobile || r.Mobile
+	if bestASNN >= MinSources {
+		loc.ASN = bestASN
+		loc.Org = asnOrg[bestASN]
 	}
+
+	// net_type flags: set only when >= MinSources sources report them.
+	//
+	// These were OR-ed, which made each one a single-source assertion in a
+	// record whose country and city both require corroboration. One of three
+	// free apis -- compromised, or merely wrong for an afternoon -- could
+	// therefore mark Proxy or Hosting on every provider the fleet probes,
+	// fleet-wide and indistinguishable downstream from a flag all three
+	// agreed on. A flag nobody corroborates now stays false, which is the
+	// same direction the rest of this function fails in: silent about what it
+	// does not know, rather than confident about what one source said.
+	var hosting, proxy, mobile int
+	for _, r := range ok {
+		if r.Hosting {
+			hosting++
+		}
+		if r.Proxy {
+			proxy++
+		}
+		if r.Mobile {
+			mobile++
+		}
+	}
+	loc.Hosting = hosting >= MinSources
+	loc.Proxy = proxy >= MinSources
+	loc.Mobile = mobile >= MinSources
 
 	return loc
 }

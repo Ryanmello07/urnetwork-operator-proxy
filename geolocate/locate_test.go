@@ -42,8 +42,11 @@ func TestLocateAllAgree(t *testing.T) {
 	if loc.ASN != 401486 {
 		t.Fatalf("ASN = %d", loc.ASN)
 	}
-	if !loc.Proxy {
-		t.Fatal("Proxy flag from freeipapi must OR true")
+	// Only freeipapi called this a proxy. A net-type flag is held to the same
+	// corroboration bar as the country, so one source's say-so does not set
+	// it -- see TestConsensusFlagsRequireCorroboration.
+	if loc.Proxy {
+		t.Fatal("Proxy was set from a single source; flags require corroboration")
 	}
 	if len(loc.Sources) != 3 {
 		t.Fatalf("expected 3 source records, got %d", len(loc.Sources))

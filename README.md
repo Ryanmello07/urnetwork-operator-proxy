@@ -19,7 +19,9 @@ a consensus, and submits the result to the operator's server.
   provider on the path cannot forge a location.
 - Country is the trusted output. City is recorded only when at least two sources
   agree (free sources disagree on city often), otherwise the location is
-  country-granular.
+  country-granular. The same two-source bar applies to the ASN/Org and to the
+  `hosting`/`proxy`/`mobile` flags: anything only one source asserts is left
+  unset, so a single bad api cannot mark the whole fleet.
 - A provider that refuses to carry the probe is simply not located; the server
   falls back to its own database.
 
