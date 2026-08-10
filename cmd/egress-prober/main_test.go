@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -50,7 +52,12 @@ func buildProber(t *testing.T) string {
 			buildErr = err
 			return
 		}
+		// Windows exec refuses an extensionless path (LookPath only tries
+		// PATHEXT extensions), so the binary must be named with .exe there.
 		bin := filepath.Join(dir, "egress-prober")
+		if runtime.GOOS == "windows" {
+			bin += ".exe"
+		}
 		out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput()
 		if err != nil {
 			buildErr = err
@@ -74,7 +81,14 @@ func runProberWithSecretsInEnv(t *testing.T, args ...string) string {
 		"UR_PROBER_BY_JWT="+testJwtSecret,
 		"UR_OPERATOR_SECRET="+testOperatorSecret,
 	)
-	out, _ := cmd.CombinedOutput() // a non-zero exit is expected in these tests
+	out, err := cmd.CombinedOutput()
+	// A non-zero exit is expected in these tests, but a process that never
+	// ran is not: swallowing that error made the content assertions below
+	// fail against empty output instead of naming the real problem.
+	var exitErr *exec.ExitError
+	if err != nil && !errors.As(err, &exitErr) {
+		t.Fatalf("running the prober: %s", err)
+	}
 	return string(out)
 }
 
