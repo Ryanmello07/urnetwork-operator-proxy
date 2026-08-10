@@ -415,7 +415,7 @@ const (
 // It also demonstrably changes what ClassReputation measures -- see that
 // class's comment, where the same host got 403 under curl's default agent and
 // 206 under this one.
-const UserAgent = "urnetwork-egress-prober/0.1 (+https://github.com/urnetwork/urnetwork-operator-proxy; operator egress health probe)"
+const UserAgent = "urnetwork-egress-prober/0.1 (+https://github.com/urnetwork/operator-proxy; operator egress health probe)"
 
 // destinations is the production table: the owner's curated 159-row list,
 // minus the rows that cannot be checked over an *http.Client, plus the seven

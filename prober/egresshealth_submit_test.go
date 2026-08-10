@@ -11,9 +11,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/egresshealth"
-	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
-	"github.com/urnetwork/urnetwork-operator-proxy/ingest"
+	"github.com/urnetwork/operator-proxy/egresshealth"
+	"github.com/urnetwork/operator-proxy/geolocate"
+	"github.com/urnetwork/operator-proxy/ingest"
 )
 
 // stubHealthReporter records what the prober handed to the health submitter.

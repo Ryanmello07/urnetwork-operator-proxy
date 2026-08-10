@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
+	"github.com/urnetwork/operator-proxy/geolocate"
 )
 
 // TestSubmitPostsContractShape locks down the wire shape of submitBody

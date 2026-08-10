@@ -17,11 +17,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/bandwidth"
-	"github.com/urnetwork/urnetwork-operator-proxy/confinement"
-	"github.com/urnetwork/urnetwork-operator-proxy/egresshealth"
-	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
-	"github.com/urnetwork/urnetwork-operator-proxy/ingest"
+	"github.com/urnetwork/operator-proxy/bandwidth"
+	"github.com/urnetwork/operator-proxy/confinement"
+	"github.com/urnetwork/operator-proxy/egresshealth"
+	"github.com/urnetwork/operator-proxy/geolocate"
+	"github.com/urnetwork/operator-proxy/ingest"
 )
 
 // lookupFails is a resolver that cannot resolve anything. That is both a

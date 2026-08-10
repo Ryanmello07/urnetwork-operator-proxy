@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
+	"github.com/urnetwork/operator-proxy/geolocate"
 )
 
 type attempt struct {

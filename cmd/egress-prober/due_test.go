@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/bandwidth"
-	"github.com/urnetwork/urnetwork-operator-proxy/ingest"
-	"github.com/urnetwork/urnetwork-operator-proxy/prober"
-	"github.com/urnetwork/urnetwork-operator-proxy/providertunnel"
+	"github.com/urnetwork/operator-proxy/bandwidth"
+	"github.com/urnetwork/operator-proxy/ingest"
+	"github.com/urnetwork/operator-proxy/prober"
+	"github.com/urnetwork/operator-proxy/providertunnel"
 )
 
 type stubDueLister struct {

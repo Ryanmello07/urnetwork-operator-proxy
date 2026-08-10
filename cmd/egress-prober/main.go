@@ -42,13 +42,13 @@ import (
 	gojwt "github.com/golang-jwt/jwt/v5"
 	"github.com/urnetwork/connect"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/bandwidth"
-	"github.com/urnetwork/urnetwork-operator-proxy/confinement"
-	"github.com/urnetwork/urnetwork-operator-proxy/egresshealth"
-	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
-	"github.com/urnetwork/urnetwork-operator-proxy/ingest"
-	"github.com/urnetwork/urnetwork-operator-proxy/prober"
-	"github.com/urnetwork/urnetwork-operator-proxy/providertunnel"
+	"github.com/urnetwork/operator-proxy/bandwidth"
+	"github.com/urnetwork/operator-proxy/confinement"
+	"github.com/urnetwork/operator-proxy/egresshealth"
+	"github.com/urnetwork/operator-proxy/geolocate"
+	"github.com/urnetwork/operator-proxy/ingest"
+	"github.com/urnetwork/operator-proxy/prober"
+	"github.com/urnetwork/operator-proxy/providertunnel"
 )
 
 func main() {

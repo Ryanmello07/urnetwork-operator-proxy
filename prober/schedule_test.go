@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
+	"github.com/urnetwork/operator-proxy/geolocate"
 )
 
 func okProber(probed *int32, mu *sync.Mutex, inflight *int32, maxSeen *int32) *Prober {

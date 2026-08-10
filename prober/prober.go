@@ -11,8 +11,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/egresshealth"
-	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
+	"github.com/urnetwork/operator-proxy/egresshealth"
+	"github.com/urnetwork/operator-proxy/geolocate"
 )
 
 // Locator runs the geolocation consensus over a client. In production this is

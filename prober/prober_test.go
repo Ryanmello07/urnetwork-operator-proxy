@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
+	"github.com/urnetwork/operator-proxy/geolocate"
 )
 
 // stubSubmitter is shared by prober_test.go (single-goroutine callers) and

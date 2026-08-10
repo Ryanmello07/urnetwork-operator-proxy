@@ -11,8 +11,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/egresshealth"
-	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
+	"github.com/urnetwork/operator-proxy/egresshealth"
+	"github.com/urnetwork/operator-proxy/geolocate"
 )
 
 // captureLog redirects the standard logger for the duration of a test.

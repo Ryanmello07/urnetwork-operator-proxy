@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
+	"github.com/urnetwork/operator-proxy/geolocate"
 )
 
 // ErrNotConfident is returned when a result is not country-confident. Such a
