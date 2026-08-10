@@ -131,9 +131,23 @@ type dueResult struct {
 // database, where it survives a restart. limit must be positive: the server
 // answers 400 to limit<1 precisely because an empty list is indistinguishable
 // from "nothing is due", and it clamps the value to its own maximum.
+//
+// When ShardCount is above 1 the shard parameters are sent, so the server hands
+// this prober only its own slice of the queue. Below that they are omitted
+// entirely, which is both the single-prober case and what keeps this working
+// against a server that predates them.
 func (c *Client) Due(ctx context.Context, limit int) ([]string, error) {
 	if limit < 1 {
 		return nil, fmt.Errorf("ingest: due limit must be positive (got %d)", limit)
+	}
+	// Caught here rather than sent. The server answers 400, but an operator
+	// reading an empty result as "nothing is due" is exactly the confusion the
+	// limit<1 check above already exists to prevent.
+	if 1 < c.ShardCount && (c.ShardIndex < 0 || c.ShardCount <= c.ShardIndex) {
+		return nil, fmt.Errorf(
+			"ingest: shard index %d is out of range for shard count %d",
+			c.ShardIndex, c.ShardCount,
+		)
 	}
 
 	u, err := url.Parse(c.dueURL())
@@ -142,6 +156,10 @@ func (c *Client) Due(ctx context.Context, limit int) ([]string, error) {
 	}
 	q := u.Query()
 	q.Set("limit", strconv.Itoa(limit))
+	if 1 < c.ShardCount {
+		q.Set("shard_count", strconv.Itoa(c.ShardCount))
+		q.Set("shard_index", strconv.Itoa(c.ShardIndex))
+	}
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
