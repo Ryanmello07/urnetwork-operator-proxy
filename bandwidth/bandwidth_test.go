@@ -517,6 +517,46 @@ func TestSamplerSkipsWhenTheProbeHasNoTimeLeft(t *testing.T) {
 	}
 }
 
+// TestSamplerSkipsWhenTheDeadlineCannotCoverTheMeasurement: the floor has to
+// be the measurement's OWN timeout, not a fixed 1s that sits below it. With
+// 2s of probe deadline left and a 5s per-target cap, the old floor admitted
+// the measurement, spent a 16 MiB deployment-wide reservation on it, and then
+// let the parent deadline -- not the measurement's cap -- kill the read. The
+// byte budget was charged, nothing was recorded, and the provider logged
+// failed(context deadline exceeded) instead of the skip this situation has a
+// dedicated string for.
+func TestSamplerSkipsWhenTheDeadlineCannotCoverTheMeasurement(t *testing.T) {
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	reserver := &recordingReserver{}
+	sampler := &Sampler{
+		Targets: []Target{{Name: "operator", Source: SourceOperator, URL: srv.URL}},
+		Reserve: reserver,
+		Submit:  &recordingSubmitter{},
+		Timeout: 5 * time.Second,
+	}
+
+	// More than MinTimeBudget, less than the sampler's own per-target cap.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	results := sampler.Sample(ctx, "provider-1", srv.Client())
+	if len(results) != 1 || results[0].Skip != SkipNoTime {
+		t.Fatalf("got %+v, want a single %q skip: the remaining deadline cannot cover a 5s measurement", results, SkipNoTime)
+	}
+	if reserver.count() != 0 {
+		t.Errorf("%d reservation(s) of deployment-wide byte budget taken for a measurement the deadline could not cover", reserver.count())
+	}
+	if n := requests.Load(); n != 0 {
+		t.Errorf("%d request(s) made, want 0", n)
+	}
+}
+
 // TestSummaryShowsBothFiguresSideBySide: the log line is the operator's only
 // view of divergence between the two targets, so both figures are always
 // present, always labelled, and a skip says so explicitly rather than going

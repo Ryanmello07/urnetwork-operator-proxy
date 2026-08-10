@@ -148,10 +148,15 @@ const (
 	// DefaultTimeout is the per-target wall-clock cap.
 	DefaultTimeout = 5 * time.Second
 
-	// MinTimeBudget is the least remaining context budget worth starting a
-	// measurement with. Below it the request would be cut off mid-transfer and
-	// the resulting figure would describe the prober's exhausted deadline
-	// rather than the provider.
+	// MinTimeBudget is the absolute floor on the remaining context budget
+	// worth starting a measurement with. Below it the request would be cut off
+	// mid-transfer and the resulting figure would describe the prober's
+	// exhausted deadline rather than the provider.
+	//
+	// It is a floor, not the whole test: hasTimeBudget requires the
+	// measurement's own per-target cap when that is larger, since a
+	// reservation spent on a measurement the parent deadline will cut short
+	// charges the fleet's byte budget for nothing.
 	MinTimeBudget = time.Second
 )
 
@@ -714,7 +719,7 @@ func (s *Sampler) sampleOne(
 	// The probe's remaining budget is checked before the reservation, not
 	// after: a reservation spends deployment-wide budget, and spending it on a
 	// measurement that cannot finish would charge the fleet for nothing.
-	if !hasTimeBudget(ctx) {
+	if !hasTimeBudget(ctx, s.timeout()) {
 		return Result{Target: target, Skip: SkipNoTime}
 	}
 
@@ -759,15 +764,26 @@ func (s *Sampler) timeout() time.Duration {
 
 // hasTimeBudget reports whether enough of the probe's deadline remains to take
 // a measurement that describes the provider rather than the deadline.
-func hasTimeBudget(ctx context.Context) bool {
+//
+// need is the measurement's own per-target cap, not a fixed floor. A floor
+// below that cap admits a measurement the parent deadline will cut short:
+// with 2s left and a 5s cap the reservation (16 MiB of deployment-wide byte
+// budget) is spent, readStream correctly classifies the parent's deadline as
+// a failure, and nothing is recorded -- the provider then logs
+// failed(context deadline exceeded) instead of the SkipNoTime this exact
+// situation has a dedicated string for.
+func hasTimeBudget(ctx context.Context, need time.Duration) bool {
 	if ctx.Err() != nil {
 		return false
+	}
+	if need < MinTimeBudget {
+		need = MinTimeBudget
 	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		return true
 	}
-	return MinTimeBudget <= time.Until(deadline)
+	return need <= time.Until(deadline)
 }
 
 // Summary renders one provider's results as `operator=12.4MB/s cdn=11.8MB/s`,
