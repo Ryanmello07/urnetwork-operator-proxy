@@ -240,8 +240,13 @@ func issueIntermediateSignedBy(t *testing.T, cn string, caCert *x509.Certificate
 
 // httpClientOverDialer is the contract Tunnel.HTTPClient must satisfy: every
 // request is dialed through the supplied dialer (the tunnel), never the host
-// network. This test exercises that wiring with a stub dialer, so it runs
-// without a live provider.
+// network. https is the only scheme the client will carry (see
+// TestHTTPClientRefusesPlainHTTP), so the wiring is proven by watching the
+// dialer get invoked for an allowlisted https host; the handshake then
+// failing against the plaintext stub is expected and irrelevant to the
+// property -- what matters is that the connection attempt rode the supplied
+// dialer at all. This keeps the test free of the trust-injection harness,
+// so it runs on every platform.
 func TestHTTPClientUsesSuppliedDialer(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -264,17 +269,42 @@ func TestHTTPClientUsesSuppliedDialer(t *testing.T) {
 		return net.Dial("tcp", ln.Addr().String())
 	}
 
-	client := httpClientOverDialer(dial, nil, 5*time.Second)
-	resp, err := client.Get("http://geolocation.example/json")
-	if err != nil {
-		t.Fatalf("get err = %v", err)
+	client := httpClientOverDialer(dial, map[string][]string{"geolocation.example": {"sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}}, 5*time.Second)
+	resp, err := client.Get("https://geolocation.example/json")
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("TLS handshake against a plaintext stub unexpectedly succeeded")
 	}
-	defer resp.Body.Close()
 	if dialed == 0 {
 		t.Fatal("request did not go through the supplied dialer")
 	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", resp.StatusCode)
+}
+
+// TestHTTPClientRefusesPlainHTTP: the allowlist and the pins are enforced
+// in DialTLSContext, which only https traffic reaches. A plain http:// URL
+// would otherwise ride the raw tunnel dialer in cleartext -- unpinned,
+// un-allowlisted, and forgeable by the provider being measured -- so the
+// transport must refuse the scheme outright, before any bytes traverse the
+// tunnel. Even an allowlisted host is refused: the allowlist grants pinned
+// https, not the host.
+func TestHTTPClientRefusesPlainHTTP(t *testing.T) {
+	dialed := 0
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		dialed++
+		return nil, context.Canceled
+	}
+
+	client := httpClientOverDialer(dial, map[string][]string{"geolocation.example": {"sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}}, 5*time.Second)
+	resp, err := client.Get("http://geolocation.example/json")
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("plain http through the tunnel succeeded; it must be refused")
+	}
+	if !errors.Is(err, ErrPlainHTTPRefused) {
+		t.Fatalf("err = %v, want it to wrap ErrPlainHTTPRefused", err)
+	}
+	if dialed != 0 {
+		t.Fatalf("the tunnel dialer was invoked %d time(s) for a plain-http request; the refusal must happen before any bytes traverse the tunnel", dialed)
 	}
 }
 
