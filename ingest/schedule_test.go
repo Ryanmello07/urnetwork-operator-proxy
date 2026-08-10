@@ -7,8 +7,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // TestDueRequestsTheContract locks the due request against the server's fixed
@@ -210,6 +212,26 @@ func TestReportAttemptTruncatesProbeFailure(t *testing.T) {
 	}
 }
 
+// TestTruncateUTF8DoesNotSplitARune: every current caller passes ASCII, so a
+// byte-boundary cut is invisible today and would corrupt the moment one does
+// not -- json marshals a partial encoding as U+FFFD.
+func TestTruncateUTF8DoesNotSplitARune(t *testing.T) {
+	// "é" occupies bytes 1-2, so a cut at 2 lands inside it and must back up
+	// to the boundary at 1; a cut at 3 is already on a boundary and stands.
+	if got := truncateUTF8("aéb", 2); got != "a" {
+		t.Fatalf("truncateUTF8(\"aéb\", 2) = %q, want \"a\": the cut must fall back to a rune boundary", got)
+	}
+	if got := truncateUTF8("aéb", 3); got != "aé" {
+		t.Fatalf("truncateUTF8(\"aéb\", 3) = %q, want \"aé\": a cut already on a boundary must not lose a rune", got)
+	}
+	if got := truncateUTF8("abc", 10); got != "abc" {
+		t.Fatalf("truncateUTF8 shortened a string already within the limit: %q", got)
+	}
+	if !utf8.ValidString(truncateUTF8(strings.Repeat("é", 40), 61)) {
+		t.Fatal("truncateUTF8 produced invalid utf-8")
+	}
+}
+
 func TestReportAttemptSurfacesUnauthorized(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -236,5 +258,43 @@ func TestReportAttemptTolerates404(t *testing.T) {
 	err := c.ReportAttempt(context.Background(), "019f8835-158d-6fd8-e9dd-fd0e4c6d6792", "tunnel_failed")
 	if !errors.Is(err, ErrAttemptUnsupported) {
 		t.Fatalf("ReportAttempt err = %v, want ErrAttemptUnsupported", err)
+	}
+}
+
+// TestTruncateNameListCutsOnElementBoundaries: cutting mid-element invents a
+// destination. Review measured a real case -- a 1388-byte, 131-name list cut
+// at 512 bytes ended in "kernel-org-mirror" while the real destination is
+// "kernel-org-mirrors" -- which is indistinguishable from a genuine name, so
+// a query for providers failing it silently returns nothing.
+func TestTruncateNameListCutsOnElementBoundaries(t *testing.T) {
+	names := []string{"kernel-org-mirrors", "cachefly", "akamai", "etsy", "canva"}
+	got := truncateNameList(names, 30)
+
+	if len(got) > 30 {
+		t.Fatalf("truncateNameList = %q (%d bytes), want at most 30", got, len(got))
+	}
+	// Every name before the marker must be a whole name from the input.
+	listed, _, _ := strings.Cut(got, "…")
+	for _, name := range strings.Split(listed, ",") {
+		if name == "" {
+			continue
+		}
+		if !slices.Contains(names, name) {
+			t.Errorf("truncateNameList emitted %q, which is not one of the real destinations: a partial name reads as a genuine one", name)
+		}
+	}
+	if !strings.Contains(got, "more") {
+		t.Errorf("truncateNameList = %q, want a dropped-count marker so a truncated list is distinguishable from a short one", got)
+	}
+	// A list inside the budget is returned untouched, with no marker.
+	if got := truncateNameList(names[:2], 512); got != "kernel-org-mirrors,cachefly" {
+		t.Errorf("truncateNameList within budget = %q, want the plain join", got)
+	}
+	if got := truncateNameList(nil, 512); got != "" {
+		t.Errorf("truncateNameList(nil) = %q, want empty", got)
+	}
+	// A single name wider than the whole budget still cannot overflow it.
+	if got := truncateNameList([]string{strings.Repeat("x", 400)}, 40); len(got) > 40 {
+		t.Errorf("truncateNameList = %q (%d bytes), want at most 40", got, len(got))
 	}
 }

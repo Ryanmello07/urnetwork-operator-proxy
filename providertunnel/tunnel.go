@@ -40,6 +40,13 @@ type Config struct {
 // that later from a skewed geolocation result.
 var ErrPinsRequired = errors.New("providertunnel: Config.Pins must not be empty; a tunnel with no pins cannot safely carry a geolocation probe")
 
+// ErrPlainHTTPRefused is returned for any http:// request made through a
+// tunnel client. The allowlist and the certificate pins live in
+// DialTLSContext, which only https traffic reaches; a plain-http request
+// would ride the raw tunnel dialer in cleartext, forgeable by the very
+// provider being measured.
+var ErrPlainHTTPRefused = errors.New("providertunnel: plain http refused; only https, which the allowlist and pin check cover, may traverse the tunnel")
+
 // createTun builds the gvisor tun Open routes through. It is a var, and takes
 // the resolver settings explicitly rather than reaching for them itself, so a
 // test can observe exactly what Open asks for -- see
@@ -160,11 +167,21 @@ func Open(ctx context.Context, cfg Config, providerClientId connect.Id) (*Tunnel
 		}
 	}()
 
+	// The pin map is copied, not aliased: a caller that mutates its own map
+	// after Open -- the cmd layer refreshes pins on a timer -- would otherwise
+	// race the per-dial reads in DialTLSContext. The cmd layer already hands
+	// over a fresh copy per Open, so this makes the package safe by
+	// construction rather than by the caller remembering.
+	pins := make(map[string][]string, len(cfg.Pins))
+	for host, allowed := range cfg.Pins {
+		pins[host] = append([]string(nil), allowed...)
+	}
+
 	return &Tunnel{
 		cancel: cancel,
 		tun:    tun,
 		mc:     mc,
-		pins:   cfg.Pins,
+		pins:   pins,
 	}, nil
 }
 
@@ -278,7 +295,16 @@ func httpClientOverDialerWithHosts(dial dialContextFunc, pins map[string][]strin
 	}
 
 	tr := &http.Transport{
-		DialContext: dial,
+		// The raw dialer is deliberately NOT installed as DialContext.
+		// net/http uses DialContext for plain-http requests, which would
+		// bypass both the allowlist and the pin check below -- they live in
+		// DialTLSContext, and only https traffic reaches them. Refusing the
+		// dial here kills the scheme before any bytes traverse the tunnel;
+		// CheckRedirect (below) already refuses the downgrade-redirect route
+		// to the same hole.
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return nil, fmt.Errorf("%w (dial %s)", ErrPlainHTTPRefused, addr)
+		},
 		// TLSHandshakeTimeout is NOT set here: it only bounds the
 		// transport's own internal TLS handshake, which never runs because
 		// DialTLSContext (below) fully owns dialing and handshaking for

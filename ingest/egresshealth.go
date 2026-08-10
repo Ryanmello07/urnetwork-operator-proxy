@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/egresshealth"
+	"github.com/urnetwork/operator-proxy/egresshealth"
 )
 
 // egressHealthClassBody is one class's ok/total tally over the destinations
@@ -85,14 +85,20 @@ func (c *Client) SubmitEgressHealth(
 	}
 
 	buf, err := json.Marshal(submitEgressHealthBody{
-		ClientId:              providerClientId,
-		OKCount:               res.OKCount,
-		TotalCount:            res.Total,
-		ClassResults:          classResults,
-		ReputationOK:          res.Reputation.OK,
-		ReputationTotal:       res.Reputation.Total,
-		FailedNames:           strings.Join(res.FailedNames(), ","),
-		ReputationFailedNames: strings.Join(res.ReputationFailedNames(), ","),
+		ClientId:        providerClientId,
+		OKCount:         res.OKCount,
+		TotalCount:      res.Total,
+		ClassResults:    classResults,
+		ReputationOK:    res.Reputation.OK,
+		ReputationTotal: res.Reputation.Total,
+		// Bounded like probe_failure, and for the same reason: a run with
+		// many failures names ~131 destinations under -egress-health-all, and
+		// a submission the server rejects for length is a health signal
+		// dropped silently, since the prober submits these fire-and-forget
+		// with deduplicated error logging. Cut on element boundaries with a
+		// dropped count -- see truncateNameList and MaxNameListLen.
+		FailedNames:           truncateNameList(res.FailedNames(), MaxNameListLen),
+		ReputationFailedNames: truncateNameList(res.ReputationFailedNames(), MaxNameListLen),
 	})
 	if err != nil {
 		return err

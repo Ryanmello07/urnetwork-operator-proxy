@@ -10,7 +10,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/egresshealth"
+	"github.com/urnetwork/operator-proxy/egresshealth"
 )
 
 // ingestHealthResult is a provider whose tunnel works, which two CDNs refuse,

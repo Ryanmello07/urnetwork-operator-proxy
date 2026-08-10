@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
+	"github.com/urnetwork/operator-proxy/geolocate"
 )
 
 // stubSubmitter is shared by prober_test.go (single-goroutine callers) and
@@ -75,7 +75,12 @@ func TestProbeOneNoConsensusDoesNotSubmit(t *testing.T) {
 	}
 }
 
-func TestProbeOneTunnelFailureIsReported(t *testing.T) {
+// TestProbeOneTunnelFailureSkipsLocateAndSubmit: a tunnel that will not open
+// must short-circuit the probe. (The ATTEMPT reporting for this case is
+// covered by TestProbeOneReportsATunnelFailure in attempt_test.go, which
+// wires a reporter; this test deliberately has none, so its old name promised
+// an assertion it never made.)
+func TestProbeOneTunnelFailureSkipsLocateAndSubmit(t *testing.T) {
 	sub := &stubSubmitter{}
 	p := &Prober{
 		Open: func(ctx context.Context, id string) (*http.Client, func() error, error) {

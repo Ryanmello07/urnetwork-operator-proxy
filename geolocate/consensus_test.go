@@ -257,20 +257,72 @@ func TestConsensusCityAgreementWithRegionConfident(t *testing.T) {
 	}
 }
 
-func TestConsensusFlagsOr(t *testing.T) {
+// TestConsensusFlagsRequireCorroboration: the net-type flags are held to the
+// same standard as the country they travel with. They used to be OR-ed
+// across sources, so ONE of three free apis -- compromised, or merely having
+// a bad day -- could set Proxy or Hosting on every provider the fleet probes,
+// with nothing downstream able to tell a corroborated flag from a solo one.
+// Two sources agreeing is the same MinSources bar the country clears.
+func TestConsensusFlagsRequireCorroboration(t *testing.T) {
+	all := FlagSupport{Hosting: true, Proxy: true, Mobile: true}
 	ok := []SourceResult{
-		{Name: "a", OK: true, CountryCode: "US", Hosting: false, Proxy: false, Mobile: false},
-		{Name: "b", OK: true, CountryCode: "US", Hosting: true, Proxy: true, Mobile: false},
+		{Name: "a", OK: true, CountryCode: "US", Supports: all},
+		{Name: "b", OK: true, CountryCode: "US", Hosting: true, Proxy: true, Supports: all},
+		{Name: "c", OK: true, CountryCode: "US", Hosting: true, Supports: all},
 	}
 	loc := consensus(ok)
 	if !loc.Hosting {
-		t.Fatal("Hosting must be OR-ed true")
+		t.Fatal("Hosting must be set: two sources reported it")
 	}
-	if !loc.Proxy {
-		t.Fatal("Proxy must be OR-ed true")
+	if loc.Proxy {
+		t.Fatal("Proxy must not be set from a single source's say-so")
 	}
 	if loc.Mobile {
 		t.Fatal("Mobile must remain false")
+	}
+}
+
+// TestConsensusSingleRogueSourceCannotDictateTheRecord is the whole
+// single-bad-source threat model in one table. With three sources and one of
+// them lying about everything, nothing it alone asserts may reach the record:
+// not the country (outvoted), not the flags, not the ASN it invents.
+func TestConsensusSingleRogueSourceCannotDictateTheRecord(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "ip.pn", OK: true, CountryCode: "US", Country: "United States", ASN: 7922,
+			Supports: FlagSupport{Hosting: true, Proxy: true, Mobile: true}},
+		{Name: "freeipapi", OK: true, CountryCode: "US", Country: "United States", ASN: 7922,
+			Supports: FlagSupport{Hosting: true, Proxy: true, Mobile: true}},
+		{Name: "ipinfo", OK: true, CountryCode: "RU", Country: "Russia", ASN: 64512, Org: "Rogue",
+			Hosting: true, Proxy: true, Mobile: true,
+			Supports: FlagSupport{Hosting: true, Proxy: true, Mobile: true}},
+	}
+	loc := consensus(ok)
+	if loc.CountryCode != "us" || !loc.CountryConfident {
+		t.Fatalf("CountryCode = %q confident=%v, want us/true: two honest sources must outvote one rogue", loc.CountryCode, loc.CountryConfident)
+	}
+	if loc.Hosting || loc.Proxy || loc.Mobile {
+		t.Fatalf("flags hosting=%v proxy=%v mobile=%v, want all false: one source is not corroboration", loc.Hosting, loc.Proxy, loc.Mobile)
+	}
+	if loc.ASN != 7922 {
+		t.Fatalf("ASN = %d, want 7922 (the corroborated one)", loc.ASN)
+	}
+	if loc.Org == "Rogue" {
+		t.Fatal("Org came from the rogue source's uncorroborated ASN")
+	}
+}
+
+// TestConsensusUncorroboratedASNIsNotAdopted: with every source naming a
+// different ASN there is no corroboration to be had, and a plurality of one
+// is just the first source winning a coin toss. Leave it empty rather than
+// publish a coin toss as a fact.
+func TestConsensusUncorroboratedASNIsNotAdopted(t *testing.T) {
+	ok := []SourceResult{
+		{Name: "ip.pn", OK: true, CountryCode: "US", Country: "United States", ASN: 7922, Org: "Comcast"},
+		{Name: "freeipapi", OK: true, CountryCode: "US", Country: "United States", ASN: 15169, Org: "Google"},
+	}
+	loc := consensus(ok)
+	if loc.ASN != 0 || loc.Org != "" {
+		t.Fatalf("ASN = %d Org = %q, want unset: no two sources agreed", loc.ASN, loc.Org)
 	}
 }
 

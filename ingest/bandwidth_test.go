@@ -9,7 +9,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/bandwidth"
+	"github.com/urnetwork/operator-proxy/bandwidth"
 )
 
 // TestReserveBandwidthMapsStatusToOutcome pins the reservation contract. The

@@ -11,8 +11,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/egresshealth"
-	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
+	"github.com/urnetwork/operator-proxy/egresshealth"
+	"github.com/urnetwork/operator-proxy/geolocate"
 )
 
 // Locator runs the geolocation consensus over a client. In production this is
@@ -132,8 +132,7 @@ type Prober struct {
 	// a wrong secret, a dead network -- stops them for every provider, so
 	// logging per provider would bury the pass's real output under one
 	// identical line per provider, every pass.
-	attemptErrMu     sync.Mutex
-	attemptErrLogged map[string]bool
+	attemptErr errGate
 
 	// healthErrLogged deduplicates health-submission error messages, for the
 	// same reason attemptErrLogged does: whatever stops the submissions getting
@@ -146,8 +145,86 @@ type Prober struct {
 	// fail for different reasons and say different things about what is lost,
 	// and a shared map would let a noisy attempt error suppress the first
 	// health error (or the reverse).
-	healthErrMu     sync.Mutex
-	healthErrLogged map[string]bool
+	healthErr errGate
+
+	// closeErrLogged deduplicates tunnel-teardown errors, on its own gate for
+	// the same reason the two above are separate: a noisy teardown failure
+	// must not consume the log budget that would otherwise have surfaced the
+	// first health or attempt failure.
+	closeErr errGate
+}
+
+// errGate deduplicates error messages within one pass and bounds how many
+// distinct ones it logs.
+//
+// The cap is what makes this safe on a message that VARIES: the maps are
+// keyed on the full error text, and ingest.ErrRejected embeds up to 4096
+// bytes of server response body -- a body carrying a request id or a
+// timestamp, which is ordinary, makes every message distinct. Without a cap
+// the gate inverted, logging one line per provider per pass (the flood it
+// exists to prevent) while the map grew an entry per probe.
+//
+// The RESET is what makes the cap safe. These gates live on the Prober,
+// which lives for the whole process -- months -- so a permanent cap is not
+// the same mechanism the scheduler uses, even though it looks like it: the
+// scheduler's map is local to one Run and re-arms every pass. Ten transient
+// errors would otherwise burn the gate forever, and a later fault that
+// breaks EVERY attempt report (a rotated operator secret answering 401)
+// would log nothing at all -- re-creating exactly the silent failure the
+// logging exists to prevent. Each pass starts with a clean gate and closes
+// by reporting what it suppressed.
+//
+// The mutex and its map are one type rather than two arguments so a caller
+// cannot pair the wrong ones.
+type errGate struct {
+	mu         sync.Mutex
+	seen       map[string]bool
+	suppressed int
+}
+
+// allow reports whether this error should be logged now, and records it so
+// an identical message is not logged again this pass.
+func (g *errGate) allow(err error) bool {
+	msg := err.Error()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.seen == nil {
+		g.seen = map[string]bool{}
+	}
+	if g.seen[msg] {
+		return false
+	}
+	if maxLoggedDistinctErrors <= len(g.seen) {
+		g.suppressed++
+		return false
+	}
+	g.seen[msg] = true
+	return true
+}
+
+// reset re-arms the gate and returns how many distinct messages it withheld.
+func (g *errGate) reset() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	n := g.suppressed
+	g.seen = nil
+	g.suppressed = 0
+	return n
+}
+
+// ResetErrorLogging re-arms the per-pass error-log gates and reports what the
+// finished pass withheld. The scheduler calls it at the start of every Run;
+// a Prober driven directly can call it per pass for the same effect.
+func (p *Prober) ResetErrorLogging() {
+	for what, gate := range map[string]*errGate{
+		"probe-attempt report": &p.attemptErr,
+		"egress-health submit": &p.healthErr,
+		"tunnel teardown":      &p.closeErr,
+	} {
+		if n := gate.reset(); n > 0 {
+			log.Printf("prober: suppressed %d further distinct %s error(s) in the previous pass (detail is capped at %d per pass)", n, what, maxLoggedDistinctErrors)
+		}
+	}
 }
 
 // ProbeOne probes a single provider. The tunnel is always closed, and nothing
@@ -177,11 +254,27 @@ func (p *Prober) ProbeOne(ctx context.Context, providerClientId string) error {
 func (p *Prober) probeOne(ctx context.Context, providerClientId string) (string, error) {
 	client, closeTunnel, err := p.Open(ctx, providerClientId)
 	if err != nil {
-		return FailureTunnel, fmt.Errorf("open tunnel to %s: %w", providerClientId, err)
+		// No provider id in the message: the scheduler dedups on the error
+		// text and keeps only maxLoggedDistinctErrors distinct ones, so an id
+		// here made a fleet-wide identical failure (a wrong -platform-url, a
+		// revoked jwt) look like one distinct error per provider, filling
+		// every detail slot with copies of a single failure mode and
+		// suppressing genuinely different ones. The id is already in the
+		// caller's log line, as provider=.
+		return FailureTunnel, fmt.Errorf("open tunnel: %w", err)
 	}
 	defer func() {
-		if closeTunnel != nil {
-			_ = closeTunnel()
+		if closeTunnel == nil {
+			return
+		}
+		if err := closeTunnel(); err != nil && p.closeErr.allow(err) {
+			// Deduplicated on its own gate, for the reason the other two are
+			// separate: a noisy teardown error must not consume the budget
+			// that would have shown the first health or attempt failure. This
+			// never fails the probe -- the location is already submitted by
+			// the time it runs -- but discarding it entirely made a tunnel
+			// leaking its netstack completely invisible.
+			log.Printf("prober: tunnel teardown failed (provider=%s): %s. Logged once per distinct error.", providerClientId, err)
 		}
 	}()
 
@@ -320,18 +413,7 @@ func (p *Prober) reportEgressHealth(ctx context.Context, providerClientId string
 }
 
 func (p *Prober) logHealthErrOnce(err error, line string) {
-	msg := err.Error()
-	p.healthErrMu.Lock()
-	logged := p.healthErrLogged[msg]
-	if !logged {
-		if p.healthErrLogged == nil {
-			p.healthErrLogged = map[string]bool{}
-		}
-		p.healthErrLogged[msg] = true
-	}
-	p.healthErrMu.Unlock()
-
-	if !logged {
+	if p.healthErr.allow(err) {
 		log.Print(line)
 	}
 }
@@ -345,18 +427,7 @@ func (p *Prober) reportAttempt(ctx context.Context, providerClientId string, fai
 		return
 	}
 
-	msg := err.Error()
-	p.attemptErrMu.Lock()
-	logged := p.attemptErrLogged[msg]
-	if !logged {
-		if p.attemptErrLogged == nil {
-			p.attemptErrLogged = map[string]bool{}
-		}
-		p.attemptErrLogged[msg] = true
-	}
-	p.attemptErrMu.Unlock()
-
-	if !logged {
+	if p.attemptErr.allow(err) {
 		log.Printf("prober: could not report a probe attempt (provider=%s failure=%q): %s -- while this persists, providers that always fail to probe stay at the head of the server's due queue. Logged once per distinct error.", providerClientId, failure, err)
 	}
 }

@@ -112,7 +112,9 @@ const (
 	// warmup window on ordinary providers: 16 MiB aggregate takes longer than
 	// WarmupDuration for anything under 32 MiB/s, where the old 5 MiB single
 	// stream crossed that line at 10 MiB/s and therefore fell back to the
-	// lower-bound path on most of the fleet.
+	// lower-bound path on most of the fleet. (The steady window must also be
+	// a large enough fraction of the transfer -- see MaxSteadyInflation --
+	// but that bound is relative, so it does not move this crossover.)
 	StreamBytes = 2 * 1024 * 1024
 
 	// MaxSampleBytes bounds one measurement across all of its streams. It is
@@ -133,13 +135,46 @@ const (
 	// throughput, which would systematically penalise distant providers.
 	WarmupDuration = 500 * time.Millisecond
 
+	// MaxSteadyInflation bounds how much of the transfer's wall clock the
+	// steady window may exclude: the window must cover at least
+	// 1/MaxSteadyInflation of it, or the figure falls back to the
+	// warmup-inclusive lower bound.
+	//
+	// Excluding the warmup can raise the reported rate by at most
+	// totalElapsed/steadyElapsed -- the case where the discarded warmup
+	// carried nothing -- so this is directly a bound on how far a "steady"
+	// figure may exceed the whole-transfer aggregate, which is the physical
+	// ceiling for that transfer. A transfer stalling across the warmup
+	// boundary and then bursting (a windowed tunnel transport refilling just
+	// after the boundary) is the shape that exceeds it; review measured 17x
+	// the true aggregate published as steady.
+	//
+	// 4 leaves real slow-start exclusion intact -- a warmup carrying a
+	// quarter of the transfer's average still passes -- while capping the
+	// residual error at 4x rather than the unbounded original.
+	//
+	// It is deliberately a ratio and not a duration. Solving
+	// T/(T-WarmupDuration) <= 4 for the 16 MiB transfer gives a steady-path
+	// ceiling of ~24 MiB/s (measured ~21 with real overhead), against ~16
+	// MiB/s for a fixed 500 ms floor. Above that the reported figure is the
+	// warmup-inclusive lower bound. The pre-bound ceiling of ~32 MiB/s was
+	// partly illusory: at 31 MiB/s the steady window is already under 20 ms,
+	// and dividing 16 MiB by a window that thin is the inflation this bound
+	// exists to stop, not a measurement worth keeping.
+	MaxSteadyInflation = 4
+
 	// DefaultTimeout is the per-target wall-clock cap.
 	DefaultTimeout = 5 * time.Second
 
-	// MinTimeBudget is the least remaining context budget worth starting a
-	// measurement with. Below it the request would be cut off mid-transfer and
-	// the resulting figure would describe the prober's exhausted deadline
-	// rather than the provider.
+	// MinTimeBudget is the absolute floor on the remaining context budget
+	// worth starting a measurement with. Below it the request would be cut off
+	// mid-transfer and the resulting figure would describe the prober's
+	// exhausted deadline rather than the provider.
+	//
+	// It is a floor, not the whole test: hasTimeBudget requires the
+	// measurement's own per-target cap when that is larger, since a
+	// reservation spent on a measurement the parent deadline will cut short
+	// charges the fleet's byte budget for nothing.
 	MinTimeBudget = time.Second
 )
 
@@ -191,6 +226,16 @@ var ErrUnsupported = errors.New("bandwidth: the server does not implement the pr
 // succeeded and simply delivered nothing.
 var ErrNoSample = errors.New("bandwidth: no bytes transferred, cannot compute a rate")
 
+// ErrUnmeasuredDuration reports that bytes DID move but the wall clock did
+// not observably advance while they did, so no rate can be computed. This is
+// unreachable where the prober deploys (Linux clocks have nanosecond
+// granularity) but real on Windows dev machines, whose monotonic clock ticks
+// at ~0.5ms -- a loopback transfer can complete inside one tick. It is kept
+// distinct from ErrNoSample because "no bytes" and "no time" point at
+// opposite problems, and a message claiming no bytes moved when 16 MiB did
+// made this failure expensive to diagnose.
+var ErrUnmeasuredDuration = errors.New("bandwidth: bytes transferred but the clock did not advance, cannot compute a rate")
+
 // Target is one thing to download from. Both targets in production carry the
 // same URL shape and differ only in host, source tag, and whether an operator
 // secret is attached.
@@ -221,11 +266,18 @@ type Sample struct {
 	// the fan-out that produced it.
 	Streams int
 	// WarmupExcluded reports whether the rate was computed over the
-	// steady-state window only. It is false when the whole transfer finished
-	// inside WarmupDuration -- 16 MiB completes in under 500 ms above
-	// ~32 MiB/s, which the fastest datacenter-hosted providers clear -- in
-	// which case the rate is computed over the full transfer instead and is a
-	// LOWER BOUND on the real throughput, because it includes slow start.
+	// steady-state window only. It is false in two cases -- the whole
+	// transfer finished inside WarmupDuration (16 MiB completes in under
+	// 500 ms above ~32 MiB/s, which the fastest datacenter-hosted providers
+	// clear), or the steady window covered too small a fraction of the
+	// transfer to describe it (see MaxSteadyInflation) -- in which case the
+	// rate is computed over the full transfer instead and is a LOWER BOUND on
+	// the real throughput, because it includes slow start.
+	//
+	// This flag does NOT reach the server: ingest submits only the rate and
+	// the byte count, so a lower-bound figure is stored indistinguishably
+	// from a steady one. That is a gap worth closing on the server side --
+	// until it is, the distinction lives only in this process's log line.
 	//
 	// Reporting a lower bound rather than zero is deliberate: returning zero
 	// here would make the fastest providers, the ones most worth measuring,
@@ -488,7 +540,36 @@ func measure(
 		return Sample{}, ErrNoSample
 	}
 
-	if steadyElapsed := windowEnd.Sub(windowStart); !windowStart.IsZero() && 0 < steadyElapsed && 0 < steadyBytes {
+	totalElapsed := windowEnd.Sub(start)
+	if totalElapsed <= 0 {
+		return Sample{SampleByteCount: total, Streams: StreamCount}, ErrUnmeasuredDuration
+	}
+
+	// The steady window must be a representative FRACTION of the transfer,
+	// not merely wider than some fixed duration.
+	//
+	// Excluding the warmup can only raise the reported rate by the factor
+	// totalElapsed/steadyElapsed (the extreme where the discarded warmup
+	// carried no bytes at all), so bounding that ratio bounds how far a
+	// steady figure may exceed the whole-transfer aggregate -- which is the
+	// physical ceiling, since those bytes demonstrably moved in that wall
+	// clock. A stall straddling the warmup boundary followed by a burst is
+	// exactly the shape that blows past it: the tail's bytes divided by the
+	// tail's spread. Reported inflation is now bounded at
+	// MaxSteadyInflation whatever the stall's width, where an absolute floor
+	// only caught stalls whose tail happened to be narrow.
+	//
+	// A relative bound also costs nothing at the top of the range, which an
+	// absolute one did: a healthy 20 MiB/s provider moves 16 MiB in ~800ms
+	// and keeps a ~300ms steady window, comfortably inside the ratio. That
+	// band is the first one the parallel-stream rewrite unlocked, so giving
+	// it back to the lower-bound path would have undone the point of it.
+	steadyElapsed := windowEnd.Sub(windowStart)
+	representative := !windowStart.IsZero() &&
+		0 < steadyBytes &&
+		0 < steadyElapsed &&
+		totalElapsed <= time.Duration(MaxSteadyInflation)*steadyElapsed
+	if representative {
 		return Sample{
 			BytesPerSecond:  float64(steadyBytes) / steadyElapsed.Seconds(),
 			SampleByteCount: total,
@@ -498,18 +579,13 @@ func measure(
 		}, nil
 	}
 
-	// Every stream finished inside the warmup window. Rather than report no
-	// rate at all -- which would silently exclude the fastest providers, the
-	// ones most worth measuring -- fall back to the warmup-inclusive aggregate
-	// over the full transfer. That figure includes slow start, so it
-	// understates the link: it is a lower bound, and WarmupExcluded=false says
-	// so. Parallel streams make this rarer than it was (the threshold moves
-	// from ~10 MiB/s to ~32 MiB/s) but not impossible, and it must stay honest
-	// when it happens.
-	totalElapsed := windowEnd.Sub(start)
-	if totalElapsed <= 0 {
-		return Sample{SampleByteCount: total, Streams: StreamCount}, ErrNoSample
-	}
+	// Every stream finished inside the warmup window, or the post-warmup
+	// window was too small a fraction of the transfer to describe it. Rather
+	// than report no rate at all -- which would silently exclude the fastest
+	// providers, the ones most worth measuring -- fall back to the
+	// warmup-inclusive aggregate over the full transfer. That figure includes
+	// slow start, so it understates the link: it is a lower bound, and
+	// WarmupExcluded=false says so. It must stay honest when it happens.
 	return Sample{
 		BytesPerSecond:  float64(total) / totalElapsed.Seconds(),
 		SampleByteCount: total,
@@ -690,7 +766,7 @@ func (s *Sampler) sampleOne(
 	// The probe's remaining budget is checked before the reservation, not
 	// after: a reservation spends deployment-wide budget, and spending it on a
 	// measurement that cannot finish would charge the fleet for nothing.
-	if !hasTimeBudget(ctx) {
+	if !hasTimeBudget(ctx, s.timeout()) {
 		return Result{Target: target, Skip: SkipNoTime}
 	}
 
@@ -735,15 +811,36 @@ func (s *Sampler) timeout() time.Duration {
 
 // hasTimeBudget reports whether enough of the probe's deadline remains to take
 // a measurement that describes the provider rather than the deadline.
-func hasTimeBudget(ctx context.Context) bool {
+//
+// need is the measurement's own per-target cap, not a fixed floor. A floor
+// below that cap admits a measurement the parent deadline will cut short:
+// with 2s left and a 5s cap the reservation (16 MiB of deployment-wide byte
+// budget) is spent, readStream correctly classifies the parent's deadline as
+// a failure, and nothing is recorded -- the provider then logs
+// failed(context deadline exceeded) instead of the SkipNoTime this exact
+// situation has a dedicated string for.
+//
+// Note that the shipped wiring cannot currently reach that state: nothing on
+// cmd/egress-prober's path puts a deadline on the context it hands the
+// scheduler (-probe-timeout bounds the http.Client and the per-source
+// lookups, not the pass -- see the comment on egressHealthOptions), so
+// ctx.Deadline() reports none and this returns true regardless of need. The
+// guard is here for the day a per-provider deadline is added, which is
+// exactly when getting it wrong would start costing byte budget silently. If
+// that day comes, weigh requiring the FULL cap against skipping fast
+// providers that would have finished 16 MiB well inside it.
+func hasTimeBudget(ctx context.Context, need time.Duration) bool {
 	if ctx.Err() != nil {
 		return false
+	}
+	if need < MinTimeBudget {
+		need = MinTimeBudget
 	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		return true
 	}
-	return MinTimeBudget <= time.Until(deadline)
+	return need <= time.Until(deadline)
 }
 
 // Summary renders one provider's results as `operator=12.4MB/s cdn=11.8MB/s`,

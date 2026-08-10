@@ -115,6 +115,24 @@ func TestGeolocationPinsFailsOnAnUnreachableServer(t *testing.T) {
 	}
 }
 
+// TestGeolocationPinsPreservesTheTransportCause: the transport error is
+// wrapped with %w so a caller triaging a shutdown can still tell a cancelled
+// startup from a server that is genuinely unreachable. Wrapped with %s the
+// cause was flattened to text and errors.Is stopped working, while the 401
+// path beside it kept its sentinel.
+func TestGeolocationPinsPreservesTheTransportCause(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c := &Client{ServerURL: "http://127.0.0.1:1", OperatorSecret: "s3cret"}
+	_, err := c.GeolocationPins(ctx)
+	if !errors.Is(err, ErrPinsUnavailable) {
+		t.Fatalf("err = %v, want it to wrap ErrPinsUnavailable", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want it to also wrap context.Canceled", err)
+	}
+}
+
 // A body of `null` decodes into a nil map with no error. Returning that as a
 // successful fetch would hand the caller an empty set that looks fetched, so
 // the check belongs here rather than in every caller.

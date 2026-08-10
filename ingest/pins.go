@@ -63,7 +63,10 @@ func (c *Client) GeolocationPins(ctx context.Context) (map[string]GeolocationPin
 
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrPinsUnavailable, err)
+		// %w, not %s: a caller triaging a startup or shutdown needs
+		// errors.Is(err, context.Canceled / DeadlineExceeded) to survive this
+		// wrapping, the same way the 401 case below preserves its sentinel.
+		return nil, fmt.Errorf("%w: %w", ErrPinsUnavailable, err)
 	}
 	defer resp.Body.Close()
 

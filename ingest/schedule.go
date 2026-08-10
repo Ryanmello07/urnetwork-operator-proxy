@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // ErrDueUnsupported reports that the server has no due endpoint (404). The
@@ -37,6 +38,69 @@ var ErrUnauthorized = errors.New("ingest: the server rejected the operator secre
 // provider straight back at the head of the due queue -- the starvation the
 // endpoint exists to prevent -- so a long class is truncated rather than sent.
 const MaxProbeFailureLen = 64
+
+// MaxNameListLen bounds each of the two failure-name lists in an
+// egress-health submission. Unlike probe_failure the server's column width
+// here is unconfirmed, so this is not a mirror of a known limit: it is the
+// same defensive posture applied to the same kind of field. A heavy-failure
+// run names ~26 destinations (400+ characters), and a submission rejected
+// for length is a health signal silently dropped after one deduplicated log
+// line, because the prober submits these fire-and-forget.
+const MaxNameListLen = 512
+
+// truncateUTF8 cuts s to at most max BYTES without splitting a rune.
+// Truncating on a byte boundary can leave a partial encoding that json
+// marshals as U+FFFD; every current caller passes ASCII, which is exactly
+// why the failure would be silent when one eventually does not.
+func truncateUTF8(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
+}
+
+// truncateNameList cuts a comma-separated list to at most max bytes on an
+// ELEMENT boundary, and appends a count of what it dropped.
+//
+// Cutting mid-element is worse than cutting fewer elements: a list ending
+// "...,kernel-org-mirror" names a destination that does not exist, and is
+// indistinguishable from one that does, so a query for providers failing that
+// destination silently returns nothing. The dropped count matters for the
+// same reason -- a blackholing provider under -egress-health-all names ~131
+// destinations in ~1.4 KB, so most of the list is dropped, and a reader must
+// be able to tell a short list from a truncated one.
+func truncateNameList(names []string, max int) string {
+	joined := strings.Join(names, ",")
+	if len(joined) <= max {
+		return joined
+	}
+	kept, used := 0, 0
+	for _, name := range names {
+		width := len(name)
+		if 0 < kept {
+			width++ // the separating comma
+		}
+		// Leave room for the "+N more" marker, which is what tells a reader
+		// the list is partial.
+		if max-len("…+999 more") < used+width {
+			break
+		}
+		used += width
+		kept++
+	}
+	if kept == 0 {
+		// One name alone exceeds the budget: keep a rune-safe prefix rather
+		// than nothing, and let the marker say the rest was dropped.
+		return truncateUTF8(joined, max-len("…+999 more")) + fmt.Sprintf("…+%d more", len(names))
+	}
+	return strings.Join(names[:kept], ",") + fmt.Sprintf("…+%d more", len(names)-kept)
+}
 
 // dueURL resolves the due endpoint: the explicit DueURL when set, otherwise
 // derived from ServerURL.
@@ -130,9 +194,7 @@ type attemptBody struct {
 // and reporting unconditionally means there is no path through the prober that
 // forgets.
 func (c *Client) ReportAttempt(ctx context.Context, providerClientId string, probeFailure string) error {
-	if MaxProbeFailureLen < len(probeFailure) {
-		probeFailure = probeFailure[:MaxProbeFailureLen]
-	}
+	probeFailure = truncateUTF8(probeFailure, MaxProbeFailureLen)
 
 	buf, err := json.Marshal(attemptBody{ClientId: providerClientId, ProbeFailure: probeFailure})
 	if err != nil {

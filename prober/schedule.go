@@ -105,6 +105,13 @@ func (s *Scheduler) prune() {
 // visible via the returned Summary.
 func (s *Scheduler) Run(ctx context.Context, providerClientIds []string) Summary {
 	s.prune()
+	// Re-arm the prober's per-pass error-log gates (and report what the last
+	// pass withheld). Their cap is only safe because every pass starts clean:
+	// a permanent cap would let ten transient errors silence a later fault
+	// that breaks every provider.
+	if s.Prober != nil {
+		s.Prober.ResetErrorLogging()
+	}
 
 	concurrency := s.Concurrency
 	if concurrency < 1 {
@@ -119,16 +126,57 @@ func (s *Scheduler) Run(ctx context.Context, providerClientIds []string) Summary
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 
-	for _, id := range providerClientIds {
-		if s.recentlyProbed(id) {
+	// recentlyProbed only becomes true once a probe COMPLETES, so a duplicate
+	// id inside one batch would otherwise open two tunnels to the same
+	// provider simultaneously and pay the contract cost twice. The enumeration
+	// path de-duplicates before it gets here; the due path is whatever the
+	// server sent.
+	seen := map[string]bool{}
+
+	for i, id := range providerClientIds {
+		if seen[id] {
 			mu.Lock()
 			sum.Skipped++
 			mu.Unlock()
 			continue
 		}
+		seen[id] = true
+
+		// A dead context stops the pass here, before any further tunnel is
+		// built. providertunnel.Open constructs a full netstack before it
+		// ever consults the context, so without this check every remaining
+		// provider in the batch would get a real tunnel built and torn down
+		// just so its probe could fail instantly -- a 500-provider batch
+		// reporting hundreds of spurious failures (and, in single-shot mode,
+		// exiting non-zero blaming the providers) when the truth is that the
+		// operator sent SIGTERM. The explicit Err check runs first because
+		// select chooses randomly among ready cases: with the semaphore free
+		// AND the context dead, the select below may still pick the
+		// semaphore.
+		cancelled := ctx.Err() != nil
+		if !cancelled {
+			if s.recentlyProbed(id) {
+				mu.Lock()
+				sum.Skipped++
+				mu.Unlock()
+				continue
+			}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				cancelled = true
+			}
+		}
+		if cancelled {
+			remaining := len(providerClientIds) - i
+			mu.Lock()
+			sum.Skipped += remaining
+			mu.Unlock()
+			log.Printf("prober: run cancelled (%v); skipping the %d remaining provider(s) in this pass", ctx.Err(), remaining)
+			break
+		}
 
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(id string) {
 			defer wg.Done()
 			defer func() { <-sem }()

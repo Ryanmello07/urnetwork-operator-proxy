@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
+	"github.com/urnetwork/operator-proxy/geolocate"
 )
 
 // stubAttempts records the failure class reported for each probe, which is the

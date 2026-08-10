@@ -1,4 +1,4 @@
-# urnetwork-operator-proxy
+# operator-proxy
 
 Operator tooling for urnetwork network operators.
 
@@ -19,13 +19,23 @@ a consensus, and submits the result to the operator's server.
   provider on the path cannot forge a location.
 - Country is the trusted output. City is recorded only when at least two sources
   agree (free sources disagree on city often), otherwise the location is
-  country-granular.
+  country-granular. The same two-source bar applies to the ASN/Org and to the
+  `hosting`/`proxy`/`mobile` flags: anything only one source asserts is left
+  unset, so a single bad api cannot mark the whole fleet.
 - A provider that refuses to carry the probe is simply not located; the server
   falls back to its own database.
 
 ### Build
 
+This module resolves `github.com/urnetwork/connect` and
+`github.com/urnetwork/glog` through `replace ../` directives, so a lone
+checkout does **not** build — it fails with a `missing go.sum entry` that names
+nothing about the real cause. Check the siblings out beside it, under exactly
+these directory names:
+
 ```bash
+git clone https://github.com/urnetwork/connect.git ../connect
+git clone https://github.com/urnetwork/glog.git ../glog
 go build ./cmd/egress-prober
 ```
 
@@ -238,9 +248,14 @@ recorded it clean.
   `cloud.google.com`, `apnews.com`, `www.baidu.com`; earlier, jsDelivr and
   BootstrapCDN), so the `io.LimitReader` cap — not the header — is what actually
   bounds the cost. A full run against a completely unresponsive provider costs
-  at most one extra `-probe-timeout` of wall clock per provider (the whole run
-  shares that one budget across six concurrent rounds), so a blackholing
-  provider costs about 2× `-probe-timeout` in total rather than 4×.
+  at most one extra `-probe-timeout` of wall clock per provider — the whole run
+  shares that one budget, divided across however many concurrent rounds the run
+  actually takes (5 rounds of 6 for a sample, 14 rounds of 10 for the full
+  table under `-egress-health-all`) — so a blackholing provider costs about
+  2× `-probe-timeout` in total rather than 4×. The per-request slice is
+  therefore shorter under `-egress-health-all`; deriving it from the sampled
+  round count and then spending it over the full table's rounds is what made
+  the shipped default draw 2.8× its stated budget.
 - The health destinations are reached **unpinned** but under ordinary WebPKI
   verification. Pinning 140 leaves that rotate on 140 schedules would turn every
   routine certificate rotation into a failure indistinguishable from the
@@ -316,6 +331,28 @@ warmup-inclusive rate instead, flagged `(lower-bound)` — reporting nothing
 there would exclude exactly the fastest providers, which are the ones most
 worth measuring. Parallel streams make that case rarer than the single-stream
 probe's ~10 MiB/s threshold, not impossible.
+
+The steady window must also cover at least a quarter of the transfer's wall
+clock, or the figure falls back to the same lower bound. Discarding the warmup
+can only raise a rate by `total ÷ steady` elapsed — the case where the warmup
+carried nothing — so bounding that ratio bounds how far a "steady" figure can
+exceed the whole-transfer aggregate, which is the physical ceiling for bytes
+that demonstrably moved in that wall clock. Without it, a provider whose
+delivery stalls across the 500 ms boundary and then bursts (a windowed tunnel
+transport refilling just after it) has the burst's bytes divided by the burst's
+own spread: measured at **17× the true aggregate**, published as a steady
+figure rather than a bound. It is a ratio and not a fixed floor deliberately:
+the ratio puts the steady-path ceiling at ~24 MiB/s (measured ~21), where a
+fixed 500 ms floor would have put it at ~16 and given back most of the band the
+parallel-stream rewrite exists to have unlocked. Above that ceiling the
+lower-bound figure is reported. The old ~32 MiB/s ceiling was partly illusory —
+at 31 MiB/s the steady window is already under 20 ms, and 16 MiB divided by a
+window that thin is the inflation this bound exists to stop.
+
+Note that `(lower-bound)` is visible only in the prober's log: the ingest body
+carries the rate and the byte count, so the server currently stores a
+lower-bound figure indistinguishably from a steady one. Closing that needs a
+server-side field.
 
 **The two figures are stored and logged separately and are never averaged.**
 That is the entire point of having two: a provider that prioritises one path

@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -24,7 +27,24 @@ var (
 	buildOnce sync.Once
 	builtBin  string
 	buildErr  error
+	buildDir  string
 )
+
+// TestMain removes the directory holding the compiled prober. buildProber
+// deliberately does not use t.TempDir (the binary is shared across tests and
+// must outlive the first test's cleanup), so without this every run of this
+// package leaves a ~36 MB binary behind in the system temp directory.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if buildDir != "" {
+		// Reported rather than discarded: on Windows a still-locked .exe leaves
+		// the ~36 MB directory behind, the exact thing this cleanup prevents.
+		if err := os.RemoveAll(buildDir); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not remove the test build dir %s: %s\n", buildDir, err)
+		}
+	}
+	os.Exit(code)
+}
 
 // buildProber compiles the CLI once per test binary and returns the path to
 // the executable.
@@ -50,7 +70,13 @@ func buildProber(t *testing.T) string {
 			buildErr = err
 			return
 		}
+		// Windows exec refuses an extensionless path (LookPath only tries
+		// PATHEXT extensions), so the binary must be named with .exe there.
+		buildDir = dir
 		bin := filepath.Join(dir, "egress-prober")
+		if runtime.GOOS == "windows" {
+			bin += ".exe"
+		}
 		out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput()
 		if err != nil {
 			buildErr = err
@@ -74,7 +100,14 @@ func runProberWithSecretsInEnv(t *testing.T, args ...string) string {
 		"UR_PROBER_BY_JWT="+testJwtSecret,
 		"UR_OPERATOR_SECRET="+testOperatorSecret,
 	)
-	out, _ := cmd.CombinedOutput() // a non-zero exit is expected in these tests
+	out, err := cmd.CombinedOutput()
+	// A non-zero exit is expected in these tests, but a process that never
+	// ran is not: swallowing that error made the content assertions below
+	// fail against empty output instead of naming the real problem.
+	var exitErr *exec.ExitError
+	if err != nil && !errors.As(err, &exitErr) {
+		t.Fatalf("running the prober: %s", err)
+	}
 	return string(out)
 }
 
@@ -133,6 +166,66 @@ func TestMissingFlagUsageDoesNotPrintSecrets(t *testing.T) {
 	}
 	if strings.Contains(missingLine, "-by-jwt") || strings.Contains(missingLine, "-operator-secret") {
 		t.Errorf("missing-flag line %q reports a secret flag as missing, but both were supplied via the environment; the env fallback is broken", missingLine)
+	}
+}
+
+// TestListProvidersErrorsWhenEveryLocationFetchFails: the per-location skip
+// exists so one hiccup out of hundreds of locations cannot abort a pass, but
+// when locations exist and EVERY find-providers2 call failed the enumeration
+// accomplished nothing -- and returning ([], nil) there flowed into the
+// "nothing to do" exit-0 carve-out, exactly the silent success the exit-code
+// contract promises an external cron will never see. The two endpoints can
+// genuinely diverge: provider-locations is GET with no auth while
+// find-providers2 is an authenticated POST, so a broken route or a revoked
+// jwt fails only the second.
+func TestListProvidersErrorsWhenEveryLocationFetchFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/network/provider-locations":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"locations":[{"location_id":"loc-1"},{"location_id":"loc-2"}]}`))
+		default:
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+
+	ids, err := listProviders(context.Background(), srv.URL, "jwt")
+	if err == nil {
+		t.Fatalf("listProviders = %v, <nil>: locations exist but every find-providers2 call failed, and that must be an error, not an empty success", ids)
+	}
+}
+
+// TestListProvidersKeepsThePassWhenOneLocationFails: the resilience the skip
+// was written for must survive the all-failed check above -- a partial
+// enumeration is still the better outcome.
+func TestListProvidersKeepsThePassWhenOneLocationFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/network/provider-locations":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"locations":[{"location_id":"loc-bad"},{"location_id":"loc-good"}]}`))
+		default:
+			var got struct {
+				Specs []map[string]string `json:"specs"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&got)
+			if len(got.Specs) == 1 && got.Specs[0]["location_id"] == "loc-bad" {
+				http.Error(w, "boom", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"providers":[{"client_id":"p-1"}]}`))
+		}
+	}))
+	defer srv.Close()
+
+	ids, err := listProviders(context.Background(), srv.URL, "jwt")
+	if err != nil {
+		t.Fatalf("listProviders: %s; one failed location out of two must not abort the pass", err)
+	}
+	if len(ids) != 1 || ids[0] != "p-1" {
+		t.Fatalf("listProviders = %v, want [p-1]", ids)
 	}
 }
 

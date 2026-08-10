@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
+	"github.com/urnetwork/operator-proxy/geolocate"
 )
 
 // TestSubmitPostsContractShape locks down the wire shape of submitBody
@@ -202,6 +202,28 @@ func TestSubmitSurfacesRejection(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("a 400 must surface as an error")
+	}
+}
+
+// TestSubmitMaps401ToErrUnauthorized: every other method on this client maps
+// 401, and the CLI keys its remediation advice ("check -operator-secret
+// against ingest_secret") off the sentinel. Submit was the one that did not,
+// and the gap is reachable: against a server without the due endpoint the
+// prober falls back to enumeration, which authenticates with the byJwt, so a
+// wrong operator secret let the whole pass proceed and surfaced only as a
+// per-provider "status 401" classified submit_failed.
+func TestSubmitMaps401ToErrUnauthorized(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	c := &Client{ServerURL: srv.URL, OperatorSecret: "wrong", HTTP: srv.Client()}
+	err := c.Submit(context.Background(), "019f8835-158d-6fd8-e9dd-fd0e4c6d6792", &geolocate.ConsensusLocation{
+		CountryCode: "us", Country: "United States", CountryConfident: true, ProbedAt: time.Now().UTC(),
+	})
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("err = %v, want it to wrap ErrUnauthorized", err)
 	}
 }
 

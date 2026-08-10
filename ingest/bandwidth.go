@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/bandwidth"
+	"github.com/urnetwork/operator-proxy/bandwidth"
 )
 
 type reserveBandwidthBody struct {

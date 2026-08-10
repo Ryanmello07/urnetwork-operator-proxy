@@ -1590,7 +1590,8 @@ func TestAllDestinationsRunsEveryDestination(t *testing.T) {
 	})
 
 	perRequest := 50 * time.Millisecond
-	budget, concurrency := BudgetForAllDestinations(perRequest)
+	concurrency := AllConcurrency
+	budget := time.Duration(RoundsForAllDestinations()) * perRequest
 	res, err := Check(context.Background(), &http.Client{Transport: rt}, Options{
 		AllDestinations:   true,
 		Budget:            budget,

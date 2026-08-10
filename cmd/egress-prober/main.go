@@ -30,6 +30,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"sort"
@@ -41,13 +42,13 @@ import (
 	gojwt "github.com/golang-jwt/jwt/v5"
 	"github.com/urnetwork/connect"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/bandwidth"
-	"github.com/urnetwork/urnetwork-operator-proxy/confinement"
-	"github.com/urnetwork/urnetwork-operator-proxy/egresshealth"
-	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
-	"github.com/urnetwork/urnetwork-operator-proxy/ingest"
-	"github.com/urnetwork/urnetwork-operator-proxy/prober"
-	"github.com/urnetwork/urnetwork-operator-proxy/providertunnel"
+	"github.com/urnetwork/operator-proxy/bandwidth"
+	"github.com/urnetwork/operator-proxy/confinement"
+	"github.com/urnetwork/operator-proxy/egresshealth"
+	"github.com/urnetwork/operator-proxy/geolocate"
+	"github.com/urnetwork/operator-proxy/ingest"
+	"github.com/urnetwork/operator-proxy/prober"
+	"github.com/urnetwork/operator-proxy/providertunnel"
 )
 
 func main() {
@@ -71,7 +72,7 @@ func main() {
 	confinementTimeout := flag.Duration("confinement-timeout", 3*time.Second, "per-address deadline for the startup confinement self-check; a timeout counts as blocked. Must be at least "+confinement.MinTimeout.String())
 	var confinementAddrs addressList
 	publicAPIURL := flag.String("public-api-url", "", "the address the api answers on FROM THE PUBLIC INTERNET, used as the operator bandwidth target. This is not -api-url: control-plane calls go prober -> api directly (an internal name on docker), but the bandwidth target travels prober -> platform -> provider -> internet -> api, so it needs the public address. Empty drops the operator target and measures the cdn only")
-	egressHealthAll := flag.Bool("egress-health-all", true, "run EVERY destination in the egress-health table instead of a random sample. Default true: the full table is also the only way this exercises CONCURRENCY, since a 30-destination sample never asks the provider to carry the full parallel load a real client would. Setting it false restores sampling, which is cheaper and keeps the destination list unpredictable, but no longer tests that dimension")
+	egressHealthAll := flag.Bool("egress-health-all", false, "run EVERY destination in the egress-health table instead of a random sample. The full table is the only way this exercises CONCURRENCY, since a sample never asks the provider to carry the full parallel load a real client would -- but the whole health run must still fit inside one -probe-timeout, and spreading it over the full table's rounds leaves each request far less than the cold-tunnel floor unless -probe-timeout is raised to match. The prober refuses to start rather than run below that floor and charge honest providers with cold-start timeouts, so setting this requires a longer -probe-timeout; it names the value")
 	flag.Var(&confinementAddrs, "confinement-address", "ip:port the confinement self-check should dial instead of resolving the probe hosts; repeatable. For a jail where dns is legitimately blocked: supply the address of every geolocation source AND every egress-health destination here and the check stays real. The host part must be an ip literal, not a name")
 	dueURL := flag.String("due-url", "", "url of the server's due-provider endpoint; empty derives <api-url>/network/provider-egress-due")
 	dueLimit := flag.Int("due-limit", 100, "how many due providers to ask the server for per pass; the server clamps this to its own maximum (500)")
@@ -164,6 +165,36 @@ func main() {
 		os.Exit(2)
 	}
 
+	// The health run has to fit inside one -probe-timeout AND leave each
+	// request at least the cold-tunnel floor. Those two are in tension: the
+	// full table takes 14 rounds at its raised concurrency, so a 60s probe
+	// timeout leaves 4.3s per request -- below the 6s this package's own
+	// DefaultConcurrency comment rejects as "cold-start timeouts charged to
+	// providers as blackholes", and well below the 10s floor. Rather than
+	// silently manufacture that, refuse to start and name the value that
+	// would work. A sampled run at the default clears the floor comfortably
+	// (12s), which is why sampling is the default.
+	if opts := egressHealthOptions(*probeTimeout, *egressHealthAll); opts.PerRequestTimeout < egresshealth.DefaultPerRequestTimeout {
+		need := time.Duration(egressHealthRounds(*egressHealthAll)) * egresshealth.DefaultPerRequestTimeout
+		fmt.Fprintf(os.Stderr,
+			"egress-prober: -probe-timeout %s leaves %s per egress-health request, below the %s cold-tunnel floor;\n"+
+				"  every request would be at risk of timing out and being recorded as a provider failure.\n"+
+				"  Either raise -probe-timeout to at least %s, or drop -egress-health-all to sample the table instead.\n\n",
+			*probeTimeout, opts.PerRequestTimeout.Round(time.Millisecond), egresshealth.DefaultPerRequestTimeout, need)
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	// A negative cache ttl makes recentlyProbed always false, silently
+	// disabling the enumeration cache. Every other duration flag is validated;
+	// this one degraded quietly instead, which is the opposite of how the rest
+	// of this startup path treats a value it cannot honour.
+	if *cacheTTL < 0 {
+		fmt.Fprintf(os.Stderr, "egress-prober: -cache-ttl must not be negative (got %s); use 0 to disable the enumeration cache\n\n", *cacheTTL)
+		flag.Usage()
+		os.Exit(2)
+	}
+
 	// A non-positive bandwidth timeout would hand context.WithTimeout an
 	// already-expired deadline, so every measurement would fail instantly and
 	// still have spent a byte reservation getting there.
@@ -175,13 +206,20 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// The first signal cancels ctx and begins a graceful wind-down (the
+	// scheduler stops spawning and the in-flight probes fail fast). Undo the
+	// signal capture at that point rather than at exit: NotifyContext keeps
+	// swallowing signals for as long as it is registered, so without this a
+	// second Ctrl-C during the wind-down would be silently discarded and the
+	// operator could not force-quit a probe stuck in teardown.
+	context.AfterFunc(ctx, stop)
 
 	// The confinement self-check runs before anything else touches the
 	// network. See checkConfinement.
 	if *skipConfinementCheck {
 		log.Printf("egress-prober: WARNING -skip-confinement-check is set: the startup confinement self-check is DISABLED.")
 		log.Printf("egress-prober: WARNING if this host can reach a geolocation api directly, a probe that fails to tunnel records the OPERATOR's own location for the provider and exposes the operator's address to third-party apis. Do not set this on the operator's deployment.")
-	} else if err := checkConfinement(ctx, (&net.Dialer{}).DialContext, net.DefaultResolver.LookupHost, confinementAddrs, *confinementTimeout); err != nil {
+	} else if err := checkConfinement(ctx, (&net.Dialer{}).DialContext, net.DefaultResolver.LookupHost, confinementAddrs, *confinementTimeout, bandwidthProbeHosts(*skipBandwidth, *bandwidthCDNURL)...); err != nil {
 		log.Printf("egress-prober: confinement self-check failed: %s", err)
 		// ErrNoEvidence is not a claim that this host is unconfined -- it is
 		// the check saying it could not find out -- so the "go and confine it"
@@ -310,7 +348,10 @@ func main() {
 		providers, serverDriven, err := selectProviders(ctx, operator, *dueLimit, *apiURL, *byJwt)
 		if err != nil {
 			log.Printf("select providers: %s", err)
-			if *interval == 0 {
+			// Same reasoning as the pass result below: a fetch that failed
+			// because the operator interrupted the process is a shutdown, not
+			// a broken deployment, and must not exit non-zero.
+			if *interval == 0 && ctx.Err() == nil {
 				log.Printf("egress-prober: single-shot pass could not fetch the provider list; exiting non-zero")
 				os.Exit(1)
 			}
@@ -322,9 +363,22 @@ func main() {
 			sum := scheduler.Run(ctx, providers)
 			log.Printf("pass: server_driven=%t attempted=%d submitted=%d skipped=%d failed=%d",
 				serverDriven, sum.Attempted, sum.Submitted, sum.Skipped, sum.Failed)
-			if *interval == 0 && sum.Submitted == 0 && 0 < sum.Failed {
-				log.Printf("egress-prober: single-shot pass submitted nothing and recorded %d failure(s); exiting non-zero", sum.Failed)
-				os.Exit(1)
+			// A pass cut short by SIGTERM is not a pass that failed. The
+			// scheduler stops spawning on cancellation, but the probes
+			// already in flight fail on the dead context and land in
+			// sum.Failed -- so without this guard an operator pressing Ctrl-C
+			// got exit 1 and a message blaming the providers, which is the
+			// same misdiagnosis the cancellation fix was written to remove.
+			// The shutdown is logged instead and the exit stays 0: nothing
+			// about the fleet was learned either way.
+			if *interval == 0 {
+				switch {
+				case ctx.Err() != nil:
+					log.Printf("egress-prober: single-shot pass interrupted (%v) after %d submitted, %d failed; exiting zero", ctx.Err(), sum.Submitted, sum.Failed)
+				case sum.Submitted == 0 && 0 < sum.Failed:
+					log.Printf("egress-prober: single-shot pass submitted nothing and recorded %d failure(s); exiting non-zero", sum.Failed)
+					os.Exit(1)
+				}
 			}
 		}
 		if *interval == 0 {
@@ -409,12 +463,7 @@ func newProber(
 		// Its budget is derived from -probe-timeout: see egressHealthOptions for
 		// the arithmetic and for what a full pass therefore costs.
 		Health: func(ctx context.Context, client *http.Client) (*egresshealth.Result, error) {
-			opts := egressHealthOptions(probeTimeout)
-			if allDestinations {
-				opts.AllDestinations = true
-				opts.Budget, opts.Concurrency = egresshealth.BudgetForAllDestinations(opts.PerRequestTimeout)
-			}
-			return egresshealth.Check(ctx, client, opts)
+			return egresshealth.Check(ctx, client, egressHealthOptions(probeTimeout, allDestinations))
 		},
 		Submit:   operator,
 		Attempts: operator,
@@ -468,15 +517,49 @@ func newProber(
 // cold-start the geolocation cap is sized for. If that turns out to be wrong in
 // the field it shows up as a specific, recognisable shape: timeouts spread
 // evenly across all classes, on providers whose geolocation succeeded.
-func egressHealthOptions(probeTimeout time.Duration) egresshealth.Options {
-	// SamplePerRun, never len(Destinations()): a run fetches a random sample of
-	// the table, not the table. Sizing the rounds off the full 140 entries would
-	// divide one probe timeout by 24 and hand each request a couple of seconds
-	// over a cold tunnel -- cold-start timeouts, charged to providers as
-	// blackholes, on a run that was only ever going to make 30 requests.
-	rounds := (egresshealth.SamplePerRun() + egresshealth.DefaultConcurrency - 1) / egresshealth.DefaultConcurrency
-	if rounds < 1 {
-		rounds = 1
+// allDestinations selects the geometry of the run being sized. Both paths get
+// the same one -probe-timeout budget; they differ only in how many rounds that
+// budget is divided across, because a full-table run raises concurrency and
+// still needs many more rounds than a sample.
+//
+// Deriving the per-request bound from one geometry and then applying it to the
+// other is precisely the defect this signature exists to prevent: sizing
+// per-request off the 5 sampled rounds and then letting the full table's 14
+// rounds multiply it drew 2.8x -probe-timeout at the shipped default, so a
+// blackholing provider cost ~3.8x per probe -- the regression the arithmetic
+// above is written to avoid, arriving through the default configuration.
+// egressHealthRounds is how many sequential rounds a run takes, which is what
+// one -probe-timeout gets divided across. It is the single place the two
+// geometries are chosen, so the budget check at startup and the options the
+// run actually uses can never disagree.
+func egressHealthRounds(allDestinations bool) int {
+	// SamplePerRun, never len(Destinations()), for a sampled run: it fetches a
+	// random sample of the table, not the table. Sizing the rounds off the
+	// full table would divide one probe timeout by 24 and hand each request a
+	// couple of seconds over a cold tunnel -- cold-start timeouts, charged to
+	// providers as blackholes, on a run that was only ever going to make 30
+	// requests.
+	requests, concurrency := egresshealth.SamplePerRun(), egresshealth.DefaultConcurrency
+	if allDestinations {
+		requests, concurrency = len(egresshealth.Destinations()), egresshealth.AllConcurrency
+	}
+	if rounds := (requests + concurrency - 1) / concurrency; rounds > 1 {
+		return rounds
+	}
+	return 1
+}
+
+func egressHealthOptions(probeTimeout time.Duration, allDestinations bool) egresshealth.Options {
+	// SamplePerRun, never len(Destinations()), for a sampled run: it fetches a
+	// random sample of the table, not the table. Sizing the rounds off the full
+	// 139 entries would divide one probe timeout by 24 and hand each request a
+	// couple of seconds over a cold tunnel -- cold-start timeouts, charged to
+	// providers as blackholes, on a run that was only ever going to make 30
+	// requests.
+	rounds := egressHealthRounds(allDestinations)
+	concurrency := egresshealth.DefaultConcurrency
+	if allDestinations {
+		concurrency = egresshealth.AllConcurrency
 	}
 	perRequest := probeTimeout / time.Duration(rounds)
 	if perRequest <= 0 {
@@ -488,6 +571,8 @@ func egressHealthOptions(probeTimeout time.Duration) egresshealth.Options {
 	return egresshealth.Options{
 		PerRequestTimeout: perRequest,
 		Budget:            probeTimeout,
+		AllDestinations:   allDestinations,
+		Concurrency:       concurrency,
 	}
 }
 
@@ -555,9 +640,14 @@ func selectProviders(ctx context.Context, due dueLister, limit int, apiURL strin
 const confinementPort = "443"
 
 // probeHosts is every third-party host this process reaches through a tunnel:
-// the pinned geolocation sources plus the egress-health destinations. It is
-// what the confinement self-check must prove unreachable directly, and what an
+// the pinned geolocation sources, the egress-health destinations, and any
+// extra hosts the caller names -- in practice the bandwidth CDN target, which
+// is third-party and configurable via -bandwidth-cdn-url. It is what the
+// confinement self-check must prove unreachable directly, and what an
 // operator translates into -confinement-address entries.
+//
+// The operator's OWN api host is deliberately absent: it is not third-party,
+// and a deployment may legitimately allow the prober to reach it directly.
 //
 // Both lists are DERIVED from the tables that own them (geolocate.SourceHosts,
 // egresshealth.DestinationHosts) for the reason spelled out on each: a
@@ -570,10 +660,12 @@ const confinementPort = "443"
 // is worse in one specific way: it would pass -- the operator's own host can
 // obviously reach Cloudflare and Amazon -- and so would certify a blackholing
 // provider as healthy, which is the exact inversion of the signal.
-func probeHosts() []string {
+func probeHosts(extra ...string) []string {
 	seen := map[string]bool{}
 	var hosts []string
-	for _, h := range append(geolocate.SourceHosts(), egresshealth.DestinationHosts()...) {
+	all := append(geolocate.SourceHosts(), egresshealth.DestinationHosts()...)
+	all = append(all, extra...)
+	for _, h := range all {
 		if h == "" || seen[h] {
 			continue
 		}
@@ -581,6 +673,23 @@ func probeHosts() []string {
 		hosts = append(hosts, h)
 	}
 	return hosts
+}
+
+// bandwidthProbeHosts returns the bandwidth CDN target's host, if the
+// bandwidth probe will run at all. It is a third-party host reached through
+// the tunnel, so the confinement check covers it like any other; the operator
+// target is deliberately excluded, being the operator's own api.
+func bandwidthProbeHosts(skipBandwidth bool, cdnURL string) []string {
+	if skipBandwidth {
+		return nil
+	}
+	u, err := url.Parse(cdnURL)
+	if err != nil || u.Hostname() == "" {
+		// A malformed -bandwidth-cdn-url is caught where it is used; the
+		// self-check simply has nothing to add for it here.
+		return nil
+	}
+	return []string{u.Hostname()}
 }
 
 // addressList collects the repeatable -confinement-address flag.
@@ -645,8 +754,8 @@ func (a *addressList) Set(v string) error {
 // that dial fails at resolution and proves nothing -- and when only some of
 // them resolve, the shortfall is logged as a WARNING so a degraded check never
 // reads like a complete one.
-func checkConfinement(ctx context.Context, dial confinement.DialFunc, lookup confinement.LookupFunc, explicitAddrs []string, timeout time.Duration) error {
-	hosts := probeHosts()
+func checkConfinement(ctx context.Context, dial confinement.DialFunc, lookup confinement.LookupFunc, explicitAddrs []string, timeout time.Duration, extraHosts ...string) error {
+	hosts := probeHosts(extraHosts...)
 
 	var addrs, unresolved []string
 	if len(explicitAddrs) > 0 {
@@ -924,15 +1033,29 @@ func listProviders(ctx context.Context, apiURL string, byJwt string) ([]string, 
 	}
 
 	seen := make(map[string]struct{})
+	succeeded := 0
+	var lastErr error
 	for _, locationId := range locationIds {
 		clientIds, err := findProvidersAtLocation(ctx, httpClient, apiURL, byJwt, locationId)
 		if err != nil {
 			log.Printf("egress-prober: find-providers2 for location %s: %s (skipping this location for this pass)", locationId, err)
+			lastErr = err
 			continue
 		}
+		succeeded++
 		for _, id := range clientIds {
 			seen[id] = struct{}{}
 		}
+	}
+	// Skipping SOME locations is resilience; skipping ALL of them is a
+	// failed enumeration wearing a success return. The two endpoints can
+	// genuinely diverge -- provider-locations is unauthenticated GET,
+	// find-providers2 is an authenticated POST -- and an empty nil-error
+	// result here flows into the "nothing to do (no providers, no failures)"
+	// exit-0 path, which the exit-code contract explicitly promises an
+	// external cron will never see from a pass that accomplished nothing.
+	if len(locationIds) > 0 && succeeded == 0 {
+		return nil, fmt.Errorf("find-providers2 failed for all %d locations (last: %w)", len(locationIds), lastErr)
 	}
 
 	ids := make([]string, 0, len(seen))

@@ -62,6 +62,21 @@ type SourceResult struct {
 	Hosting     bool
 	Proxy       bool
 	Mobile      bool
+	// Supports records which net-type flags this source's parser can populate
+	// AT ALL, as opposed to which it reported false for. Consensus needs the
+	// difference: requiring two agreeing votes for a flag only one source can
+	// ever express makes it permanently false, which is a silent loss rather
+	// than a conservative default. See consensus.
+	Supports FlagSupport
+}
+
+// FlagSupport marks which net-type flags a source is capable of reporting.
+// Set by the parser, never by a response: a source that omits a field is
+// not the same as a source that cannot carry it.
+type FlagSupport struct {
+	Hosting bool
+	Proxy   bool
+	Mobile  bool
 }
 
 // ConsensusLocation is the cross-checked result across sources.

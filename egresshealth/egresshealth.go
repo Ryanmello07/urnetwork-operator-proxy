@@ -415,7 +415,7 @@ const (
 // It also demonstrably changes what ClassReputation measures -- see that
 // class's comment, where the same host got 403 under curl's default agent and
 // 206 under this one.
-const UserAgent = "urnetwork-egress-prober/0.1 (+https://github.com/urnetwork/urnetwork-operator-proxy; operator egress health probe)"
+const UserAgent = "urnetwork-egress-prober/0.1 (+https://github.com/urnetwork/operator-proxy; operator egress health probe)"
 
 // destinations is the production table: the owner's curated 159-row list,
 // minus the rows that cannot be checked over an *http.Client, plus the seven
@@ -1787,9 +1787,13 @@ type Options struct {
 	//      sampling is what makes that impractical, so scheduled production
 	//      passes must keep sampling; this is for on-demand inspection.
 	//
-	// Budget and Concurrency must be raised to match, or the run will be cut
-	// off mid-table and destinations will fail for a reason that has nothing
-	// to do with the provider. See BudgetForAllDestinations.
+	// Concurrency must be raised to AllConcurrency to match, and the
+	// per-request timeout sized against RoundsForAllDestinations, or the run
+	// is cut off mid-table and destinations fail for a reason that has
+	// nothing to do with the provider. Note the direction cmd/egress-prober
+	// takes: it holds the whole-run Budget at one -probe-timeout and lowers
+	// the per-request timeout, rather than growing the budget -- growing it
+	// is how the health check came to cost 2.8x its stated budget.
 	AllDestinations bool
 }
 
@@ -1882,9 +1886,11 @@ var ErrUnsupported = errors.New("egresshealth: the server does not implement the
 // measures is that provider's willingness and ability to carry ordinary
 // traffic.
 func Check(ctx context.Context, client *http.Client, opts Options) (*Result, error) {
-	chosen := sampleDestinations(destinations, sampleSizes, opts.rng())
+	var chosen []Destination
 	if opts.AllDestinations {
 		chosen = append([]Destination(nil), destinations...)
+	} else {
+		chosen = sampleDestinations(destinations, sampleSizes, opts.rng())
 	}
 	res, err := check(ctx, client, chosen, opts)
 	if res != nil {
@@ -1896,27 +1902,28 @@ func Check(ctx context.Context, client *http.Client, opts Options) (*Result, err
 // SamplePerRun is how many requests one run makes: the sum of the per-class
 // sample sizes, bounded by what the table actually holds.
 //
-// It is exported because cmd/egress-prober sizes the health check's per-request
-// deadline from it -- rounds = ceil(SamplePerRun()/DefaultConcurrency) -- and
-// using len(Destinations()) there would divide one probe timeout across the
-// whole 140-entry table and give every request a few hundred milliseconds.
-// BudgetForAllDestinations returns the Budget and Concurrency an
-// AllDestinations run needs so that no destination is cut off by the deadline.
-//
-// Same arithmetic as the sampled path, with the full table substituted:
-//
-//	rounds = ceil(len(destinations)/concurrency)
-//	budget = rounds * perRequest
-//
-// The concurrency is raised for the full run because otherwise the round count
-// -- and with it the wall clock -- grows linearly with the table. It is not
-// raised further than this: every request rides the SAME provider tunnel, so
-// concurrency here is load on the provider under test, and a diagnostic that
-// overloads its subject measures the overload.
-func BudgetForAllDestinations(perRequest time.Duration) (budget time.Duration, concurrency int) {
-	concurrency = 10
-	rounds := (len(destinations) + concurrency - 1) / concurrency
-	return time.Duration(rounds) * perRequest, concurrency
+// It is exported because cmd/egress-prober sizes a SAMPLED run's per-request
+// deadline from it -- rounds = ceil(SamplePerRun()/DefaultConcurrency). A
+// full-table run uses RoundsForAllDestinations instead, and because that
+// divides one probe timeout across many more rounds, the prober refuses to
+// start when the result falls below DefaultPerRequestTimeout rather than
+// charging honest providers with cold-start timeouts.
+// AllConcurrency is the concurrency an AllDestinations run uses. It is raised
+// above DefaultConcurrency because otherwise the round count -- and with it
+// the wall clock -- grows linearly with the table. It is not raised further:
+// every request rides the SAME provider tunnel, so concurrency here is load on
+// the provider under test, and a diagnostic that overloads its subject
+// measures the overload.
+const AllConcurrency = 10
+
+// RoundsForAllDestinations is how many sequential rounds a full-table run
+// takes at AllConcurrency. A caller sizing a per-request timeout to fit a
+// fixed budget needs this number, not the sampled round count: dividing a
+// budget by the sampled rounds and then spending it over these rounds is how
+// the shipped -egress-health-all default came to draw 2.8x its stated
+// budget.
+func RoundsForAllDestinations() int {
+	return (len(destinations) + AllConcurrency - 1) / AllConcurrency
 }
 
 func SamplePerRun() int {

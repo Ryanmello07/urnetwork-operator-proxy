@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
+	"github.com/urnetwork/operator-proxy/geolocate"
 )
 
 func okProber(probed *int32, mu *sync.Mutex, inflight *int32, maxSeen *int32) *Prober {
@@ -55,6 +55,53 @@ func TestSchedulerRespectsConcurrencyCap(t *testing.T) {
 	mu.Unlock()
 	if peak > 2 {
 		t.Fatalf("peak concurrency = %d, want <= 2", peak)
+	}
+}
+
+// TestSchedulerStopsSpawningWhenCancelled: a SIGTERM mid-pass cancels the
+// run's context, and the spawn loop must stop there. providertunnel.Open
+// constructs a full netstack before any context check, so without the stop
+// every remaining provider in the batch still got a real tunnel built and
+// torn down just so its probe could fail instantly on the dead context --
+// a 500-provider batch reported hundreds of spurious failures, and
+// single-shot mode exited 1 blaming the providers, when the truth was that
+// the operator pressed Ctrl-C.
+func TestSchedulerStopsSpawningWhenCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var opens atomic.Int32
+	p := &Prober{
+		Open: func(ctx context.Context, id string) (*http.Client, func() error, error) {
+			opens.Add(1)
+			// the operator's signal lands while the first probe is in flight
+			cancel()
+			return nil, nil, ctx.Err()
+		},
+		Locate: func(ctx context.Context, c *http.Client) (*geolocate.ConsensusLocation, error) {
+			return nil, ctx.Err()
+		},
+		Submit: &stubSubmitter{},
+	}
+	var logBuf bytes.Buffer
+	origWriter := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(origWriter)
+
+	s := &Scheduler{Prober: p, Concurrency: 1, CacheTTL: time.Hour}
+	ids := []string{"a", "b", "c", "d", "e"}
+	sum := s.Run(ctx, ids)
+
+	// The in-flight probe is legitimately attempted, and one more may race
+	// the cancellation through the semaphore; anything beyond that means the
+	// loop is not watching the context.
+	if got := opens.Load(); got > 2 {
+		t.Fatalf("%d tunnels were opened after the run was cancelled, want at most 2 (the in-flight probe plus at most one race)", got)
+	}
+	if sum.Skipped < len(ids)-2 {
+		t.Fatalf("skipped = %d, want at least %d: the unspawned remainder must be accounted as skipped, not silently dropped", sum.Skipped, len(ids)-2)
+	}
+	if sum.Attempted+sum.Skipped != len(ids) {
+		t.Fatalf("attempted (%d) + skipped (%d) != %d: every id in the batch must be accounted for", sum.Attempted, sum.Skipped, len(ids))
 	}
 }
 
@@ -200,5 +247,34 @@ func TestSchedulerLogsCappedDistinctErrors(t *testing.T) {
 	}
 	if strings.Count(logged, "suppressing further per-error detail") != 1 {
 		t.Fatal("want exactly one suppression notice once the distinct-error cap was hit")
+	}
+}
+
+// TestSchedulerProbesADuplicateIdOnce: recentlyProbed only becomes true once
+// a probe COMPLETES, so a due batch containing the same provider twice used
+// to open two tunnels to it at the same moment and pay the contract cost
+// twice. The enumeration path de-duplicates before Run sees it; the due list
+// is whatever the server sent.
+func TestSchedulerProbesADuplicateIdOnce(t *testing.T) {
+	var opens atomic.Int32
+	p := &Prober{
+		Open: func(ctx context.Context, id string) (*http.Client, func() error, error) {
+			opens.Add(1)
+			time.Sleep(10 * time.Millisecond)
+			return &http.Client{}, func() error { return nil }, nil
+		},
+		Locate: func(ctx context.Context, c *http.Client) (*geolocate.ConsensusLocation, error) {
+			return &geolocate.ConsensusLocation{CountryCode: "us", CountryConfident: true}, nil
+		},
+		Submit: &stubSubmitter{},
+	}
+	s := &Scheduler{Prober: p, Concurrency: 4, CacheTTL: time.Hour}
+	sum := s.Run(context.Background(), []string{"a", "a", "a"})
+
+	if got := opens.Load(); got != 1 {
+		t.Fatalf("opened %d tunnels for one repeated id, want 1", got)
+	}
+	if sum.Attempted != 1 || sum.Skipped != 2 {
+		t.Fatalf("attempted = %d skipped = %d, want 1 and 2", sum.Attempted, sum.Skipped)
 	}
 }
