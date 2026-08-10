@@ -119,16 +119,42 @@ func (s *Scheduler) Run(ctx context.Context, providerClientIds []string) Summary
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 
-	for _, id := range providerClientIds {
-		if s.recentlyProbed(id) {
+	for i, id := range providerClientIds {
+		// A dead context stops the pass here, before any further tunnel is
+		// built. providertunnel.Open constructs a full netstack before it
+		// ever consults the context, so without this check every remaining
+		// provider in the batch would get a real tunnel built and torn down
+		// just so its probe could fail instantly -- a 500-provider batch
+		// reporting hundreds of spurious failures (and, in single-shot mode,
+		// exiting non-zero blaming the providers) when the truth is that the
+		// operator sent SIGTERM. The explicit Err check runs first because
+		// select chooses randomly among ready cases: with the semaphore free
+		// AND the context dead, the select below may still pick the
+		// semaphore.
+		cancelled := ctx.Err() != nil
+		if !cancelled {
+			if s.recentlyProbed(id) {
+				mu.Lock()
+				sum.Skipped++
+				mu.Unlock()
+				continue
+			}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				cancelled = true
+			}
+		}
+		if cancelled {
+			remaining := len(providerClientIds) - i
 			mu.Lock()
-			sum.Skipped++
+			sum.Skipped += remaining
 			mu.Unlock()
-			continue
+			log.Printf("prober: run cancelled (%v); skipping the %d remaining provider(s) in this pass", ctx.Err(), remaining)
+			break
 		}
 
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(id string) {
 			defer wg.Done()
 			defer func() { <-sem }()

@@ -175,6 +175,13 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// The first signal cancels ctx and begins a graceful wind-down (the
+	// scheduler stops spawning and the in-flight probes fail fast). Undo the
+	// signal capture at that point rather than at exit: NotifyContext keeps
+	// swallowing signals for as long as it is registered, so without this a
+	// second Ctrl-C during the wind-down would be silently discarded and the
+	// operator could not force-quit a probe stuck in teardown.
+	context.AfterFunc(ctx, stop)
 
 	// The confinement self-check runs before anything else touches the
 	// network. See checkConfinement.

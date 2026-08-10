@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,6 +56,52 @@ func TestSchedulerRespectsConcurrencyCap(t *testing.T) {
 	mu.Unlock()
 	if peak > 2 {
 		t.Fatalf("peak concurrency = %d, want <= 2", peak)
+	}
+}
+
+// TestSchedulerStopsSpawningWhenCancelled: a SIGTERM mid-pass cancels the
+// run's context, and the spawn loop must stop there. providertunnel.Open
+// constructs a full netstack before any context check, so without the stop
+// every remaining provider in the batch still got a real tunnel built and
+// torn down just so its probe could fail instantly on the dead context --
+// a 500-provider batch reported hundreds of spurious failures, and
+// single-shot mode exited 1 blaming the providers, when the truth was that
+// the operator pressed Ctrl-C.
+func TestSchedulerStopsSpawningWhenCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var opens atomic.Int32
+	p := &Prober{
+		Open: func(ctx context.Context, id string) (*http.Client, func() error, error) {
+			opens.Add(1)
+			// the operator's signal lands while the first probe is in flight
+			cancel()
+			return nil, nil, ctx.Err()
+		},
+		Locate: func(ctx context.Context, c *http.Client) (*geolocate.ConsensusLocation, error) {
+			return nil, ctx.Err()
+		},
+		Submit: &stubSubmitter{},
+	}
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr)
+
+	s := &Scheduler{Prober: p, Concurrency: 1, CacheTTL: time.Hour}
+	ids := []string{"a", "b", "c", "d", "e"}
+	sum := s.Run(ctx, ids)
+
+	// The in-flight probe is legitimately attempted, and one more may race
+	// the cancellation through the semaphore; anything beyond that means the
+	// loop is not watching the context.
+	if got := opens.Load(); got > 2 {
+		t.Fatalf("%d tunnels were opened after the run was cancelled, want at most 2 (the in-flight probe plus at most one race)", got)
+	}
+	if sum.Skipped < len(ids)-2 {
+		t.Fatalf("skipped = %d, want at least %d: the unspawned remainder must be accounted as skipped, not silently dropped", sum.Skipped, len(ids)-2)
+	}
+	if sum.Attempted+sum.Skipped != len(ids) {
+		t.Fatalf("attempted (%d) + skipped (%d) != %d: every id in the batch must be accounted for", sum.Attempted, sum.Skipped, len(ids))
 	}
 }
 
