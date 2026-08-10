@@ -373,8 +373,6 @@ func TestSPKIPinStableAcrossReissuance(t *testing.T) {
 	}
 }
 
-var _ = tls.Config{}
-
 // TestNormalizePinsMergesCollidingKeys: two keys that normalize to the same
 // host ("ipinfo.io" and "IPINFO.IO:443") used to overwrite each other, so
 // which pin set survived depended on map iteration order -- nondeterministic,

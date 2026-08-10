@@ -26,7 +26,20 @@ var (
 	buildOnce sync.Once
 	builtBin  string
 	buildErr  error
+	buildDir  string
 )
+
+// TestMain removes the directory holding the compiled prober. buildProber
+// deliberately does not use t.TempDir (the binary is shared across tests and
+// must outlive the first test's cleanup), so without this every run of this
+// package leaves a ~36 MB binary behind in the system temp directory.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if buildDir != "" {
+		os.RemoveAll(buildDir)
+	}
+	os.Exit(code)
+}
 
 // buildProber compiles the CLI once per test binary and returns the path to
 // the executable.
@@ -54,6 +67,7 @@ func buildProber(t *testing.T) string {
 		}
 		// Windows exec refuses an extensionless path (LookPath only tries
 		// PATHEXT extensions), so the binary must be named with .exe there.
+		buildDir = dir
 		bin := filepath.Join(dir, "egress-prober")
 		if runtime.GOOS == "windows" {
 			bin += ".exe"
@@ -150,17 +164,6 @@ func TestMissingFlagUsageDoesNotPrintSecrets(t *testing.T) {
 	}
 }
 
-// TestFindProvidersAtLocationRequestsForceMinimum is the regression test for
-// the enumeration gap: find-providers2 routes candidates through
-// loadClientScores, which drops any provider failing PassesMinimums -- a
-// user-facing quality gate. A geolocation census wants every provider that
-// can accept a contract, not only those meeting that bar. The server exposes
-// FindProviders2Args.ForceMinimum (json "force_minimum") for exactly this,
-// but the prober never set it, so on beta this returned 1 of 39 providers.
-//
-// The assertion decodes the actual JSON body rather than inspecting the Go
-// request struct: the server only ever sees the JSON, so asserting on the
-// struct would let a wrong or missing json tag pass silently.
 // TestListProvidersErrorsWhenEveryLocationFetchFails: the per-location skip
 // exists so one hiccup out of hundreds of locations cannot abort a pass, but
 // when locations exist and EVERY find-providers2 call failed the enumeration
@@ -221,6 +224,17 @@ func TestListProvidersKeepsThePassWhenOneLocationFails(t *testing.T) {
 	}
 }
 
+// TestFindProvidersAtLocationRequestsForceMinimum is the regression test for
+// the enumeration gap: find-providers2 routes candidates through
+// loadClientScores, which drops any provider failing PassesMinimums -- a
+// user-facing quality gate. A geolocation census wants every provider that
+// can accept a contract, not only those meeting that bar. The server exposes
+// FindProviders2Args.ForceMinimum (json "force_minimum") for exactly this,
+// but the prober never set it, so on beta this returned 1 of 39 providers.
+//
+// The assertion decodes the actual JSON body rather than inspecting the Go
+// request struct: the server only ever sees the JSON, so asserting on the
+// struct would let a wrong or missing json tag pass silently.
 func TestFindProvidersAtLocationRequestsForceMinimum(t *testing.T) {
 	var got map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

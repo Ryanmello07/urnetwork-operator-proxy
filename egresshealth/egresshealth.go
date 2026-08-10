@@ -1882,9 +1882,11 @@ var ErrUnsupported = errors.New("egresshealth: the server does not implement the
 // measures is that provider's willingness and ability to carry ordinary
 // traffic.
 func Check(ctx context.Context, client *http.Client, opts Options) (*Result, error) {
-	chosen := sampleDestinations(destinations, sampleSizes, opts.rng())
+	var chosen []Destination
 	if opts.AllDestinations {
 		chosen = append([]Destination(nil), destinations...)
+	} else {
+		chosen = sampleDestinations(destinations, sampleSizes, opts.rng())
 	}
 	res, err := check(ctx, client, chosen, opts)
 	if res != nil {

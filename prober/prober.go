@@ -148,6 +148,13 @@ type Prober struct {
 	// health error (or the reverse).
 	healthErrMu     sync.Mutex
 	healthErrLogged map[string]bool
+
+	// closeErrLogged deduplicates tunnel-teardown errors, on its own gate for
+	// the same reason the two above are separate: a noisy teardown failure
+	// must not consume the log budget that would otherwise have surfaced the
+	// first health or attempt failure.
+	closeErrMu     sync.Mutex
+	closeErrLogged map[string]bool
 }
 
 // shouldLogOnce reports whether line should be logged for this error, and
@@ -216,8 +223,17 @@ func (p *Prober) probeOne(ctx context.Context, providerClientId string) (string,
 		return FailureTunnel, fmt.Errorf("open tunnel: %w", err)
 	}
 	defer func() {
-		if closeTunnel != nil {
-			_ = closeTunnel()
+		if closeTunnel == nil {
+			return
+		}
+		if err := closeTunnel(); err != nil && shouldLogOnce(&p.closeErrMu, &p.closeErrLogged, err) {
+			// Deduplicated on its own gate, for the reason the other two are
+			// separate: a noisy teardown error must not consume the budget
+			// that would have shown the first health or attempt failure. This
+			// never fails the probe -- the location is already submitted by
+			// the time it runs -- but discarding it entirely made a tunnel
+			// leaking its netstack completely invisible.
+			log.Printf("prober: tunnel teardown failed (provider=%s): %s. Logged once per distinct error.", providerClientId, err)
 		}
 	}()
 

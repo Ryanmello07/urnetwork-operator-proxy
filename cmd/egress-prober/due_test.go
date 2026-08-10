@@ -156,6 +156,12 @@ func TestNewProberReportsAttempts(t *testing.T) {
 	if p.Submit == nil || p.Open == nil || p.Locate == nil {
 		t.Fatal("newProber left a dependency unset")
 	}
+	// HealthResults too: without it the health check still runs and still
+	// logs, so every test here would pass while the results reached no
+	// server at all -- which is the whole point of submitting them.
+	if p.HealthResults == nil {
+		t.Fatal("newProber built a Prober with no health-result submitter; health would be logged and never persisted")
+	}
 	if p.Bandwidth != nil {
 		t.Error("a nil sampler (-skip-bandwidth) must leave the bandwidth hook unset, not install one that measures nothing")
 	}
