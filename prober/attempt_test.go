@@ -1,10 +1,15 @@
 package prober
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
@@ -217,5 +222,93 @@ func TestProbeOneWithoutAReporterStillProbes(t *testing.T) {
 	}
 	if sub.calls != 1 {
 		t.Fatalf("submit calls = %d, want 1", sub.calls)
+	}
+}
+
+// varyingReporter fails with a DIFFERENT message every call, the way a real
+// server does when its 5xx body carries a request id or a timestamp.
+type varyingReporter struct{ n atomic.Int64 }
+
+func (r *varyingReporter) ReportAttempt(ctx context.Context, id string, probeFailure string) error {
+	return fmt.Errorf("ingest: rejected: status 503: request-id %d", r.n.Add(1))
+}
+
+// TestReportAttemptErrorLoggingIsBounded: the dedup map keyed on the full
+// error text is the whole mechanism keeping a broken ingest endpoint from
+// logging once per provider per pass -- and it inverts when the message
+// varies. ErrRejected embeds up to 4096 bytes of server response body, and a
+// body carrying a request id or timestamp makes every message distinct: the
+// "logged once" gate then logs EVERY line (the flood it exists to prevent)
+// while the map grows one entry per probe, forever, in a process designed to
+// run for months.
+func TestReportAttemptErrorLoggingIsBounded(t *testing.T) {
+	var buf bytes.Buffer
+	orig := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(orig)
+
+	p := &Prober{Open: okOpen, Attempts: &varyingReporter{}}
+	const probes = 200
+	for i := 0; i < probes; i++ {
+		p.reportAttempt(context.Background(), fmt.Sprintf("provider-%d", i), FailureTunnel)
+	}
+
+	lines := strings.Count(buf.String(), "could not report a probe attempt")
+	if lines > maxLoggedDistinctErrors {
+		t.Errorf("logged %d attempt-error lines across %d probes, want at most %d: a varying error message must not defeat the dedup gate",
+			lines, probes, maxLoggedDistinctErrors)
+	}
+	p.attemptErrMu.Lock()
+	size := len(p.attemptErrLogged)
+	p.attemptErrMu.Unlock()
+	if size > maxLoggedDistinctErrors {
+		t.Errorf("dedup map holds %d entries after %d probes, want at most %d: it must not grow without bound in a long-running process",
+			size, probes, maxLoggedDistinctErrors)
+	}
+}
+
+// TestHealthSubmitErrorLoggingIsBounded is the same property for the health
+// submitter, which has its own map for the same reason.
+func TestHealthSubmitErrorLoggingIsBounded(t *testing.T) {
+	var buf bytes.Buffer
+	orig := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(orig)
+
+	p := &Prober{Open: okOpen}
+	for i := 0; i < 200; i++ {
+		p.logHealthErrOnce(fmt.Errorf("ingest: rejected: status 503: request-id %d", i), "prober: could not submit an egress-health result")
+	}
+
+	p.healthErrMu.Lock()
+	size := len(p.healthErrLogged)
+	p.healthErrMu.Unlock()
+	if size > maxLoggedDistinctErrors {
+		t.Errorf("health dedup map holds %d entries, want at most %d", size, maxLoggedDistinctErrors)
+	}
+}
+
+// TestTunnelFailureErrorDoesNotEmbedTheProviderId: the scheduler dedups on
+// the error text and keeps only maxLoggedDistinctErrors distinct messages. A
+// fleet-wide identical tunnel failure -- a wrong -platform-url, a revoked jwt,
+// the doc comment's own examples -- produced a DISTINCT message per provider
+// when the id was wrapped into it, so all ten detail slots filled with copies
+// of one failure mode and a genuinely different eleventh error was suppressed.
+// The id is already in the log line's provider= field.
+func TestTunnelFailureErrorDoesNotEmbedTheProviderId(t *testing.T) {
+	p := &Prober{
+		Open: func(ctx context.Context, id string) (*http.Client, func() error, error) {
+			return nil, nil, errors.New("dial platform: connection refused")
+		},
+		Submit: &stubSubmitter{},
+	}
+	first := p.ProbeOne(context.Background(), "provider-aaa")
+	second := p.ProbeOne(context.Background(), "provider-bbb")
+	if first == nil || second == nil {
+		t.Fatal("both probes must fail")
+	}
+	if first.Error() != second.Error() {
+		t.Errorf("two providers failing the same way produced different error text:\n  %s\n  %s\nthe scheduler dedups on this text, so per-provider variation exhausts its detail budget on one failure mode",
+			first, second)
 	}
 }

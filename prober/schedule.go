@@ -119,7 +119,22 @@ func (s *Scheduler) Run(ctx context.Context, providerClientIds []string) Summary
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 
+	// recentlyProbed only becomes true once a probe COMPLETES, so a duplicate
+	// id inside one batch would otherwise open two tunnels to the same
+	// provider simultaneously and pay the contract cost twice. The enumeration
+	// path de-duplicates before it gets here; the due path is whatever the
+	// server sent.
+	seen := map[string]bool{}
+
 	for i, id := range providerClientIds {
+		if seen[id] {
+			mu.Lock()
+			sum.Skipped++
+			mu.Unlock()
+			continue
+		}
+		seen[id] = true
+
 		// A dead context stops the pass here, before any further tunnel is
 		// built. providertunnel.Open constructs a full netstack before it
 		// ever consults the context, so without this check every remaining

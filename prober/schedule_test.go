@@ -249,3 +249,32 @@ func TestSchedulerLogsCappedDistinctErrors(t *testing.T) {
 		t.Fatal("want exactly one suppression notice once the distinct-error cap was hit")
 	}
 }
+
+// TestSchedulerProbesADuplicateIdOnce: recentlyProbed only becomes true once
+// a probe COMPLETES, so a due batch containing the same provider twice used
+// to open two tunnels to it at the same moment and pay the contract cost
+// twice. The enumeration path de-duplicates before Run sees it; the due list
+// is whatever the server sent.
+func TestSchedulerProbesADuplicateIdOnce(t *testing.T) {
+	var opens atomic.Int32
+	p := &Prober{
+		Open: func(ctx context.Context, id string) (*http.Client, func() error, error) {
+			opens.Add(1)
+			time.Sleep(10 * time.Millisecond)
+			return &http.Client{}, func() error { return nil }, nil
+		},
+		Locate: func(ctx context.Context, c *http.Client) (*geolocate.ConsensusLocation, error) {
+			return &geolocate.ConsensusLocation{CountryCode: "us", CountryConfident: true}, nil
+		},
+		Submit: &stubSubmitter{},
+	}
+	s := &Scheduler{Prober: p, Concurrency: 4, CacheTTL: time.Hour}
+	sum := s.Run(context.Background(), []string{"a", "a", "a"})
+
+	if got := opens.Load(); got != 1 {
+		t.Fatalf("opened %d tunnels for one repeated id, want 1", got)
+	}
+	if sum.Attempted != 1 || sum.Skipped != 2 {
+		t.Fatalf("attempted = %d skipped = %d, want 1 and 2", sum.Attempted, sum.Skipped)
+	}
+}

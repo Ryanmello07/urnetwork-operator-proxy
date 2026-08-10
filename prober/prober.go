@@ -150,6 +150,35 @@ type Prober struct {
 	healthErrLogged map[string]bool
 }
 
+// shouldLogOnce reports whether line should be logged for this error, and
+// records it so an identical message is not logged again.
+//
+// The cap is what makes this safe on a message that VARIES. Both maps are
+// keyed on the full error text, and ingest.ErrRejected embeds up to 4096
+// bytes of server response body -- a body carrying a request id or a
+// timestamp, which is ordinary, makes every message distinct. The gate then
+// inverted: it logged one line per provider per pass (the flood it exists to
+// prevent) while the map grew an entry per probe, forever, in a process built
+// to run for months. Past the cap the gate stays closed, on the same
+// reasoning as the scheduler's: ten distinct failures are enough to see the
+// shape of what is broken, and the counts the caller reports carry the total.
+func shouldLogOnce(mu *sync.Mutex, logged *map[string]bool, err error) bool {
+	msg := err.Error()
+	mu.Lock()
+	defer mu.Unlock()
+	if *logged == nil {
+		*logged = map[string]bool{}
+	}
+	if (*logged)[msg] {
+		return false
+	}
+	if maxLoggedDistinctErrors <= len(*logged) {
+		return false
+	}
+	(*logged)[msg] = true
+	return true
+}
+
 // ProbeOne probes a single provider. The tunnel is always closed, and nothing
 // is submitted unless the geolocation reached consensus.
 //
@@ -177,7 +206,14 @@ func (p *Prober) ProbeOne(ctx context.Context, providerClientId string) error {
 func (p *Prober) probeOne(ctx context.Context, providerClientId string) (string, error) {
 	client, closeTunnel, err := p.Open(ctx, providerClientId)
 	if err != nil {
-		return FailureTunnel, fmt.Errorf("open tunnel to %s: %w", providerClientId, err)
+		// No provider id in the message: the scheduler dedups on the error
+		// text and keeps only maxLoggedDistinctErrors distinct ones, so an id
+		// here made a fleet-wide identical failure (a wrong -platform-url, a
+		// revoked jwt) look like one distinct error per provider, filling
+		// every detail slot with copies of a single failure mode and
+		// suppressing genuinely different ones. The id is already in the
+		// caller's log line, as provider=.
+		return FailureTunnel, fmt.Errorf("open tunnel: %w", err)
 	}
 	defer func() {
 		if closeTunnel != nil {
@@ -320,18 +356,7 @@ func (p *Prober) reportEgressHealth(ctx context.Context, providerClientId string
 }
 
 func (p *Prober) logHealthErrOnce(err error, line string) {
-	msg := err.Error()
-	p.healthErrMu.Lock()
-	logged := p.healthErrLogged[msg]
-	if !logged {
-		if p.healthErrLogged == nil {
-			p.healthErrLogged = map[string]bool{}
-		}
-		p.healthErrLogged[msg] = true
-	}
-	p.healthErrMu.Unlock()
-
-	if !logged {
+	if shouldLogOnce(&p.healthErrMu, &p.healthErrLogged, err) {
 		log.Print(line)
 	}
 }
@@ -345,18 +370,7 @@ func (p *Prober) reportAttempt(ctx context.Context, providerClientId string, fai
 		return
 	}
 
-	msg := err.Error()
-	p.attemptErrMu.Lock()
-	logged := p.attemptErrLogged[msg]
-	if !logged {
-		if p.attemptErrLogged == nil {
-			p.attemptErrLogged = map[string]bool{}
-		}
-		p.attemptErrLogged[msg] = true
-	}
-	p.attemptErrMu.Unlock()
-
-	if !logged {
+	if shouldLogOnce(&p.attemptErrMu, &p.attemptErrLogged, err) {
 		log.Printf("prober: could not report a probe attempt (provider=%s failure=%q): %s -- while this persists, providers that always fail to probe stay at the head of the server's due queue. Logged once per distinct error.", providerClientId, failure, err)
 	}
 }
