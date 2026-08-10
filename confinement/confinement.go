@@ -75,6 +75,13 @@ var ErrNoDialer = errors.New("confinement: a dial function is required")
 // passed is exactly that. Verify rejects a nil dialer for the same reason.
 var ErrNoLookup = errors.New("confinement: a lookup function is required")
 
+// ErrInterrupted reports that the caller's context was cancelled or expired
+// while the check ran. Every remaining dial then fails in microseconds with
+// a context error, which is indistinguishable at the dial site from a
+// refusal -- so counting those dials would produce a vacuous pass on a host
+// that might have full egress. An interrupted check refuses instead.
+var ErrInterrupted = errors.New("confinement: the check was interrupted before it finished; an interrupted check is not evidence of confinement")
+
 // ErrInvalidTimeout reports a per-address timeout below MinTimeout. A budget
 // that expires before a connection could have completed makes every dial fail
 // for a reason unrelated to confinement, and the check passes vacuously. A
@@ -129,6 +136,14 @@ func Verify(ctx context.Context, dial DialFunc, addrs []string, unresolved []str
 			}
 			return fmt.Errorf("%w: %s", ErrNotConfined, addr)
 		}
+		// The dial failed -- but if the caller's own context is dead, it
+		// failed for the caller's reason, not the network's. Counting it as
+		// "refused" would let a cancelled or short-deadlined run pass having
+		// tested nothing, through a path the MinTimeout floor cannot see
+		// (the floor validates the parameter, not the context it nests in).
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("%w (%s, while dialing %s)", ErrInterrupted, ctxErr, addr)
+		}
 	}
 	return nil
 }
@@ -174,7 +189,21 @@ func Addresses(ctx context.Context, lookup LookupFunc, hosts []string, port stri
 			for _, ip := range ips {
 				// A record that is not an ip literal cannot serve as evidence:
 				// it would just be re-resolved at dial time.
-				if net.ParseIP(ip) == nil {
+				ipAddr := net.ParseIP(ip)
+				if ipAddr == nil {
+					continue
+				}
+				// A record outside global-unicast space is not the host's
+				// address either. Filtering resolvers (Pi-hole, AdGuard,
+				// NextDNS, corporate DNS) answer 0.0.0.0 or :: for a blocked
+				// name, and loopback/link-local/multicast records are equally
+				// incapable of standing in for an internet host. Dialing one
+				// produces evidence about this machine, not about the
+				// confinement: on Linux 0.0.0.0 connects to loopback, so with
+				// nothing listening the refusal reads as a vacuous pass, and
+				// with a local service on the port it reads as ErrNotConfined
+				// with a wildly misleading diagnosis.
+				if !ipAddr.IsGlobalUnicast() {
 					continue
 				}
 				add(net.JoinHostPort(ip, port))

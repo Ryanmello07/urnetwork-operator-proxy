@@ -70,6 +70,26 @@ func TestVerifyTreatsADialTimeoutAsConfined(t *testing.T) {
 	}
 }
 
+// TestVerifyInterruptedContextIsNotEvidence: with the parent context already
+// cancelled (or expiring mid-loop), every dial fails in microseconds with a
+// context error -- which the loop would happily count as "refused", the
+// exact vacuous-pass shape TestVerifyTreatsADialTimeoutAsConfined guards
+// against, reached through a path the MinTimeout floor cannot see.
+func TestVerifyInterruptedContextIsNotEvidence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, ctx.Err()
+	}
+	err := Verify(ctx, dial, []string{"203.0.113.7:443"}, nil, MinTimeout)
+	if err == nil {
+		t.Fatal("Verify reported confinement from a run whose every dial was cut short by the caller's dead context; an interrupted check has no evidence")
+	}
+	if !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("Verify error = %v, want ErrInterrupted", err)
+	}
+}
+
 func TestVerifyRequiresAtLeastOneAddress(t *testing.T) {
 	// an empty address list would vacuously "pass" and silently disable the
 	// entire check
@@ -327,6 +347,68 @@ func TestAddressesRejectsANonIpRecord(t *testing.T) {
 	}
 	if len(unresolved) != 1 || unresolved[0] != "a.example" {
 		t.Fatalf("unresolved = %v, want [a.example]", unresolved)
+	}
+}
+
+// TestAddressesRoutesBlockedResolverAnswersToUnresolved: filtering resolvers
+// (Pi-hole, AdGuard, NextDNS, plenty of corporate DNS) answer 0.0.0.0 or ::
+// for a blocked name, and free geolocation apis are plausible blocklist
+// members. Those answers are not the host's address, and dialing them is
+// worse than useless: 0.0.0.0 dials loopback on Linux, so with nothing
+// listening the refusal reads as evidence of confinement (a vacuous pass --
+// the defect class this package exists to refuse), and with anything on the
+// port it reads as ErrNotConfined with a misleading diagnosis. The same
+// holds for loopback, link-local, multicast and the like: none of them are
+// the internet host the check is meant to prove unreachable, so they take
+// the unresolved path like a non-ip record.
+func TestAddressesRoutesBlockedResolverAnswersToUnresolved(t *testing.T) {
+	cases := []struct {
+		name   string
+		answer string
+	}{
+		{"ipv4 unspecified", "0.0.0.0"},
+		{"ipv6 unspecified", "::"},
+		{"ipv4 loopback", "127.0.0.1"},
+		{"ipv6 loopback", "::1"},
+		{"ipv4 link-local", "169.254.169.254"},
+		{"ipv6 link-local", "fe80::1"},
+		{"multicast", "ff02::1"},
+		{"ipv4-mapped unspecified", "::ffff:0.0.0.0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lookup := func(ctx context.Context, host string) ([]string, error) {
+				return []string{tc.answer}, nil
+			}
+			got, unresolved, err := Addresses(context.Background(), lookup, []string{"a.example"}, "443")
+			if err != nil {
+				t.Fatalf("Addresses: %s", err)
+			}
+			if len(got) != 0 {
+				t.Fatalf("Addresses = %v, want nothing dialable: %q is a filtering-resolver answer, not the host's address", got, tc.answer)
+			}
+			if len(unresolved) != 1 || unresolved[0] != "a.example" {
+				t.Fatalf("unresolved = %v, want [a.example]", unresolved)
+			}
+		})
+	}
+}
+
+// TestAddressesKeepsTheRealRecordsWhenABlockedAnswerIsMixedIn: one poisoned
+// record must not discard the genuine ones alongside it.
+func TestAddressesKeepsTheRealRecordsWhenABlockedAnswerIsMixedIn(t *testing.T) {
+	lookup := func(ctx context.Context, host string) ([]string, error) {
+		return []string{"0.0.0.0", "203.0.113.7"}, nil
+	}
+	got, unresolved, err := Addresses(context.Background(), lookup, []string{"a.example"}, "443")
+	if err != nil {
+		t.Fatalf("Addresses: %s", err)
+	}
+	if len(got) != 1 || got[0] != "203.0.113.7:443" {
+		t.Fatalf("Addresses = %v, want [203.0.113.7:443]", got)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unresolved = %v, want none: a real record was obtained", unresolved)
 	}
 }
 
