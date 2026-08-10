@@ -238,9 +238,14 @@ recorded it clean.
   `cloud.google.com`, `apnews.com`, `www.baidu.com`; earlier, jsDelivr and
   BootstrapCDN), so the `io.LimitReader` cap — not the header — is what actually
   bounds the cost. A full run against a completely unresponsive provider costs
-  at most one extra `-probe-timeout` of wall clock per provider (the whole run
-  shares that one budget across six concurrent rounds), so a blackholing
-  provider costs about 2× `-probe-timeout` in total rather than 4×.
+  at most one extra `-probe-timeout` of wall clock per provider — the whole run
+  shares that one budget, divided across however many concurrent rounds the run
+  actually takes (5 rounds of 6 for a sample, 14 rounds of 10 for the full
+  table under `-egress-health-all`) — so a blackholing provider costs about
+  2× `-probe-timeout` in total rather than 4×. The per-request slice is
+  therefore shorter under `-egress-health-all`; deriving it from the sampled
+  round count and then spending it over the full table's rounds is what made
+  the shipped default draw 2.8× its stated budget.
 - The health destinations are reached **unpinned** but under ordinary WebPKI
   verification. Pinning 140 leaves that rotate on 140 schedules would turn every
   routine certificate rotation into a failure indistinguishable from the

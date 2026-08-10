@@ -71,7 +71,7 @@ func main() {
 	confinementTimeout := flag.Duration("confinement-timeout", 3*time.Second, "per-address deadline for the startup confinement self-check; a timeout counts as blocked. Must be at least "+confinement.MinTimeout.String())
 	var confinementAddrs addressList
 	publicAPIURL := flag.String("public-api-url", "", "the address the api answers on FROM THE PUBLIC INTERNET, used as the operator bandwidth target. This is not -api-url: control-plane calls go prober -> api directly (an internal name on docker), but the bandwidth target travels prober -> platform -> provider -> internet -> api, so it needs the public address. Empty drops the operator target and measures the cdn only")
-	egressHealthAll := flag.Bool("egress-health-all", true, "run EVERY destination in the egress-health table instead of a random sample. Default true: the full table is also the only way this exercises CONCURRENCY, since a 30-destination sample never asks the provider to carry the full parallel load a real client would. Setting it false restores sampling, which is cheaper and keeps the destination list unpredictable, but no longer tests that dimension")
+	egressHealthAll := flag.Bool("egress-health-all", true, "run EVERY destination in the egress-health table instead of a random sample. Default true: the full table is also the only way this exercises CONCURRENCY, since a 30-destination sample never asks the provider to carry the full parallel load a real client would. Setting it false restores sampling, which is cheaper and keeps the destination list unpredictable, but no longer tests that dimension. Either way the whole health run fits inside one -probe-timeout; the full table spends it over more rounds, so each request gets a shorter slice")
 	flag.Var(&confinementAddrs, "confinement-address", "ip:port the confinement self-check should dial instead of resolving the probe hosts; repeatable. For a jail where dns is legitimately blocked: supply the address of every geolocation source AND every egress-health destination here and the check stays real. The host part must be an ip literal, not a name")
 	dueURL := flag.String("due-url", "", "url of the server's due-provider endpoint; empty derives <api-url>/network/provider-egress-due")
 	dueLimit := flag.Int("due-limit", 100, "how many due providers to ask the server for per pass; the server clamps this to its own maximum (500)")
@@ -416,12 +416,7 @@ func newProber(
 		// Its budget is derived from -probe-timeout: see egressHealthOptions for
 		// the arithmetic and for what a full pass therefore costs.
 		Health: func(ctx context.Context, client *http.Client) (*egresshealth.Result, error) {
-			opts := egressHealthOptions(probeTimeout)
-			if allDestinations {
-				opts.AllDestinations = true
-				opts.Budget, opts.Concurrency = egresshealth.BudgetForAllDestinations(opts.PerRequestTimeout)
-			}
-			return egresshealth.Check(ctx, client, opts)
+			return egresshealth.Check(ctx, client, egressHealthOptions(probeTimeout, allDestinations))
 		},
 		Submit:   operator,
 		Attempts: operator,
@@ -475,13 +470,29 @@ func newProber(
 // cold-start the geolocation cap is sized for. If that turns out to be wrong in
 // the field it shows up as a specific, recognisable shape: timeouts spread
 // evenly across all classes, on providers whose geolocation succeeded.
-func egressHealthOptions(probeTimeout time.Duration) egresshealth.Options {
-	// SamplePerRun, never len(Destinations()): a run fetches a random sample of
-	// the table, not the table. Sizing the rounds off the full 140 entries would
-	// divide one probe timeout by 24 and hand each request a couple of seconds
-	// over a cold tunnel -- cold-start timeouts, charged to providers as
-	// blackholes, on a run that was only ever going to make 30 requests.
-	rounds := (egresshealth.SamplePerRun() + egresshealth.DefaultConcurrency - 1) / egresshealth.DefaultConcurrency
+// allDestinations selects the geometry of the run being sized. Both paths get
+// the same one--probe-timeout budget; they differ only in how many rounds that
+// budget is divided across, because a full-table run raises concurrency and
+// still needs many more rounds than a sample.
+//
+// Deriving the per-request bound from one geometry and then applying it to the
+// other is precisely the defect this signature exists to prevent: sizing
+// per-request off the 5 sampled rounds and then letting the full table's 14
+// rounds multiply it drew 2.8x -probe-timeout at the shipped default, so a
+// blackholing provider cost ~3.8x per probe -- the regression the arithmetic
+// above is written to avoid, arriving through the default configuration.
+func egressHealthOptions(probeTimeout time.Duration, allDestinations bool) egresshealth.Options {
+	// SamplePerRun, never len(Destinations()), for a sampled run: it fetches a
+	// random sample of the table, not the table. Sizing the rounds off the full
+	// 139 entries would divide one probe timeout by 24 and hand each request a
+	// couple of seconds over a cold tunnel -- cold-start timeouts, charged to
+	// providers as blackholes, on a run that was only ever going to make 30
+	// requests.
+	requests, concurrency := egresshealth.SamplePerRun(), egresshealth.DefaultConcurrency
+	if allDestinations {
+		requests, concurrency = len(egresshealth.Destinations()), egresshealth.AllConcurrency
+	}
+	rounds := (requests + concurrency - 1) / concurrency
 	if rounds < 1 {
 		rounds = 1
 	}
@@ -495,6 +506,8 @@ func egressHealthOptions(probeTimeout time.Duration) egresshealth.Options {
 	return egresshealth.Options{
 		PerRequestTimeout: perRequest,
 		Budget:            probeTimeout,
+		AllDestinations:   allDestinations,
+		Concurrency:       concurrency,
 	}
 }
 

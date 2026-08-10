@@ -1914,9 +1914,22 @@ func Check(ctx context.Context, client *http.Client, opts Options) (*Result, err
 // concurrency here is load on the provider under test, and a diagnostic that
 // overloads its subject measures the overload.
 func BudgetForAllDestinations(perRequest time.Duration) (budget time.Duration, concurrency int) {
-	concurrency = 10
-	rounds := (len(destinations) + concurrency - 1) / concurrency
-	return time.Duration(rounds) * perRequest, concurrency
+	return time.Duration(RoundsForAllDestinations()) * perRequest, AllConcurrency
+}
+
+// AllConcurrency is the concurrency an AllDestinations run uses. See
+// BudgetForAllDestinations for why it is raised above DefaultConcurrency for
+// the full table, and why it is not raised further.
+const AllConcurrency = 10
+
+// RoundsForAllDestinations is how many sequential rounds a full-table run
+// takes at AllConcurrency. A caller sizing a per-request timeout to fit a
+// fixed budget needs this number, not the sampled round count: dividing a
+// budget by the sampled rounds and then spending it over these rounds is how
+// the shipped -egress-health-all default came to draw 2.8x its stated
+// budget.
+func RoundsForAllDestinations() int {
+	return (len(destinations) + AllConcurrency - 1) / AllConcurrency
 }
 
 func SamplePerRun() int {

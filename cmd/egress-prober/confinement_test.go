@@ -437,7 +437,7 @@ func TestEgressHealthDestinationsAreNotPinned(t *testing.T) {
 // in one -probe-timeout.
 func TestEgressHealthAddsAtMostOneProbeTimeout(t *testing.T) {
 	for _, probeTimeout := range []time.Duration{time.Second, 30 * time.Second, 60 * time.Second, 5 * time.Minute} {
-		opts := egressHealthOptions(probeTimeout)
+		opts := egressHealthOptions(probeTimeout, false)
 		if opts.Budget != probeTimeout {
 			t.Errorf("egressHealthOptions(%s).Budget = %s; a full health run must add at most one -probe-timeout per provider", probeTimeout, opts.Budget)
 		}
@@ -466,8 +466,44 @@ func TestEgressHealthAddsAtMostOneProbeTimeout(t *testing.T) {
 	}
 	// ...and it must still scale, so raising -probe-timeout actually helps a
 	// slow provider.
-	if egressHealthOptions(10*time.Second).PerRequestTimeout <= egressHealthOptions(time.Second).PerRequestTimeout {
+	if egressHealthOptions(10*time.Second, false).PerRequestTimeout <= egressHealthOptions(time.Second, false).PerRequestTimeout {
 		t.Error("egressHealthOptions does not scale with -probe-timeout")
+	}
+}
+
+// TestEgressHealthAllAddsAtMostOneProbeTimeout pins the SHIPPED
+// configuration. -egress-health-all defaults to true, and that path derived
+// its per-request bound from the sampled round count (5) and then multiplied
+// it by the full-table round count (14), so the health run drew 2.8x
+// -probe-timeout -- a blackholing provider cost ~3.8x per probe, which is
+// the ~4x regression the arithmetic in egressHealthOptions exists to
+// prevent, arriving through the default nobody had measured. The invariant
+// is the same one the sampled path is held to, so it is asserted the same
+// way.
+func TestEgressHealthAllAddsAtMostOneProbeTimeout(t *testing.T) {
+	for _, probeTimeout := range []time.Duration{time.Second, 30 * time.Second, 60 * time.Second, 5 * time.Minute} {
+		opts := egressHealthOptions(probeTimeout, true)
+		if !opts.AllDestinations {
+			t.Fatalf("egressHealthOptions(%s, true).AllDestinations = false", probeTimeout)
+		}
+		if opts.Budget > probeTimeout {
+			t.Errorf("egressHealthOptions(%s, true).Budget = %s (%.2fx); a full health run must add at most one -probe-timeout per provider",
+				probeTimeout, opts.Budget, float64(opts.Budget)/float64(probeTimeout))
+		}
+		if opts.PerRequestTimeout <= 0 {
+			t.Errorf("egressHealthOptions(%s, true).PerRequestTimeout = %s, want positive", probeTimeout, opts.PerRequestTimeout)
+		}
+		// Every destination in the WHOLE table must be attemptable inside the
+		// budget, or the last rounds are always cut off and those destinations
+		// fail for a reason the provider had nothing to do with.
+		rounds := (len(egresshealth.Destinations()) + opts.Concurrency - 1) / opts.Concurrency
+		if got := opts.PerRequestTimeout * time.Duration(rounds); got > opts.Budget {
+			t.Errorf("egressHealthOptions(%s, true): %d rounds x %s = %s exceeds the budget %s; the last rounds would always be cut off",
+				probeTimeout, rounds, opts.PerRequestTimeout, got, opts.Budget)
+		}
+	}
+	if egressHealthOptions(10*time.Second, true).PerRequestTimeout <= egressHealthOptions(time.Second, true).PerRequestTimeout {
+		t.Error("egressHealthOptions(_, true) does not scale with -probe-timeout")
 	}
 }
 
