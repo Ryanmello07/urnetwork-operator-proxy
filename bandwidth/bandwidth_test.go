@@ -104,7 +104,16 @@ func TestMeasureStopsAtTimeCap(t *testing.T) {
 // naive rate computed from the same run, so it does not depend on how fast the
 // test machine happens to be.
 func TestMeasureExcludesWarmup(t *testing.T) {
-	const bulk = 4 * 1024 * 1024
+	// The stall must be at least twice the paced bulk phase for the 3x
+	// assertion below to hold by construction (steady/naive ~= 1 +
+	// stall/fast when nearly all bytes land post-boundary), and the bulk
+	// phase must outlast MinSteadyDuration or the measurement correctly
+	// refuses to call its window "steady" and reports the lower bound
+	// instead (see TestMeasureBurstAfterWarmupBoundaryIsNotASteadyFigure
+	// for that property).
+	const stall = 1500 * time.Millisecond
+	const chunk = 64 * 1024
+	const chunkEvery = 20 * time.Millisecond // 2 MiB/stream in ~640ms
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, err := w.Write([]byte("x")); err != nil {
 			return
@@ -112,14 +121,20 @@ func TestMeasureExcludesWarmup(t *testing.T) {
 		flush(w)
 		// stall past WarmupDuration, so everything after this lands in the
 		// steady-state window and everything before it does not
-		time.Sleep(WarmupDuration + 200*time.Millisecond)
-		_, _ = io.Copy(w, io.LimitReader(zeroReader{}, bulk))
+		time.Sleep(stall)
+		for sent := 0; sent < StreamBytes; sent += chunk {
+			if _, err := io.Copy(w, io.LimitReader(zeroReader{}, chunk)); err != nil {
+				return
+			}
+			flush(w)
+			time.Sleep(chunkEvery)
+		}
 	}))
 	defer srv.Close()
 
 	start := time.Now()
 	sample, err := MeasureTarget(context.Background(), srv.Client(),
-		Target{Name: "test", URL: srv.URL}, 5*time.Second)
+		Target{Name: "test", URL: srv.URL}, 10*time.Second)
 	wallClock := time.Since(start)
 	if err != nil {
 		t.Fatalf("MeasureTarget: %s", err)
@@ -195,12 +210,17 @@ func TestMeasureTargetSendsHeaders(t *testing.T) {
 	var got atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got.Store(r.Header.Get("X-UR-Operator-Secret"))
-		_, _ = io.Copy(w, io.LimitReader(zeroReader{}, 64*1024))
+		// A full-size body, like the sibling tests: a 64 KiB body completes
+		// inside one ~0.5ms Windows clock tick, which turns this into an
+		// ErrUnmeasuredDuration coin flip on a dev machine. The property
+		// under test is the header, which is sent either way, but the run
+		// must not Fatal before asserting it.
+		_, _ = io.Copy(w, io.LimitReader(zeroReader{}, StreamBytes))
 	}))
 	defer srv.Close()
 
 	target := OperatorTarget(srv.URL, "s3cret")
-	if _, err := MeasureTarget(context.Background(), srv.Client(), target, 5*time.Second); err != nil {
+	if _, err := MeasureTarget(context.Background(), srv.Client(), target, 5*time.Second); err != nil && !errors.Is(err, ErrUnmeasuredDuration) {
 		t.Fatalf("MeasureTarget: %s", err)
 	}
 	if got.Load() != "s3cret" {
@@ -706,6 +726,102 @@ func TestMeasureAggregatesAcrossParallelStreams(t *testing.T) {
 	}
 }
 
+// burstBody models a transfer that stalls across the warmup boundary and
+// then bursts: it delivers preBytes immediately, then blocks until stallFor
+// has elapsed from its first Read, then delivers the remainder instantly.
+// Windowed tunnel transports produce exactly this shape when a window
+// refill lands just after the boundary.
+type burstBody struct {
+	preBytes  int
+	stallFor  time.Duration
+	firstRead time.Time
+	delivered int
+	stalled   bool
+}
+
+func (b *burstBody) Read(p []byte) (int, error) {
+	if b.firstRead.IsZero() {
+		b.firstRead = time.Now()
+	}
+	if b.preBytes <= b.delivered && !b.stalled {
+		time.Sleep(b.stallFor - time.Since(b.firstRead))
+		b.stalled = true
+	}
+	for i := range p {
+		p[i] = 0
+	}
+	b.delivered += len(p)
+	return len(p), nil
+}
+
+func (b *burstBody) Close() error { return nil }
+
+type burstTransport struct {
+	preBytes int
+	stallFor time.Duration
+	// stagger spreads the streams' stall ends a few milliseconds apart, the
+	// way independent connections through one congested tunnel actually
+	// resume. Without it every stream resumes on the same clock tick and the
+	// steady window can collapse to exactly zero width, which takes a
+	// different (already-guarded) code path than the sub-millisecond-but-
+	// nonzero window this models.
+	stagger time.Duration
+	opened  atomic.Int64
+}
+
+func (t *burstTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	k := t.opened.Add(1) - 1
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &burstBody{preBytes: t.preBytes, stallFor: t.stallFor + time.Duration(k)*t.stagger},
+		Request:    r,
+	}, nil
+}
+
+// TestMeasureBurstAfterWarmupBoundaryIsNotASteadyFigure: the steady-state
+// figure divides post-warmup bytes by the post-warmup window, and nothing
+// used to require that window to be meaningfully wide. A provider whose
+// delivery stalls across the warmup boundary and then bursts got the tail's
+// bytes divided by the tail's few-millisecond spread -- measured at 17x the
+// true aggregate in review, published with WarmupExcluded=true, i.e. as a
+// trustworthy steady figure rather than a bound. Such a transfer must take
+// the warmup-inclusive lower-bound path instead.
+func TestMeasureBurstAfterWarmupBoundaryIsNotASteadyFigure(t *testing.T) {
+	// Per stream: 1 MiB delivered instantly (all inside warmup), then a
+	// stall until well past the boundary, then the final 1 MiB in one burst,
+	// with the streams' resumes staggered ~10ms apart. The margin over
+	// WarmupDuration is generous so a loaded runner cannot move the stall
+	// back inside the warmup window.
+	stallFor := WarmupDuration + 300*time.Millisecond
+	client := &http.Client{Transport: &burstTransport{
+		preBytes: StreamBytes - 1024*1024,
+		stallFor: stallFor,
+		stagger:  10 * time.Millisecond,
+	}}
+
+	measureStart := time.Now()
+	sample, err := MeasureTarget(context.Background(), client,
+		Target{Name: "test", URL: "https://stub.example/download"}, 30*time.Second)
+	if err != nil {
+		t.Fatalf("MeasureTarget: %s", err)
+	}
+	wall := time.Since(measureStart)
+
+	if sample.WarmupExcluded {
+		t.Errorf("WarmupExcluded = true: a burst straddling the warmup boundary was published as a steady figure (%.0f B/s over %s)",
+			sample.BytesPerSecond, sample.Elapsed)
+	}
+	// The reported rate must be anchored to reality: the whole transfer took
+	// at least stallFor of wall clock, so the true aggregate rate is bounded
+	// by total/stallFor. Allow 2x for accounting slack; the defect this
+	// guards against reported ~17x.
+	trueCeiling := float64(sample.SampleByteCount) / stallFor.Seconds()
+	if sample.BytesPerSecond > 2*trueCeiling {
+		t.Errorf("BytesPerSecond = %.0f, more than double the wall-clock ceiling %.0f (wall %s): the figure describes the burst, not the link",
+			sample.BytesPerSecond, trueCeiling, wall)
+	}
+}
+
 // unalignedBody yields exactly chunk bytes per Read, forever. A real
 // connection does the same thing -- a Read returns whatever happens to have
 // arrived, not a whole buffer -- and the sizes it returns are not multiples of
@@ -758,7 +874,10 @@ func TestMeasureCapsEachStreamOnItsRemainingAllowance(t *testing.T) {
 
 	sample, err := MeasureTarget(context.Background(), client,
 		Target{Name: "test", URL: "https://stub.example/download"}, 30*time.Second)
-	if err != nil {
+	// The stub delivers from memory, so the whole 16 MiB can complete inside
+	// one coarse clock tick; the byte accounting under test is valid either
+	// way, so an unmeasurable duration is tolerated -- any other error is not.
+	if err != nil && !errors.Is(err, ErrUnmeasuredDuration) {
 		t.Fatalf("MeasureTarget: %s", err)
 	}
 	if want := int64(MaxSampleBytes); sample.SampleByteCount != want {

@@ -133,6 +133,18 @@ const (
 	// throughput, which would systematically penalise distant providers.
 	WarmupDuration = 500 * time.Millisecond
 
+	// MinSteadyDuration is the narrowest post-warmup window a steady-state
+	// figure may be computed over; anything narrower falls back to the
+	// warmup-inclusive lower bound. The warmup discard exists because
+	// sub-WarmupDuration behavior is not steady state, so a "steady" figure
+	// taken over a window shorter than that discard would contradict the
+	// package's own definition -- and it is not a theoretical case: a
+	// transfer that stalls across the warmup boundary and then bursts (a
+	// windowed tunnel transport refilling just after the boundary) divides
+	// the tail's bytes by the tail's few-millisecond spread. Measured in
+	// review: 17x the true aggregate, published with WarmupExcluded=true.
+	MinSteadyDuration = WarmupDuration
+
 	// DefaultTimeout is the per-target wall-clock cap.
 	DefaultTimeout = 5 * time.Second
 
@@ -190,6 +202,16 @@ var ErrUnsupported = errors.New("bandwidth: the server does not implement the pr
 // be computed. Distinct from a transport error: the request itself may have
 // succeeded and simply delivered nothing.
 var ErrNoSample = errors.New("bandwidth: no bytes transferred, cannot compute a rate")
+
+// ErrUnmeasuredDuration reports that bytes DID move but the wall clock did
+// not observably advance while they did, so no rate can be computed. This is
+// unreachable where the prober deploys (Linux clocks have nanosecond
+// granularity) but real on Windows dev machines, whose monotonic clock ticks
+// at ~0.5ms -- a loopback transfer can complete inside one tick. It is kept
+// distinct from ErrNoSample because "no bytes" and "no time" point at
+// opposite problems, and a message claiming no bytes moved when 16 MiB did
+// made this failure expensive to diagnose.
+var ErrUnmeasuredDuration = errors.New("bandwidth: bytes transferred but the clock did not advance, cannot compute a rate")
 
 // Target is one thing to download from. Both targets in production carry the
 // same URL shape and differ only in host, source tag, and whether an operator
@@ -488,7 +510,7 @@ func measure(
 		return Sample{}, ErrNoSample
 	}
 
-	if steadyElapsed := windowEnd.Sub(windowStart); !windowStart.IsZero() && 0 < steadyElapsed && 0 < steadyBytes {
+	if steadyElapsed := windowEnd.Sub(windowStart); !windowStart.IsZero() && MinSteadyDuration <= steadyElapsed && 0 < steadyBytes {
 		return Sample{
 			BytesPerSecond:  float64(steadyBytes) / steadyElapsed.Seconds(),
 			SampleByteCount: total,
@@ -498,17 +520,19 @@ func measure(
 		}, nil
 	}
 
-	// Every stream finished inside the warmup window. Rather than report no
-	// rate at all -- which would silently exclude the fastest providers, the
-	// ones most worth measuring -- fall back to the warmup-inclusive aggregate
+	// Every stream finished inside the warmup window, or the post-warmup
+	// window was narrower than MinSteadyDuration. Rather than report no rate
+	// at all -- which would silently exclude the fastest providers, the ones
+	// most worth measuring -- fall back to the warmup-inclusive aggregate
 	// over the full transfer. That figure includes slow start, so it
 	// understates the link: it is a lower bound, and WarmupExcluded=false says
 	// so. Parallel streams make this rarer than it was (the threshold moves
-	// from ~10 MiB/s to ~32 MiB/s) but not impossible, and it must stay honest
-	// when it happens.
+	// from ~10 MiB/s to ~16 MiB/s, the rate at which 16 MiB no longer yields
+	// a full MinSteadyDuration past the warmup) but not impossible, and it
+	// must stay honest when it happens.
 	totalElapsed := windowEnd.Sub(start)
 	if totalElapsed <= 0 {
-		return Sample{SampleByteCount: total, Streams: StreamCount}, ErrNoSample
+		return Sample{SampleByteCount: total, Streams: StreamCount}, ErrUnmeasuredDuration
 	}
 	return Sample{
 		BytesPerSecond:  float64(total) / totalElapsed.Seconds(),
