@@ -324,6 +324,28 @@ there would exclude exactly the fastest providers, which are the ones most
 worth measuring. Parallel streams make that case rarer than the single-stream
 probe's ~10 MiB/s threshold, not impossible.
 
+The steady window must also cover at least a quarter of the transfer's wall
+clock, or the figure falls back to the same lower bound. Discarding the warmup
+can only raise a rate by `total ÷ steady` elapsed — the case where the warmup
+carried nothing — so bounding that ratio bounds how far a "steady" figure can
+exceed the whole-transfer aggregate, which is the physical ceiling for bytes
+that demonstrably moved in that wall clock. Without it, a provider whose
+delivery stalls across the 500 ms boundary and then bursts (a windowed tunnel
+transport refilling just after it) has the burst's bytes divided by the burst's
+own spread: measured at **17× the true aggregate**, published as a steady
+figure rather than a bound. It is a ratio and not a fixed floor deliberately:
+the ratio puts the steady-path ceiling at ~24 MiB/s (measured ~21), where a
+fixed 500 ms floor would have put it at ~16 and given back most of the band the
+parallel-stream rewrite exists to have unlocked. Above that ceiling the
+lower-bound figure is reported. The old ~32 MiB/s ceiling was partly illusory —
+at 31 MiB/s the steady window is already under 20 ms, and 16 MiB divided by a
+window that thin is the inflation this bound exists to stop.
+
+Note that `(lower-bound)` is visible only in the prober's log: the ingest body
+carries the rate and the byte count, so the server currently stores a
+lower-bound figure indistinguishably from a steady one. Closing that needs a
+server-side field.
+
 **The two figures are stored and logged separately and are never averaged.**
 That is the entire point of having two: a provider that prioritises one path
 and not the other is invisible in a combined number and obvious in a pair. The

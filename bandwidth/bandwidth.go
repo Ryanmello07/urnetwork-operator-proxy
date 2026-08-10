@@ -112,7 +112,9 @@ const (
 	// warmup window on ordinary providers: 16 MiB aggregate takes longer than
 	// WarmupDuration for anything under 32 MiB/s, where the old 5 MiB single
 	// stream crossed that line at 10 MiB/s and therefore fell back to the
-	// lower-bound path on most of the fleet.
+	// lower-bound path on most of the fleet. (The steady window must also be
+	// a large enough fraction of the transfer -- see MaxSteadyInflation --
+	// but that bound is relative, so it does not move this crossover.)
 	StreamBytes = 2 * 1024 * 1024
 
 	// MaxSampleBytes bounds one measurement across all of its streams. It is
@@ -133,17 +135,33 @@ const (
 	// throughput, which would systematically penalise distant providers.
 	WarmupDuration = 500 * time.Millisecond
 
-	// MinSteadyDuration is the narrowest post-warmup window a steady-state
-	// figure may be computed over; anything narrower falls back to the
-	// warmup-inclusive lower bound. The warmup discard exists because
-	// sub-WarmupDuration behavior is not steady state, so a "steady" figure
-	// taken over a window shorter than that discard would contradict the
-	// package's own definition -- and it is not a theoretical case: a
-	// transfer that stalls across the warmup boundary and then bursts (a
-	// windowed tunnel transport refilling just after the boundary) divides
-	// the tail's bytes by the tail's few-millisecond spread. Measured in
-	// review: 17x the true aggregate, published with WarmupExcluded=true.
-	MinSteadyDuration = WarmupDuration
+	// MaxSteadyInflation bounds how much of the transfer's wall clock the
+	// steady window may exclude: the window must cover at least
+	// 1/MaxSteadyInflation of it, or the figure falls back to the
+	// warmup-inclusive lower bound.
+	//
+	// Excluding the warmup can raise the reported rate by at most
+	// totalElapsed/steadyElapsed -- the case where the discarded warmup
+	// carried nothing -- so this is directly a bound on how far a "steady"
+	// figure may exceed the whole-transfer aggregate, which is the physical
+	// ceiling for that transfer. A transfer stalling across the warmup
+	// boundary and then bursting (a windowed tunnel transport refilling just
+	// after the boundary) is the shape that exceeds it; review measured 17x
+	// the true aggregate published as steady.
+	//
+	// 4 leaves real slow-start exclusion intact -- a warmup carrying a
+	// quarter of the transfer's average still passes -- while capping the
+	// residual error at 4x rather than the unbounded original.
+	//
+	// It is deliberately a ratio and not a duration. Solving
+	// T/(T-WarmupDuration) <= 4 for the 16 MiB transfer gives a steady-path
+	// ceiling of ~24 MiB/s (measured ~21 with real overhead), against ~16
+	// MiB/s for a fixed 500 ms floor. Above that the reported figure is the
+	// warmup-inclusive lower bound. The pre-bound ceiling of ~32 MiB/s was
+	// partly illusory: at 31 MiB/s the steady window is already under 20 ms,
+	// and dividing 16 MiB by a window that thin is the inflation this bound
+	// exists to stop, not a measurement worth keeping.
+	MaxSteadyInflation = 4
 
 	// DefaultTimeout is the per-target wall-clock cap.
 	DefaultTimeout = 5 * time.Second
@@ -248,11 +266,18 @@ type Sample struct {
 	// the fan-out that produced it.
 	Streams int
 	// WarmupExcluded reports whether the rate was computed over the
-	// steady-state window only. It is false when the whole transfer finished
-	// inside WarmupDuration -- 16 MiB completes in under 500 ms above
-	// ~32 MiB/s, which the fastest datacenter-hosted providers clear -- in
-	// which case the rate is computed over the full transfer instead and is a
-	// LOWER BOUND on the real throughput, because it includes slow start.
+	// steady-state window only. It is false in two cases -- the whole
+	// transfer finished inside WarmupDuration (16 MiB completes in under
+	// 500 ms above ~32 MiB/s, which the fastest datacenter-hosted providers
+	// clear), or the steady window covered too small a fraction of the
+	// transfer to describe it (see MaxSteadyInflation) -- in which case the
+	// rate is computed over the full transfer instead and is a LOWER BOUND on
+	// the real throughput, because it includes slow start.
+	//
+	// This flag does NOT reach the server: ingest submits only the rate and
+	// the byte count, so a lower-bound figure is stored indistinguishably
+	// from a steady one. That is a gap worth closing on the server side --
+	// until it is, the distinction lives only in this process's log line.
 	//
 	// Reporting a lower bound rather than zero is deliberate: returning zero
 	// here would make the fastest providers, the ones most worth measuring,
@@ -515,7 +540,36 @@ func measure(
 		return Sample{}, ErrNoSample
 	}
 
-	if steadyElapsed := windowEnd.Sub(windowStart); !windowStart.IsZero() && MinSteadyDuration <= steadyElapsed && 0 < steadyBytes {
+	totalElapsed := windowEnd.Sub(start)
+	if totalElapsed <= 0 {
+		return Sample{SampleByteCount: total, Streams: StreamCount}, ErrUnmeasuredDuration
+	}
+
+	// The steady window must be a representative FRACTION of the transfer,
+	// not merely wider than some fixed duration.
+	//
+	// Excluding the warmup can only raise the reported rate by the factor
+	// totalElapsed/steadyElapsed (the extreme where the discarded warmup
+	// carried no bytes at all), so bounding that ratio bounds how far a
+	// steady figure may exceed the whole-transfer aggregate -- which is the
+	// physical ceiling, since those bytes demonstrably moved in that wall
+	// clock. A stall straddling the warmup boundary followed by a burst is
+	// exactly the shape that blows past it: the tail's bytes divided by the
+	// tail's spread. Reported inflation is now bounded at
+	// MaxSteadyInflation whatever the stall's width, where an absolute floor
+	// only caught stalls whose tail happened to be narrow.
+	//
+	// A relative bound also costs nothing at the top of the range, which an
+	// absolute one did: a healthy 20 MiB/s provider moves 16 MiB in ~800ms
+	// and keeps a ~300ms steady window, comfortably inside the ratio. That
+	// band is the first one the parallel-stream rewrite unlocked, so giving
+	// it back to the lower-bound path would have undone the point of it.
+	steadyElapsed := windowEnd.Sub(windowStart)
+	representative := !windowStart.IsZero() &&
+		0 < steadyBytes &&
+		0 < steadyElapsed &&
+		totalElapsed <= time.Duration(MaxSteadyInflation)*steadyElapsed
+	if representative {
 		return Sample{
 			BytesPerSecond:  float64(steadyBytes) / steadyElapsed.Seconds(),
 			SampleByteCount: total,
@@ -526,19 +580,12 @@ func measure(
 	}
 
 	// Every stream finished inside the warmup window, or the post-warmup
-	// window was narrower than MinSteadyDuration. Rather than report no rate
-	// at all -- which would silently exclude the fastest providers, the ones
-	// most worth measuring -- fall back to the warmup-inclusive aggregate
-	// over the full transfer. That figure includes slow start, so it
-	// understates the link: it is a lower bound, and WarmupExcluded=false says
-	// so. Parallel streams make this rarer than it was (the threshold moves
-	// from ~10 MiB/s to ~16 MiB/s, the rate at which 16 MiB no longer yields
-	// a full MinSteadyDuration past the warmup) but not impossible, and it
-	// must stay honest when it happens.
-	totalElapsed := windowEnd.Sub(start)
-	if totalElapsed <= 0 {
-		return Sample{SampleByteCount: total, Streams: StreamCount}, ErrUnmeasuredDuration
-	}
+	// window was too small a fraction of the transfer to describe it. Rather
+	// than report no rate at all -- which would silently exclude the fastest
+	// providers, the ones most worth measuring -- fall back to the
+	// warmup-inclusive aggregate over the full transfer. That figure includes
+	// slow start, so it understates the link: it is a lower bound, and
+	// WarmupExcluded=false says so. It must stay honest when it happens.
 	return Sample{
 		BytesPerSecond:  float64(total) / totalElapsed.Seconds(),
 		SampleByteCount: total,

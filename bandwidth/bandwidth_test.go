@@ -784,7 +784,11 @@ func (b *burstBody) Read(p []byte) (int, error) {
 		b.firstRead = time.Now()
 	}
 	if b.preBytes <= b.delivered && !b.stalled {
-		time.Sleep(b.stallFor - time.Since(b.firstRead))
+		// Clamped: a negative sleep would silently drop the stall and make
+		// this a different test that happens to still pass.
+		if rest := b.stallFor - time.Since(b.firstRead); rest > 0 {
+			time.Sleep(rest)
+		}
 		b.stalled = true
 	}
 	for i := range p {
@@ -861,6 +865,110 @@ func TestMeasureBurstAfterWarmupBoundaryIsNotASteadyFigure(t *testing.T) {
 			sample.BytesPerSecond, trueCeiling, wall)
 	}
 }
+
+// TestMeasureWideStallBurstIsNotASteadyFigure is the case an absolute
+// window floor could not catch: the stall is long and the burst that follows
+// is WIDER than any fixed minimum, so the tail looks like a respectable
+// steady window while still being the tail of a stall. Its bytes divided by
+// its own spread reported 5.1x the true aggregate in review. The bound is
+// relative for exactly this reason -- the tail must be a fraction of the
+// transfer, not merely wide in absolute terms.
+func TestMeasureWideStallBurstIsNotASteadyFigure(t *testing.T) {
+	// ~4s of stall, then the last 512 KiB/stream paced out: a steady window
+	// several times WarmupDuration -- so no absolute floor catches it -- and
+	// still under a quarter of the transfer's wall clock.
+	stallFor := 4 * time.Second
+	start := time.Now()
+	client := &http.Client{Transport: &pacedBurstTransport{
+		preBytes: StreamBytes - 512*1024,
+		stallFor: stallFor,
+		chunk:    64 * 1024,
+		pace:     85 * time.Millisecond,
+	}}
+
+	sample, err := MeasureTarget(context.Background(), client,
+		Target{Name: "test", URL: "https://stub.example/download"}, 30*time.Second)
+	if err != nil {
+		t.Fatalf("MeasureTarget: %s", err)
+	}
+	wall := time.Since(start)
+
+	// The contract, stated directly: however the window falls out, a
+	// published rate may not exceed the whole-transfer aggregate -- the
+	// physical ceiling for bytes that demonstrably moved in that wall clock
+	// -- by more than MaxSteadyInflation.
+	trueAggregate := float64(sample.SampleByteCount) / wall.Seconds()
+	if inflation := sample.BytesPerSecond / trueAggregate; inflation > MaxSteadyInflation {
+		t.Errorf("reported %.0f B/s against a true aggregate of %.0f B/s over %s: %.1fx inflation, bound is %dx (steady=%v window=%s)",
+			sample.BytesPerSecond, trueAggregate, wall, inflation, MaxSteadyInflation, sample.WarmupExcluded, sample.Elapsed)
+	}
+	if sample.WarmupExcluded {
+		t.Errorf("WarmupExcluded = true over a %s window against a %s transfer: a wide tail is still the tail of a stall, and %.0f B/s was published as steady",
+			sample.Elapsed, wall, sample.BytesPerSecond)
+	}
+}
+
+// pacedBurstTransport is burstTransport whose post-stall delivery is paced
+// over many reads rather than dumped, so the steady window it produces is
+// wide in absolute terms.
+type pacedBurstTransport struct {
+	preBytes int
+	stallFor time.Duration
+	chunk    int
+	pace     time.Duration
+}
+
+func (t *pacedBurstTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body: &pacedBurstBody{
+			preBytes: t.preBytes,
+			stallFor: t.stallFor,
+			chunk:    t.chunk,
+			pace:     t.pace,
+		},
+		Request: r,
+	}, nil
+}
+
+type pacedBurstBody struct {
+	preBytes  int
+	stallFor  time.Duration
+	chunk     int
+	pace      time.Duration
+	firstRead time.Time
+	delivered int
+	stalled   bool
+}
+
+func (b *pacedBurstBody) Read(p []byte) (int, error) {
+	if b.firstRead.IsZero() {
+		b.firstRead = time.Now()
+	}
+	if b.preBytes <= b.delivered && !b.stalled {
+		// Clamped: if the pre-burst phase somehow outran the stall, sleeping
+		// a negative duration would silently drop the stall entirely and turn
+		// this into a different test.
+		if rest := b.stallFor - time.Since(b.firstRead); rest > 0 {
+			time.Sleep(rest)
+		}
+		b.stalled = true
+	}
+	if b.stalled {
+		time.Sleep(b.pace)
+	}
+	n := len(p)
+	if b.stalled && b.chunk < n {
+		n = b.chunk
+	}
+	for i := 0; i < n; i++ {
+		p[i] = 0
+	}
+	b.delivered += n
+	return n, nil
+}
+
+func (b *pacedBurstBody) Close() error { return nil }
 
 // unalignedBody yields exactly chunk bytes per Read, forever. A real
 // connection does the same thing -- a Read returns whatever happens to have
