@@ -81,6 +81,8 @@ func parseIpPn(b []byte) (SourceResult, error) {
 		Mobile:      v.Mobile,
 		Proxy:       v.Proxy,
 		Hosting:     v.Hosting,
+		// ip.pn is the only source that carries all three.
+		Supports: FlagSupport{Hosting: true, Proxy: true, Mobile: true},
 	}, nil
 }
 
@@ -103,6 +105,8 @@ func parseFreeIpApi(b []byte) (SourceResult, error) {
 		Region:      v.RegionName,
 		ASN:         parseASNValue(v.ASN),
 		Proxy:       v.IsProxy,
+		// freeipapi exposes isProxy and nothing equivalent for the other two.
+		Supports: FlagSupport{Proxy: true},
 	}, nil
 }
 

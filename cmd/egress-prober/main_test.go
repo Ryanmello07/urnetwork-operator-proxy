@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -36,7 +37,11 @@ var (
 func TestMain(m *testing.M) {
 	code := m.Run()
 	if buildDir != "" {
-		os.RemoveAll(buildDir)
+		// Reported rather than discarded: on Windows a still-locked .exe leaves
+		// the ~36 MB directory behind, the exact thing this cleanup prevents.
+		if err := os.RemoveAll(buildDir); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not remove the test build dir %s: %s\n", buildDir, err)
+		}
 	}
 	os.Exit(code)
 }

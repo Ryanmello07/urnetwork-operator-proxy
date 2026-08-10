@@ -328,31 +328,61 @@ func consensus(ok []SourceResult) ConsensusLocation {
 		loc.Org = asnOrg[bestASN]
 	}
 
-	// net_type flags: set only when >= MinSources sources report them.
+	// net_type flags: corroborated where corroboration is POSSIBLE.
 	//
 	// These were OR-ed, which made each one a single-source assertion in a
-	// record whose country and city both require corroboration. One of three
+	// record whose country and city both require corroboration: one of three
 	// free apis -- compromised, or merely wrong for an afternoon -- could
-	// therefore mark Proxy or Hosting on every provider the fleet probes,
-	// fleet-wide and indistinguishable downstream from a flag all three
-	// agreed on. A flag nobody corroborates now stays false, which is the
-	// same direction the rest of this function fails in: silent about what it
-	// does not know, rather than confident about what one source said.
-	var hosting, proxy, mobile int
-	for _, r := range ok {
-		if r.Hosting {
-			hosting++
-		}
-		if r.Proxy {
-			proxy++
-		}
-		if r.Mobile {
-			mobile++
-		}
-	}
-	loc.Hosting = hosting >= MinSources
-	loc.Proxy = proxy >= MinSources
-	loc.Mobile = mobile >= MinSources
+	// mark Proxy or Hosting on every provider the fleet probes,
+	// indistinguishable downstream from a flag all three agreed on.
+	//
+	// A flat MinSources bar is wrong here though, because the sources are not
+	// interchangeable for these fields the way they are for the country. Only
+	// ip.pn carries hosting and mobile at all (freeipapi carries proxy;
+	// ipinfo carries none), so demanding two votes for hosting made it
+	// permanently false -- a silent, total loss of the field rather than a
+	// conservative default. The threshold is therefore the corroboration
+	// actually available: two votes when two sources can express the flag,
+	// one when only one can.
+	//
+	// The residual risk is explicit rather than hidden: a flag only one
+	// source can report is that source's word, and adding the field to a
+	// second parser is what raises its bar. Callers that need to know which
+	// regime a flag came from must look at the per-source records in Sources.
+	loc.Hosting = flagAgreed(ok, func(r SourceResult) (bool, bool) { return r.Hosting, r.Supports.Hosting })
+	loc.Proxy = flagAgreed(ok, func(r SourceResult) (bool, bool) { return r.Proxy, r.Supports.Proxy })
+	loc.Mobile = flagAgreed(ok, func(r SourceResult) (bool, bool) { return r.Mobile, r.Supports.Mobile })
 
 	return loc
+}
+
+// flagAgreed reports one net-type flag's consensus value. get returns the
+// flag and whether that source can express it at all.
+//
+// The threshold is min(MinSources, sources capable of the flag): full
+// corroboration where the table supports it, and the single capable source's
+// word where it does not -- never a bar no source set can clear. Sources that
+// cannot express the flag are not counted as votes against it; they have no
+// opinion, and treating silence as a "false" vote would make one capable
+// source unable to set a flag that two others simply never mention.
+func flagAgreed(ok []SourceResult, get func(SourceResult) (value bool, supported bool)) bool {
+	votes, capable := 0, 0
+	for _, r := range ok {
+		value, supported := get(r)
+		if !supported {
+			continue
+		}
+		capable++
+		if value {
+			votes++
+		}
+	}
+	if capable == 0 {
+		return false
+	}
+	threshold := MinSources
+	if capable < threshold {
+		threshold = capable
+	}
+	return votes >= threshold
 }

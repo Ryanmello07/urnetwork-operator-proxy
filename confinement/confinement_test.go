@@ -373,6 +373,11 @@ func TestAddressesRoutesBlockedResolverAnswersToUnresolved(t *testing.T) {
 		{"ipv4 link-local", "169.254.169.254"},
 		{"ipv6 link-local", "fe80::1"},
 		{"multicast", "ff02::1"},
+		{"rfc1918 answer from a split-horizon resolver", "192.168.1.1"},
+		{"rfc1918 10/8", "10.0.0.53"},
+		{"rfc1918 172.16/12", "172.16.0.1"},
+		{"ipv6 ULA", "fd00::1"},
+		{"cgnat", "100.64.0.1"},
 		{"ipv4-mapped unspecified", "::ffff:0.0.0.0"},
 	}
 	for _, tc := range cases {
@@ -433,5 +438,57 @@ func TestAddressesRequiresALookup(t *testing.T) {
 	}
 	if !errors.Is(err, ErrNoLookup) {
 		t.Fatalf("Addresses error = %v, want ErrNoLookup", err)
+	}
+}
+
+// TestAddressesRefusesWhenResolutionIsInterrupted: the resolution budget is
+// shared across all hosts, so a resolver that hangs on the first one leaves
+// every remaining host failing instantly for the caller's reason. Those land
+// in `unresolved`, the caller logs a degraded WARNING and proceeds -- having
+// proven confinement only for whatever resolved before the clock ran out.
+// Verify refuses on exactly this shape; Addresses must too.
+func TestAddressesRefusesWhenResolutionIsInterrupted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	first := true
+	lookup := func(ctx context.Context, host string) ([]string, error) {
+		if first {
+			first = false
+			cancel() // the shared budget is burned resolving host #1
+			return []string{"203.0.113.7"}, nil
+		}
+		return nil, ctx.Err()
+	}
+	defer cancel()
+
+	_, _, err := Addresses(ctx, lookup, []string{"a.example", "b.example", "c.example", "d.example"}, "443")
+	if err == nil {
+		t.Fatal("Addresses reported success after resolution was cut short; the hosts it never resolved would be logged as a degraded pass")
+	}
+	if !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("Addresses error = %v, want ErrInterrupted", err)
+	}
+}
+
+// TestVerifyKeepsEvidenceFromACheckThatFinished: a context that dies in the
+// window AFTER the final genuine refusal came back describes a check that
+// did finish. Reporting "interrupted before it finished" there discards real
+// evidence and exits non-zero on a correctly confined host.
+func TestVerifyKeepsEvidenceFromACheckThatFinished(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	dialed := 0
+	dial := func(dialCtx context.Context, network, addr string) (net.Conn, error) {
+		dialed++
+		// A real deny rule: the refusal has nothing to do with the context.
+		err := errors.New("connect: permission denied")
+		if dialed == 3 {
+			cancel() // the operator's signal lands after the last real answer
+		}
+		return nil, err
+	}
+	defer cancel()
+
+	err := Verify(ctx, dial, []string{"203.0.113.1:443", "203.0.113.2:443", "203.0.113.3:443"}, nil, MinTimeout)
+	if err != nil {
+		t.Fatalf("Verify error = %v, want nil: every address was dialed and every one was genuinely refused", err)
 	}
 }

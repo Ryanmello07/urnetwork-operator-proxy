@@ -196,3 +196,54 @@ func TestSourceHostsCoversEverySource(t *testing.T) {
 		seen[h] = true
 	}
 }
+
+// TestFlagsAreReachableThroughTheRealParsers is the regression test for a
+// corroboration bar no source set could clear. Only ip.pn's parser populates
+// hosting and mobile (freeipapi carries proxy; ipinfo carries none), so a flat
+// two-vote threshold made those two fields permanently false -- a silent total
+// loss of the signal rather than a conservative default. This drives the REAL
+// parsers, which is the only way to see that: a test hand-building
+// SourceResult{Hosting: true} for two sources asserts a shape no parser in
+// this repo can emit.
+func TestFlagsAreReachableThroughTheRealParsers(t *testing.T) {
+	ipPn, err := parseIpPn([]byte(`{"status":"success","countryCode":"US","country":"United States","asn":7922,"hosting":true,"proxy":true,"mobile":true}`))
+	if err != nil {
+		t.Fatalf("parseIpPn: %s", err)
+	}
+	ipPn.Name, ipPn.OK = "ip.pn", true
+
+	freeIpApi, err := parseFreeIpApi([]byte(`{"countryCode":"US","countryName":"United States","asn":"7922","isProxy":true}`))
+	if err != nil {
+		t.Fatalf("parseFreeIpApi: %s", err)
+	}
+	freeIpApi.Name, freeIpApi.OK = "freeipapi", true
+
+	ipInfo, err := parseIpInfo([]byte(`{"country":"US","org":"AS7922 Comcast"}`))
+	if err != nil {
+		t.Fatalf("parseIpInfo: %s", err)
+	}
+	ipInfo.Name, ipInfo.OK = "ipinfo", true
+
+	loc := consensus([]SourceResult{ipPn, freeIpApi, ipInfo})
+
+	// hosting and mobile: ip.pn is the only source capable of them, so its
+	// word is the most corroboration obtainable and must be enough.
+	if !loc.Hosting {
+		t.Error("Hosting is unreachable: only ip.pn's parser can report it, so requiring two votes makes it permanently false")
+	}
+	if !loc.Mobile {
+		t.Error("Mobile is unreachable for the same reason as Hosting")
+	}
+	// proxy: two sources can report it, so two must agree -- and here they do.
+	if !loc.Proxy {
+		t.Error("Proxy is unreachable: ip.pn and freeipapi both reported it")
+	}
+
+	// ...and with only the freeipapi vote, proxy stays unset, because a
+	// second capable source (ip.pn) declined to corroborate it.
+	ipPnClean, _ := parseIpPn([]byte(`{"status":"success","countryCode":"US","country":"United States","asn":7922}`))
+	ipPnClean.Name, ipPnClean.OK = "ip.pn", true
+	if consensus([]SourceResult{ipPnClean, freeIpApi, ipInfo}).Proxy {
+		t.Error("Proxy was set on one vote although a second capable source did not corroborate it")
+	}
+}

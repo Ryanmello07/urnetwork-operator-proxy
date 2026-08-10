@@ -1,4 +1,4 @@
-# urnetwork-operator-proxy
+# operator-proxy
 
 Operator tooling for urnetwork network operators.
 
@@ -27,7 +27,15 @@ a consensus, and submits the result to the operator's server.
 
 ### Build
 
+This module resolves `github.com/urnetwork/connect` and
+`github.com/urnetwork/glog` through `replace ../` directives, so a lone
+checkout does **not** build — it fails with a `missing go.sum entry` that names
+nothing about the real cause. Check the siblings out beside it, under exactly
+these directory names:
+
 ```bash
+git clone https://github.com/urnetwork/connect.git ../connect
+git clone https://github.com/urnetwork/glog.git ../glog
 go build ./cmd/egress-prober
 ```
 

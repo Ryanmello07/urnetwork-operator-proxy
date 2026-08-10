@@ -1103,3 +1103,30 @@ func TestHTTPClientForHostsOpensOneConnectionPerConcurrentRequest(t *testing.T) 
 			got, streams, streams)
 	}
 }
+
+// TestOpenCopiesThePinMap: Open must not alias the caller's map. The cmd
+// layer refreshes pins on a timer, so a caller mutating its own map after
+// Open would race the per-dial reads in DialTLSContext -- and the copy had no
+// coverage at all: reverting it left the whole suite green.
+func TestOpenCopiesThePinMap(t *testing.T) {
+	cfg := dummyOpenConfig()
+	pins := map[string][]string{"ipinfo.io": {"originalpin"}}
+	cfg.Pins = pins
+
+	tun, err := Open(context.Background(), cfg, connect.NewId())
+	if err != nil {
+		t.Fatalf("Open: %s", err)
+	}
+	defer tun.Close()
+
+	// The refresh the cmd layer performs, done the unsafe way.
+	pins["ipinfo.io"] = []string{"rotatedpin"}
+	pins["added.example"] = []string{"newpin"}
+
+	if got := tun.pins["ipinfo.io"]; len(got) != 1 || got[0] != "originalpin" {
+		t.Errorf("tunnel pins for ipinfo.io = %v after the caller mutated its map, want [originalpin]: Open aliased the caller's map", got)
+	}
+	if _, added := tun.pins["added.example"]; added {
+		t.Error("a host added to the caller's map after Open appeared in the tunnel's allowlist")
+	}
+}

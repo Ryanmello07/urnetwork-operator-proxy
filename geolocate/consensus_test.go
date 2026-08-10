@@ -264,10 +264,11 @@ func TestConsensusCityAgreementWithRegionConfident(t *testing.T) {
 // with nothing downstream able to tell a corroborated flag from a solo one.
 // Two sources agreeing is the same MinSources bar the country clears.
 func TestConsensusFlagsRequireCorroboration(t *testing.T) {
+	all := FlagSupport{Hosting: true, Proxy: true, Mobile: true}
 	ok := []SourceResult{
-		{Name: "a", OK: true, CountryCode: "US", Hosting: false, Proxy: false, Mobile: false},
-		{Name: "b", OK: true, CountryCode: "US", Hosting: true, Proxy: true, Mobile: false},
-		{Name: "c", OK: true, CountryCode: "US", Hosting: true, Proxy: false, Mobile: false},
+		{Name: "a", OK: true, CountryCode: "US", Supports: all},
+		{Name: "b", OK: true, CountryCode: "US", Hosting: true, Proxy: true, Supports: all},
+		{Name: "c", OK: true, CountryCode: "US", Hosting: true, Supports: all},
 	}
 	loc := consensus(ok)
 	if !loc.Hosting {
@@ -287,9 +288,13 @@ func TestConsensusFlagsRequireCorroboration(t *testing.T) {
 // not the country (outvoted), not the flags, not the ASN it invents.
 func TestConsensusSingleRogueSourceCannotDictateTheRecord(t *testing.T) {
 	ok := []SourceResult{
-		{Name: "ip.pn", OK: true, CountryCode: "US", Country: "United States", ASN: 7922},
-		{Name: "freeipapi", OK: true, CountryCode: "US", Country: "United States", ASN: 7922},
-		{Name: "ipinfo", OK: true, CountryCode: "RU", Country: "Russia", ASN: 64512, Org: "Rogue", Hosting: true, Proxy: true, Mobile: true},
+		{Name: "ip.pn", OK: true, CountryCode: "US", Country: "United States", ASN: 7922,
+			Supports: FlagSupport{Hosting: true, Proxy: true, Mobile: true}},
+		{Name: "freeipapi", OK: true, CountryCode: "US", Country: "United States", ASN: 7922,
+			Supports: FlagSupport{Hosting: true, Proxy: true, Mobile: true}},
+		{Name: "ipinfo", OK: true, CountryCode: "RU", Country: "Russia", ASN: 64512, Org: "Rogue",
+			Hosting: true, Proxy: true, Mobile: true,
+			Supports: FlagSupport{Hosting: true, Proxy: true, Mobile: true}},
 	}
 	loc := consensus(ok)
 	if loc.CountryCode != "us" || !loc.CountryConfident {

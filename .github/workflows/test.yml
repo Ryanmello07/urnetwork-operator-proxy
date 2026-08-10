@@ -5,9 +5,17 @@ on:
     branches: [main, beta]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -17,10 +25,23 @@ jobs:
       # directives, so a lone checkout does not build -- it fails with a
       # "missing go.sum entry" that names nothing about the real cause. The
       # siblings must sit next to it, under exactly these directory names.
-      - name: Check out the sibling modules
-        run: |
-          git clone --depth 1 https://github.com/urnetwork/connect.git connect
-          git clone --depth 1 https://github.com/urnetwork/glog.git glog
+      #
+      # They are PINNED. Tracking connect main unpinned makes this repo's CI a
+      # function of another repo's latest commit: connect raising a dependency
+      # rewrites go.mod/go.sum here, which fails the tidy check below AND the
+      # build ("missing go.sum entry"), so every open PR goes red at once for a
+      # change none of them made. Bump these deliberately, in a commit that
+      # also carries the resulting go.mod/go.sum.
+      - uses: actions/checkout@v4
+        with:
+          repository: urnetwork/connect
+          ref: b4a2bc9b0b10f39c60290b33cef6d270ad7300ea
+          path: connect
+      - uses: actions/checkout@v4
+        with:
+          repository: urnetwork/glog
+          ref: 13fba7d8f57e2c37274dd2e348578d5de9d66a59
+          path: glog
 
       - uses: actions/setup-go@v5
         with:
