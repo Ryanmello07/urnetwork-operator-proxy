@@ -60,10 +60,26 @@ func normalizeHost(host string) string {
 // checkPin, PinVerifier, and the tunnel-layer allowlist check all normalize
 // the host they look up the same way via normalizeHost, so a pin map key
 // and a dialed host always compare on equal footing.
+// Colliding keys are MERGED, not overwritten: "ipinfo.io" and
+// "IPINFO.IO:443" normalize to the same host, and letting one win would
+// silently drop the other's pins in map iteration order -- nondeterministic
+// which set survived, and a dropped pin is a probe that fails closed against
+// the legitimate host after a rotation. Merging is also the safe direction
+// for the allowlist, since both keys were already permitted by the caller.
 func normalizePins(pins map[string][]string) map[string][]string {
 	normalized := make(map[string][]string, len(pins))
 	for host, allowed := range pins {
-		normalized[normalizeHost(host)] = allowed
+		key := normalizeHost(host)
+		if existing, ok := normalized[key]; ok {
+			// Copy on first merge rather than appending into the caller's
+			// backing array, which append may otherwise write through.
+			merged := make([]string, 0, len(existing)+len(allowed))
+			merged = append(merged, existing...)
+			merged = append(merged, allowed...)
+			normalized[key] = merged
+			continue
+		}
+		normalized[key] = allowed
 	}
 	return normalized
 }

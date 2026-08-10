@@ -167,11 +167,21 @@ func Open(ctx context.Context, cfg Config, providerClientId connect.Id) (*Tunnel
 		}
 	}()
 
+	// The pin map is copied, not aliased: a caller that mutates its own map
+	// after Open -- the cmd layer refreshes pins on a timer -- would otherwise
+	// race the per-dial reads in DialTLSContext. The cmd layer already hands
+	// over a fresh copy per Open, so this makes the package safe by
+	// construction rather than by the caller remembering.
+	pins := make(map[string][]string, len(cfg.Pins))
+	for host, allowed := range cfg.Pins {
+		pins[host] = append([]string(nil), allowed...)
+	}
+
 	return &Tunnel{
 		cancel: cancel,
 		tun:    tun,
 		mc:     mc,
-		pins:   cfg.Pins,
+		pins:   pins,
 	}, nil
 }
 

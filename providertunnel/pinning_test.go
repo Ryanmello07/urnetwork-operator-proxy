@@ -374,3 +374,33 @@ func TestSPKIPinStableAcrossReissuance(t *testing.T) {
 }
 
 var _ = tls.Config{}
+
+// TestNormalizePinsMergesCollidingKeys: two keys that normalize to the same
+// host ("ipinfo.io" and "IPINFO.IO:443") used to overwrite each other, so
+// which pin set survived depended on map iteration order -- nondeterministic,
+// and a dropped pin means the probe fails closed against the legitimate host
+// after a rotation the surviving entry does not cover.
+func TestNormalizePinsMergesCollidingKeys(t *testing.T) {
+	leaf, _ := selfSigned(t, "pinned.example")
+	rotated, _ := selfSigned(t, "pinned.example")
+
+	normalized := normalizePins(map[string][]string{
+		"pinned.example":     {SPKIPin(leaf)},
+		"PINNED.EXAMPLE:443": {SPKIPin(rotated)},
+	})
+
+	allowed := normalized["pinned.example"]
+	if len(allowed) != 2 {
+		t.Fatalf("normalized pins = %v, want both colliding keys' pins merged", allowed)
+	}
+	// Both certificates must now verify under the single normalized key.
+	for name, cert := range map[string]*x509.Certificate{"leaf": leaf, "rotated": rotated} {
+		cfg := PinnedTLSConfigForHost(map[string][]string{
+			"pinned.example":     {SPKIPin(leaf)},
+			"PINNED.EXAMPLE:443": {SPKIPin(rotated)},
+		}, "pinned.example")
+		if err := cfg.VerifyPeerCertificate([][]byte{cert.Raw}, chainOf(cert)); err != nil {
+			t.Errorf("%s certificate rejected after key collision: %v", name, err)
+		}
+	}
+}
