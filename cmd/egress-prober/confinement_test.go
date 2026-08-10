@@ -11,11 +11,13 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/urnetwork/urnetwork-operator-proxy/bandwidth"
 	"github.com/urnetwork/urnetwork-operator-proxy/confinement"
 	"github.com/urnetwork/urnetwork-operator-proxy/egresshealth"
 	"github.com/urnetwork/urnetwork-operator-proxy/geolocate"
@@ -520,5 +522,50 @@ func TestEgressHealthAllDefaultsOn(t *testing.T) {
 	}
 	if !*all {
 		t.Error("-egress-health-all defaults off; every provider test must run the full table")
+	}
+}
+
+// TestBandwidthCDNHostIsInTheConfinementCheck: the CDN target is a
+// third-party host reached through the tunnel, so a jail that lets the
+// prober reach it directly is the same defect as one that lets it reach a
+// geolocation api. probeHosts' comment claimed to cover "every third-party
+// host this process reaches through a tunnel" while excluding it, and an
+// operator translating that list into -confinement-address entries would
+// never learn it existed.
+func TestBandwidthCDNHostIsInTheConfinementCheck(t *testing.T) {
+	hosts := probeHosts(bandwidthProbeHosts(false, bandwidth.CDNTestURL)...)
+	want := "speed.cloudflare.com"
+	if !slices.Contains(hosts, want) {
+		t.Errorf("probe hosts do not include the bandwidth CDN target %q", want)
+	}
+
+	// -skip-bandwidth means the host is never reached, so it must not be
+	// dialed by the self-check either: a host this process will not touch is
+	// not evidence about the confinement it needs.
+	if got := bandwidthProbeHosts(true, bandwidth.CDNTestURL); len(got) != 0 {
+		t.Errorf("bandwidthProbeHosts with -skip-bandwidth = %v, want none", got)
+	}
+
+	// A custom -bandwidth-cdn-url must follow, or the check covers a host the
+	// deployment does not use while missing the one it does.
+	if got := bandwidthProbeHosts(false, "https://mirror.example.net/__down"); len(got) != 1 || got[0] != "mirror.example.net" {
+		t.Errorf("bandwidthProbeHosts with a custom url = %v, want [mirror.example.net]", got)
+	}
+}
+
+// TestNegativeCacheTTLIsRejected: a negative ttl makes recentlyProbed always
+// false, silently disabling the enumeration cache. Every other duration flag
+// fails fast.
+func TestNegativeCacheTTLIsRejected(t *testing.T) {
+	out, code := runProber(t,
+		"-api-url", "http://127.0.0.1:1",
+		"-platform-url", "ws://127.0.0.1:1",
+		"-cache-ttl", "-1h",
+	)
+	if code == 0 {
+		t.Fatalf("a negative -cache-ttl was accepted.\n--- output ---\n%s", out)
+	}
+	if !strings.Contains(out, "-cache-ttl") {
+		t.Errorf("the failure does not name -cache-ttl.\n--- output ---\n%s", out)
 	}
 }

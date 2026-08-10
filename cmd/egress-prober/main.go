@@ -30,6 +30,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"sort"
@@ -164,6 +165,16 @@ func main() {
 		os.Exit(2)
 	}
 
+	// A negative cache ttl makes recentlyProbed always false, silently
+	// disabling the enumeration cache. Every other duration flag is validated;
+	// this one degraded quietly instead, which is the opposite of how the rest
+	// of this startup path treats a value it cannot honour.
+	if *cacheTTL < 0 {
+		fmt.Fprintf(os.Stderr, "egress-prober: -cache-ttl must not be negative (got %s); use 0 to disable the enumeration cache\n\n", *cacheTTL)
+		flag.Usage()
+		os.Exit(2)
+	}
+
 	// A non-positive bandwidth timeout would hand context.WithTimeout an
 	// already-expired deadline, so every measurement would fail instantly and
 	// still have spent a byte reservation getting there.
@@ -188,7 +199,7 @@ func main() {
 	if *skipConfinementCheck {
 		log.Printf("egress-prober: WARNING -skip-confinement-check is set: the startup confinement self-check is DISABLED.")
 		log.Printf("egress-prober: WARNING if this host can reach a geolocation api directly, a probe that fails to tunnel records the OPERATOR's own location for the provider and exposes the operator's address to third-party apis. Do not set this on the operator's deployment.")
-	} else if err := checkConfinement(ctx, (&net.Dialer{}).DialContext, net.DefaultResolver.LookupHost, confinementAddrs, *confinementTimeout); err != nil {
+	} else if err := checkConfinement(ctx, (&net.Dialer{}).DialContext, net.DefaultResolver.LookupHost, confinementAddrs, *confinementTimeout, bandwidthProbeHosts(*skipBandwidth, *bandwidthCDNURL)...); err != nil {
 		log.Printf("egress-prober: confinement self-check failed: %s", err)
 		// ErrNoEvidence is not a claim that this host is unconfined -- it is
 		// the check saying it could not find out -- so the "go and confine it"
@@ -575,9 +586,14 @@ func selectProviders(ctx context.Context, due dueLister, limit int, apiURL strin
 const confinementPort = "443"
 
 // probeHosts is every third-party host this process reaches through a tunnel:
-// the pinned geolocation sources plus the egress-health destinations. It is
-// what the confinement self-check must prove unreachable directly, and what an
+// the pinned geolocation sources, the egress-health destinations, and any
+// extra hosts the caller names -- in practice the bandwidth CDN target, which
+// is third-party and configurable via -bandwidth-cdn-url. It is what the
+// confinement self-check must prove unreachable directly, and what an
 // operator translates into -confinement-address entries.
+//
+// The operator's OWN api host is deliberately absent: it is not third-party,
+// and a deployment may legitimately allow the prober to reach it directly.
 //
 // Both lists are DERIVED from the tables that own them (geolocate.SourceHosts,
 // egresshealth.DestinationHosts) for the reason spelled out on each: a
@@ -590,10 +606,12 @@ const confinementPort = "443"
 // is worse in one specific way: it would pass -- the operator's own host can
 // obviously reach Cloudflare and Amazon -- and so would certify a blackholing
 // provider as healthy, which is the exact inversion of the signal.
-func probeHosts() []string {
+func probeHosts(extra ...string) []string {
 	seen := map[string]bool{}
 	var hosts []string
-	for _, h := range append(geolocate.SourceHosts(), egresshealth.DestinationHosts()...) {
+	all := append(geolocate.SourceHosts(), egresshealth.DestinationHosts()...)
+	all = append(all, extra...)
+	for _, h := range all {
 		if h == "" || seen[h] {
 			continue
 		}
@@ -601,6 +619,23 @@ func probeHosts() []string {
 		hosts = append(hosts, h)
 	}
 	return hosts
+}
+
+// bandwidthProbeHosts returns the bandwidth CDN target's host, if the
+// bandwidth probe will run at all. It is a third-party host reached through
+// the tunnel, so the confinement check covers it like any other; the operator
+// target is deliberately excluded, being the operator's own api.
+func bandwidthProbeHosts(skipBandwidth bool, cdnURL string) []string {
+	if skipBandwidth {
+		return nil
+	}
+	u, err := url.Parse(cdnURL)
+	if err != nil || u.Hostname() == "" {
+		// A malformed -bandwidth-cdn-url is caught where it is used; the
+		// self-check simply has nothing to add for it here.
+		return nil
+	}
+	return []string{u.Hostname()}
 }
 
 // addressList collects the repeatable -confinement-address flag.
@@ -665,8 +700,8 @@ func (a *addressList) Set(v string) error {
 // that dial fails at resolution and proves nothing -- and when only some of
 // them resolve, the shortfall is logged as a WARNING so a degraded check never
 // reads like a complete one.
-func checkConfinement(ctx context.Context, dial confinement.DialFunc, lookup confinement.LookupFunc, explicitAddrs []string, timeout time.Duration) error {
-	hosts := probeHosts()
+func checkConfinement(ctx context.Context, dial confinement.DialFunc, lookup confinement.LookupFunc, explicitAddrs []string, timeout time.Duration, extraHosts ...string) error {
+	hosts := probeHosts(extraHosts...)
 
 	var addrs, unresolved []string
 	if len(explicitAddrs) > 0 {
