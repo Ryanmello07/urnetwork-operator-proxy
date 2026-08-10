@@ -107,6 +107,21 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// requireInjectedSystemTrust skips a test that needs testCACert to be a
+// trusted system root. TestMain installs it via SSL_CERT_FILE, which
+// crypto/x509 honors only on Linux (root_unix.go); Windows and macOS use
+// their platform verifiers, so there every handshake against the test CA
+// fails with "certificate signed by unknown authority" -- an environmental
+// failure indistinguishable from a real fail-closed regression in this
+// package. Skipping keeps the two from being confused; CI runs Linux and
+// still exercises these end to end.
+func requireInjectedSystemTrust(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skipf("SSL_CERT_FILE trust injection is Linux-only (GOOS=%s); the platform verifier ignores it and every handshake fails environmentally", runtime.GOOS)
+	}
+}
+
 func generateTestCA() (*x509.Certificate, *ecdsa.PrivateKey, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -367,6 +382,7 @@ func dialerToAddr(addr string) dialContextFunc {
 // would actually bite: a malicious provider MITMing its own geolocation
 // lookup to forge a favorable country.
 func TestHTTPClientRejectsWrongKeyCertForPinnedHost(t *testing.T) {
+	requireInjectedSystemTrust(t)
 	const pinnedHost = "pinned.example"
 
 	// The server presents a CA-signed cert for pinnedHost -- chain
@@ -401,6 +417,7 @@ func TestHTTPClientRejectsWrongKeyCertForPinnedHost(t *testing.T) {
 // reject everything (fail-closed but broken, e.g. wrong host normalization)
 // would not be caught by the rejection test above.
 func TestHTTPClientAcceptsMatchingPinnedCert(t *testing.T) {
+	requireInjectedSystemTrust(t)
 	const pinnedHost = "pinned.example"
 
 	serverCert, serverKey := issueLeaf(t, pinnedHost)
@@ -487,6 +504,7 @@ func TestHTTPClientRefusesUnknownHostAllowlist(t *testing.T) {
 // nor spuriously fails closed for a merely-oddly-formatted, otherwise
 // correct key.
 func TestHTTPClientPortSuffixedPinKeyIsNormalized(t *testing.T) {
+	requireInjectedSystemTrust(t)
 	const pinnedHost = "pinned.example"
 	serverCert, serverKey := issueLeaf(t, pinnedHost)
 	addr, cleanup := startTLSTestServer(t, serverCert, serverKey)
@@ -551,6 +569,7 @@ func TestHTTPClientPortSuffixedPinKeyIsNormalized(t *testing.T) {
 // rawCerts-based checkPin and PASS against the verifiedChains-based fix --
 // see the task report for the before/after run showing exactly that.
 func TestCheckPinBypassViaDeadWeightIntermediate(t *testing.T) {
+	requireInjectedSystemTrust(t)
 	const pinnedHost = "pinned.example"
 
 	legitIntermediate, _ := issueIntermediateSignedBy(t, "legit test intermediate CA", testCACert, testCAKey)
@@ -588,6 +607,7 @@ func TestCheckPinBypassViaDeadWeightIntermediate(t *testing.T) {
 // silently break the documented intermediate-rotation contract each time a
 // real leaf rotates, and nothing here would catch it.
 func TestCheckPinAcceptsRotatedLeafThroughRealHandshake(t *testing.T) {
+	requireInjectedSystemTrust(t)
 	const pinnedHost = "pinned.example"
 
 	legitIntermediate, legitIntermediateKey := issueIntermediateSignedBy(t, "legit test intermediate CA", testCACert, testCAKey)
@@ -851,6 +871,7 @@ func issueSelfSignedLeaf(t *testing.T, host string) (*x509.Certificate, *ecdsa.P
 // reveal it -- every package-level test would still be green while the feature
 // was completely dead in production.
 func TestHTTPClientForHostsAllowsTheExtraHosts(t *testing.T) {
+	requireInjectedSystemTrust(t)
 	const healthHost = "health.example"
 
 	serverCert, serverKey := issueLeaf(t, healthHost)
@@ -917,6 +938,7 @@ func TestHTTPClientForHostsStillVerifiesTheChain(t *testing.T) {
 // pinning for the geolocation lookup, which is the one place a provider CAN
 // forge a durable, user-visible result.
 func TestHTTPClientForHostsDoesNotUnpinAPinnedHost(t *testing.T) {
+	requireInjectedSystemTrust(t)
 	const pinnedHost = "pinned.example"
 
 	serverCert, serverKey := issueLeaf(t, pinnedHost)
@@ -974,6 +996,7 @@ func (l *countingListener) Accept() (net.Conn, error) {
 // first in ALPN: if this client ever starts offering ALPN protocols, the
 // server selects h2, the connection count collapses to 1, and this fails.
 func TestHTTPClientForHostsOpensOneConnectionPerConcurrentRequest(t *testing.T) {
+	requireInjectedSystemTrust(t)
 	const bandwidthHost = "bandwidth.example"
 	const streams = 8
 
