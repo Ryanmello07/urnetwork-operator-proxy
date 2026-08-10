@@ -105,6 +105,13 @@ func (s *Scheduler) prune() {
 // visible via the returned Summary.
 func (s *Scheduler) Run(ctx context.Context, providerClientIds []string) Summary {
 	s.prune()
+	// Re-arm the prober's per-pass error-log gates (and report what the last
+	// pass withheld). Their cap is only safe because every pass starts clean:
+	// a permanent cap would let ten transient errors silence a later fault
+	// that breaks every provider.
+	if s.Prober != nil {
+		s.Prober.ResetErrorLogging()
+	}
 
 	concurrency := s.Concurrency
 	if concurrency < 1 {

@@ -258,9 +258,9 @@ func TestReportAttemptErrorLoggingIsBounded(t *testing.T) {
 		t.Errorf("logged %d attempt-error lines across %d probes, want at most %d: a varying error message must not defeat the dedup gate",
 			lines, probes, maxLoggedDistinctErrors)
 	}
-	p.attemptErrMu.Lock()
-	size := len(p.attemptErrLogged)
-	p.attemptErrMu.Unlock()
+	p.attemptErr.mu.Lock()
+	size := len(p.attemptErr.seen)
+	p.attemptErr.mu.Unlock()
 	if size > maxLoggedDistinctErrors {
 		t.Errorf("dedup map holds %d entries after %d probes, want at most %d: it must not grow without bound in a long-running process",
 			size, probes, maxLoggedDistinctErrors)
@@ -280,9 +280,9 @@ func TestHealthSubmitErrorLoggingIsBounded(t *testing.T) {
 		p.logHealthErrOnce(fmt.Errorf("ingest: rejected: status 503: request-id %d", i), "prober: could not submit an egress-health result")
 	}
 
-	p.healthErrMu.Lock()
-	size := len(p.healthErrLogged)
-	p.healthErrMu.Unlock()
+	p.healthErr.mu.Lock()
+	size := len(p.healthErr.seen)
+	p.healthErr.mu.Unlock()
 	if size > maxLoggedDistinctErrors {
 		t.Errorf("health dedup map holds %d entries, want at most %d", size, maxLoggedDistinctErrors)
 	}
@@ -310,5 +310,45 @@ func TestTunnelFailureErrorDoesNotEmbedTheProviderId(t *testing.T) {
 	if first.Error() != second.Error() {
 		t.Errorf("two providers failing the same way produced different error text:\n  %s\n  %s\nthe scheduler dedups on this text, so per-provider variation exhausts its detail budget on one failure mode",
 			first, second)
+	}
+}
+
+// TestErrorLogGatesReArmEachPass: the cap on distinct messages is only safe
+// because every pass starts with a clean gate. These gates live on the
+// Prober, which lives for the whole process, so a permanent cap would let ten
+// transient errors (a burst of 503s carrying request ids) silence a later
+// fault that breaks EVERY provider -- a rotated operator secret answering 401
+// -- and that silence is the exact failure the logging exists to prevent.
+func TestErrorLogGatesReArmEachPass(t *testing.T) {
+	var buf bytes.Buffer
+	orig := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(orig)
+
+	p := &Prober{Open: okOpen, Attempts: &varyingReporter{}}
+	// Pass one burns the whole budget on transient, all-distinct errors.
+	for i := 0; i < 50; i++ {
+		p.reportAttempt(context.Background(), fmt.Sprintf("provider-%d", i), FailureTunnel)
+	}
+	if got := strings.Count(buf.String(), "could not report a probe attempt"); got != maxLoggedDistinctErrors {
+		t.Fatalf("pass one logged %d lines, want %d", got, maxLoggedDistinctErrors)
+	}
+
+	buf.Reset()
+	p.ResetErrorLogging()
+	if !strings.Contains(buf.String(), "suppressed") {
+		t.Errorf("no suppression notice after a pass that withheld 40 errors: %s", buf.String())
+	}
+
+	// Pass two: a NEW, stable fault affecting every provider must still be
+	// reported.
+	buf.Reset()
+	stable := &stubReporter{err: errors.New("ingest: the server rejected the operator secret")}
+	p.Attempts = stable
+	for i := 0; i < 5; i++ {
+		p.reportAttempt(context.Background(), fmt.Sprintf("provider-%d", i), FailureTunnel)
+	}
+	if got := strings.Count(buf.String(), "could not report a probe attempt"); got != 1 {
+		t.Fatalf("pass two logged %d lines for a new fleet-wide fault, want exactly 1: %s", got, buf.String())
 	}
 }
