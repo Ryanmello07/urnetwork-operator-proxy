@@ -328,7 +328,10 @@ func main() {
 		providers, serverDriven, err := selectProviders(ctx, operator, *dueLimit, *apiURL, *byJwt)
 		if err != nil {
 			log.Printf("select providers: %s", err)
-			if *interval == 0 {
+			// Same reasoning as the pass result below: a fetch that failed
+			// because the operator interrupted the process is a shutdown, not
+			// a broken deployment, and must not exit non-zero.
+			if *interval == 0 && ctx.Err() == nil {
 				log.Printf("egress-prober: single-shot pass could not fetch the provider list; exiting non-zero")
 				os.Exit(1)
 			}
@@ -340,9 +343,22 @@ func main() {
 			sum := scheduler.Run(ctx, providers)
 			log.Printf("pass: server_driven=%t attempted=%d submitted=%d skipped=%d failed=%d",
 				serverDriven, sum.Attempted, sum.Submitted, sum.Skipped, sum.Failed)
-			if *interval == 0 && sum.Submitted == 0 && 0 < sum.Failed {
-				log.Printf("egress-prober: single-shot pass submitted nothing and recorded %d failure(s); exiting non-zero", sum.Failed)
-				os.Exit(1)
+			// A pass cut short by SIGTERM is not a pass that failed. The
+			// scheduler stops spawning on cancellation, but the probes
+			// already in flight fail on the dead context and land in
+			// sum.Failed -- so without this guard an operator pressing Ctrl-C
+			// got exit 1 and a message blaming the providers, which is the
+			// same misdiagnosis the cancellation fix was written to remove.
+			// The shutdown is logged instead and the exit stays 0: nothing
+			// about the fleet was learned either way.
+			if *interval == 0 {
+				switch {
+				case ctx.Err() != nil:
+					log.Printf("egress-prober: single-shot pass interrupted (%v) after %d submitted, %d failed; exiting zero", ctx.Err(), sum.Submitted, sum.Failed)
+				case sum.Submitted == 0 && 0 < sum.Failed:
+					log.Printf("egress-prober: single-shot pass submitted nothing and recorded %d failure(s); exiting non-zero", sum.Failed)
+					os.Exit(1)
+				}
 			}
 		}
 		if *interval == 0 {

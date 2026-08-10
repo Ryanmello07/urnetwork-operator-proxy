@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,8 +83,9 @@ func TestSchedulerStopsSpawningWhenCancelled(t *testing.T) {
 		Submit: &stubSubmitter{},
 	}
 	var logBuf bytes.Buffer
+	origWriter := log.Writer()
 	log.SetOutput(&logBuf)
-	defer log.SetOutput(os.Stderr)
+	defer log.SetOutput(origWriter)
 
 	s := &Scheduler{Prober: p, Concurrency: 1, CacheTTL: time.Hour}
 	ids := []string{"a", "b", "c", "d", "e"}

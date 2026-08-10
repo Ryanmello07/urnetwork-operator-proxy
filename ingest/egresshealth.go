@@ -92,12 +92,13 @@ func (c *Client) SubmitEgressHealth(
 		ReputationOK:    res.Reputation.OK,
 		ReputationTotal: res.Reputation.Total,
 		// Bounded like probe_failure, and for the same reason: a run with
-		// many failures names ~26 destinations, and a submission the server
-		// rejects for length is a health signal dropped silently, since the
-		// prober submits these fire-and-forget with deduplicated error
-		// logging. See MaxNameListLen.
-		FailedNames:           truncateUTF8(strings.Join(res.FailedNames(), ","), MaxNameListLen),
-		ReputationFailedNames: truncateUTF8(strings.Join(res.ReputationFailedNames(), ","), MaxNameListLen),
+		// many failures names ~131 destinations under -egress-health-all, and
+		// a submission the server rejects for length is a health signal
+		// dropped silently, since the prober submits these fire-and-forget
+		// with deduplicated error logging. Cut on element boundaries with a
+		// dropped count -- see truncateNameList and MaxNameListLen.
+		FailedNames:           truncateNameList(res.FailedNames(), MaxNameListLen),
+		ReputationFailedNames: truncateNameList(res.ReputationFailedNames(), MaxNameListLen),
 	})
 	if err != nil {
 		return err

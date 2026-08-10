@@ -819,6 +819,16 @@ func (s *Sampler) timeout() time.Duration {
 // a failure, and nothing is recorded -- the provider then logs
 // failed(context deadline exceeded) instead of the SkipNoTime this exact
 // situation has a dedicated string for.
+//
+// Note that the shipped wiring cannot currently reach that state: nothing on
+// cmd/egress-prober's path puts a deadline on the context it hands the
+// scheduler (-probe-timeout bounds the http.Client and the per-source
+// lookups, not the pass -- see the comment on egressHealthOptions), so
+// ctx.Deadline() reports none and this returns true regardless of need. The
+// guard is here for the day a per-provider deadline is added, which is
+// exactly when getting it wrong would start costing byte budget silently. If
+// that day comes, weigh requiring the FULL cap against skipping fast
+// providers that would have finished 16 MiB well inside it.
 func hasTimeBudget(ctx context.Context, need time.Duration) bool {
 	if ctx.Err() != nil {
 		return false
