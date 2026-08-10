@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // ErrDueUnsupported reports that the server has no due endpoint (404). The
@@ -37,6 +38,29 @@ var ErrUnauthorized = errors.New("ingest: the server rejected the operator secre
 // provider straight back at the head of the due queue -- the starvation the
 // endpoint exists to prevent -- so a long class is truncated rather than sent.
 const MaxProbeFailureLen = 64
+
+// MaxNameListLen bounds each of the two failure-name lists in an
+// egress-health submission. Unlike probe_failure the server's column width
+// here is unconfirmed, so this is not a mirror of a known limit: it is the
+// same defensive posture applied to the same kind of field. A heavy-failure
+// run names ~26 destinations (400+ characters), and a submission rejected
+// for length is a health signal silently dropped after one deduplicated log
+// line, because the prober submits these fire-and-forget.
+const MaxNameListLen = 512
+
+// truncateUTF8 cuts s to at most max BYTES without splitting a rune.
+// Truncating on a byte boundary can leave a partial encoding that json
+// marshals as U+FFFD; every current caller passes ASCII, which is exactly
+// why the failure would be silent when one eventually does not.
+func truncateUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
+}
 
 // dueURL resolves the due endpoint: the explicit DueURL when set, otherwise
 // derived from ServerURL.
@@ -130,9 +154,7 @@ type attemptBody struct {
 // and reporting unconditionally means there is no path through the prober that
 // forgets.
 func (c *Client) ReportAttempt(ctx context.Context, providerClientId string, probeFailure string) error {
-	if MaxProbeFailureLen < len(probeFailure) {
-		probeFailure = probeFailure[:MaxProbeFailureLen]
-	}
+	probeFailure = truncateUTF8(probeFailure, MaxProbeFailureLen)
 
 	buf, err := json.Marshal(attemptBody{ClientId: providerClientId, ProbeFailure: probeFailure})
 	if err != nil {

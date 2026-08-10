@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // TestDueRequestsTheContract locks the due request against the server's fixed
@@ -207,6 +208,26 @@ func TestReportAttemptTruncatesProbeFailure(t *testing.T) {
 	sent, _ := got["probe_failure"].(string)
 	if len(sent) != MaxProbeFailureLen {
 		t.Fatalf("probe_failure length = %d, want it truncated to %d (the server's column width)", len(sent), MaxProbeFailureLen)
+	}
+}
+
+// TestTruncateUTF8DoesNotSplitARune: every current caller passes ASCII, so a
+// byte-boundary cut is invisible today and would corrupt the moment one does
+// not -- json marshals a partial encoding as U+FFFD.
+func TestTruncateUTF8DoesNotSplitARune(t *testing.T) {
+	// "é" occupies bytes 1-2, so a cut at 2 lands inside it and must back up
+	// to the boundary at 1; a cut at 3 is already on a boundary and stands.
+	if got := truncateUTF8("aéb", 2); got != "a" {
+		t.Fatalf("truncateUTF8(\"aéb\", 2) = %q, want \"a\": the cut must fall back to a rune boundary", got)
+	}
+	if got := truncateUTF8("aéb", 3); got != "aé" {
+		t.Fatalf("truncateUTF8(\"aéb\", 3) = %q, want \"aé\": a cut already on a boundary must not lose a rune", got)
+	}
+	if got := truncateUTF8("abc", 10); got != "abc" {
+		t.Fatalf("truncateUTF8 shortened a string already within the limit: %q", got)
+	}
+	if !utf8.ValidString(truncateUTF8(strings.Repeat("é", 40), 61)) {
+		t.Fatal("truncateUTF8 produced invalid utf-8")
 	}
 }
 

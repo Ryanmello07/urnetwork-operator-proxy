@@ -136,15 +136,22 @@ func (c *Client) Submit(ctx context.Context, providerClientId string, loc *geolo
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-UR-Operator-Secret", c.OperatorSecret)
 
-	httpClient := c.HTTP
-	if httpClient == nil {
-		httpClient = http.DefaultClient
-	}
-	resp, err := httpClient.Do(req)
+	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	// 401 is mapped like every other method's, so a wrong -operator-secret
+	// reaches the caller as ErrUnauthorized with its remediation advice. This
+	// was the one method that did not: against a server without the due
+	// endpoint the prober falls back to enumeration, which authenticates with
+	// the byJwt rather than the operator secret, so the pass proceeds and a
+	// wrong secret surfaced only as a per-provider "status 401" classified
+	// submit_failed -- the quiet degradation ErrUnauthorized exists to
+	// prevent.
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("%w: %w", ErrRejected, ErrUnauthorized)
+	}
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("%w: status %d: %s", ErrRejected, resp.StatusCode, strings.TrimSpace(string(msg)))
