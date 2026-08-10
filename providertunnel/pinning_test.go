@@ -126,6 +126,16 @@ func issueChain(t *testing.T, host string) (leaf, intermediate *x509.Certificate
 	return leafCert, intCert
 }
 
+// chainOf builds the verifiedChains argument crypto/tls hands
+// VerifyPeerCertificate after a successful chain verification. These tests
+// call the verifier directly rather than standing up a handshake, so they
+// must supply it themselves: checkPin matches against the VERIFIED chain and
+// has no fallback to the peer-controlled rawCerts, which is what makes the
+// dead-weight-intermediate bypass unreachable.
+func chainOf(certs ...*x509.Certificate) [][]*x509.Certificate {
+	return [][]*x509.Certificate{certs}
+}
+
 // TestPinnedTLSConfigAcceptsIntermediateMatchOnLeafRotation is the rotation
 // scenario this task exists to fix: the LEAF's pin is absent from the
 // allowed set (as happens the moment a host rotates its leaf certificate --
@@ -145,7 +155,7 @@ func TestPinnedTLSConfigAcceptsIntermediateMatchOnLeafRotation(t *testing.T) {
 
 	// rawCerts as a real handshake presents them: leaf first, then the
 	// intermediate(s) the server sent.
-	err := cfg.VerifyPeerCertificate([][]byte{leaf.Raw, intermediate.Raw}, nil)
+	err := cfg.VerifyPeerCertificate([][]byte{leaf.Raw, intermediate.Raw}, chainOf(leaf, intermediate))
 	if err != nil {
 		t.Fatalf("a pinned intermediate must accept a chain whose leaf rotated, got %v", err)
 	}
@@ -166,9 +176,32 @@ func TestPinnedTLSConfigRejectsWhenNeitherLeafNorIntermediateMatch(t *testing.T)
 	})
 	cfg.ServerName = host
 
-	err := cfg.VerifyPeerCertificate([][]byte{leaf.Raw, intermediate.Raw}, nil)
+	err := cfg.VerifyPeerCertificate([][]byte{leaf.Raw, intermediate.Raw}, chainOf(leaf, intermediate))
 	if err != ErrPinMismatch {
 		t.Fatalf("err = %v, want ErrPinMismatch when neither leaf nor intermediate matches", err)
+	}
+}
+
+// TestCheckPinRejectsAnEmptyVerifiedChain: with no verified chain there is
+// nothing trustworthy to match a pin against, and the peer-controlled
+// rawCerts are not a substitute -- matching them is exactly the
+// dead-weight-intermediate bypass (an attacker pads the wire chain with a
+// legitimately pinned certificate that was never on the validated path).
+// checkPin used to fall back to rawCerts here, inert in production only
+// because nothing in this package sets InsecureSkipVerify on the exported,
+// mutable configs it hands out; a single debugging line elsewhere would have
+// re-armed the full bypass with no test noticing. The fallback is gone, so
+// this must fail closed.
+func TestCheckPinRejectsAnEmptyVerifiedChain(t *testing.T) {
+	cert, _ := selfSigned(t, "pinned.example")
+	cfg := PinnedTLSConfigForHost(map[string][]string{
+		"pinned.example": {SPKIPin(cert)},
+	}, "pinned.example")
+
+	// The pin matches the presented certificate -- the ONLY thing missing is
+	// a verified chain, which is precisely the situation that must not pass.
+	if err := cfg.VerifyPeerCertificate([][]byte{cert.Raw}, nil); err != ErrPinMismatch {
+		t.Fatalf("err = %v, want ErrPinMismatch: a pin must never be matched against unverified peer certificates", err)
 	}
 }
 
@@ -192,7 +225,7 @@ func TestPinnedTLSConfigAcceptsMatchingPin(t *testing.T) {
 		"pinned.example": {SPKIPin(cert)},
 	})
 	cfg.ServerName = "pinned.example"
-	err := cfg.VerifyPeerCertificate([][]byte{cert.Raw}, nil)
+	err := cfg.VerifyPeerCertificate([][]byte{cert.Raw}, chainOf(cert))
 	if err != nil {
 		t.Fatalf("matching pin must verify, got %v", err)
 	}
@@ -205,7 +238,7 @@ func TestPinnedTLSConfigRejectsWrongPin(t *testing.T) {
 		"pinned.example": {SPKIPin(good)},
 	})
 	cfg.ServerName = "pinned.example"
-	err := cfg.VerifyPeerCertificate([][]byte{evil.Raw}, nil)
+	err := cfg.VerifyPeerCertificate([][]byte{evil.Raw}, chainOf(evil))
 	if err != ErrPinMismatch {
 		t.Fatalf("err = %v, want ErrPinMismatch (a provider must not be able to MITM)", err)
 	}
@@ -217,7 +250,7 @@ func TestPinnedTLSConfigIgnoresUnpinnedHost(t *testing.T) {
 		"pinned.example": {"someotherpin"},
 	})
 	cfg.ServerName = "other.example"
-	if err := cfg.VerifyPeerCertificate([][]byte{cert.Raw}, nil); err != nil {
+	if err := cfg.VerifyPeerCertificate([][]byte{cert.Raw}, chainOf(cert)); err != nil {
 		t.Fatalf("unpinned host must pass the pin check, got %v", err)
 	}
 }
@@ -239,7 +272,7 @@ func TestPinnedTLSConfigCloneWithDifferentServerNameFailsClosed(t *testing.T) {
 	perHost := template.Clone()
 	perHost.ServerName = "pinned.example"
 
-	err := perHost.VerifyPeerCertificate([][]byte{evil.Raw}, nil)
+	err := perHost.VerifyPeerCertificate([][]byte{evil.Raw}, chainOf(evil))
 	if err == nil {
 		t.Fatal("FAIL-OPEN: clone accepted an attacker cert with the wrong key for a pinned host")
 	}
@@ -257,7 +290,7 @@ func TestPinnedTLSConfigForHostAcceptsMatchingPin(t *testing.T) {
 	if cfg.MinVersion < tls.VersionTLS12 {
 		t.Fatalf("MinVersion = %v, want at least TLS 1.2", cfg.MinVersion)
 	}
-	if err := cfg.VerifyPeerCertificate([][]byte{cert.Raw}, nil); err != nil {
+	if err := cfg.VerifyPeerCertificate([][]byte{cert.Raw}, chainOf(cert)); err != nil {
 		t.Fatalf("matching pin must verify, got %v", err)
 	}
 }
@@ -269,7 +302,7 @@ func TestPinnedTLSConfigForHostRejectsWrongKey(t *testing.T) {
 		"pinned.example": {SPKIPin(good)},
 	}, "pinned.example")
 
-	err := cfg.VerifyPeerCertificate([][]byte{evil.Raw}, nil)
+	err := cfg.VerifyPeerCertificate([][]byte{evil.Raw}, chainOf(evil))
 	if err != ErrPinMismatch {
 		t.Fatalf("err = %v, want ErrPinMismatch (a provider must not be able to MITM)", err)
 	}
@@ -288,7 +321,7 @@ func TestPinnedTLSConfigForHostSurvivesCloneMutation(t *testing.T) {
 	clone := cfg.Clone()
 	clone.ServerName = "unrelated.example"
 
-	if err := clone.VerifyPeerCertificate([][]byte{good.Raw}, nil); err != nil {
+	if err := clone.VerifyPeerCertificate([][]byte{good.Raw}, chainOf(good)); err != nil {
 		t.Fatalf("PinVerifier must not depend on the config's mutable ServerName, got %v", err)
 	}
 }

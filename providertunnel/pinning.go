@@ -115,24 +115,18 @@ func normalizePins(pins map[string][]string) map[string][]string {
 // If no certificate in any verified chain matches, the check fails closed
 // with ErrPinMismatch.
 //
-// verifiedChains-empty fallback: when verifiedChains is empty, checkPin
-// falls back to scanning rawCerts (parsing each; a certificate that fails
-// to parse is skipped rather than aborting the whole check, so one
-// malformed entry can't mask a valid match elsewhere). This fallback is
-// safe in production and is NOT a reopening of the bypass above:
-// crypto/tls only ever calls VerifyPeerCertificate with an empty
-// verifiedChains when either (a) InsecureSkipVerify is true, which this
-// package never sets on any *tls.Config it builds (see PinnedTLSConfig /
-// PinnedTLSConfigForHost -- confirmed by reading
-// crypto/tls/handshake_client.go's verifyServerCertificate, which only
-// skips populating c.verifiedChains when config.InsecureSkipVerify is
-// true), or (b) normal chain verification failed, in which case the
-// handshake is already being aborted by crypto/tls before this callback's
-// return value is even consulted. So in every real handshake this package
-// drives, verifiedChains is non-empty by the time checkPin runs, and this
-// branch exists solely so this package's own tests can call
-// checkPin/VerifyPeerCertificate directly with rawCerts and no
-// verifiedChains, without standing up a full TLS handshake for every case.
+// An empty verifiedChains fails closed. There is deliberately no fallback to
+// scanning rawCerts: those are peer-controlled, and matching a pin against
+// them IS the dead-weight-intermediate bypass above -- an attacker pads the
+// wire chain with a legitimately pinned certificate that was never on the
+// validated path. Such a fallback did exist, reachable only from tests that
+// called this verifier directly, and it was inert in production for one
+// reason: nothing in this package sets InsecureSkipVerify on the exported,
+// MUTABLE *tls.Config values PinnedTLSConfig/PinnedTLSConfigForHost return.
+// That is a convention, not a guarantee -- one debugging line elsewhere
+// would have re-armed the whole bypass with every test still green. The
+// tests now build real verified chains instead (see chainOf in
+// pinning_test.go), which costs them one helper and removes the branch.
 func checkPin(normalized map[string][]string, host string, rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 	if len(rawCerts) == 0 {
 		return ErrPinMismatch
@@ -142,31 +136,13 @@ func checkPin(normalized map[string][]string, host string, rawCerts [][]byte, ve
 		return nil
 	}
 
-	if len(verifiedChains) > 0 {
-		for _, chain := range verifiedChains {
-			for _, cert := range chain {
-				got := SPKIPin(cert)
-				for _, want := range allowed {
-					if got == want {
-						return nil
-					}
+	for _, chain := range verifiedChains {
+		for _, cert := range chain {
+			got := SPKIPin(cert)
+			for _, want := range allowed {
+				if got == want {
+					return nil
 				}
-			}
-		}
-		return ErrPinMismatch
-	}
-
-	// See the verifiedChains-empty fallback discussion above: reached only
-	// in tests that call the verifier directly with no verifiedChains.
-	for _, raw := range rawCerts {
-		cert, err := x509.ParseCertificate(raw)
-		if err != nil {
-			continue
-		}
-		got := SPKIPin(cert)
-		for _, want := range allowed {
-			if got == want {
-				return nil
 			}
 		}
 	}
