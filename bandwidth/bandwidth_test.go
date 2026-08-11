@@ -144,9 +144,28 @@ func TestMeasureExcludesWarmup(t *testing.T) {
 			wallClock, WarmupDuration)
 	}
 
+	// The property under test is that the stalled warmup is excluded: if it
+	// were counted, BytesPerSecond would BE the warmup-inclusive rate and the
+	// ratio would be 1. Anything comfortably above 1 demonstrates exclusion.
+	//
+	// The multiplier is 2, not 3, because 3 sat right on top of what this shape
+	// produces. The ratio is wall clock over steady window, and bytes flow only
+	// in the bulk phase -- ~0.67s of a ~2.17s transfer -- so an unloaded run
+	// lands at 3.19-3.27x, and CI failed at 2.965x. (MaxSteadyInflation caps
+	// the ratio at 4x above that, but the shape binds first.) Under CPU
+	// contention the window stretches faster than the total does, so the ratio
+	// falls further still: 2.40-2.73x at a quarter CPU. A 3x bar therefore
+	// measures the runner rather than the code.
+	//
+	// 2x is a wider margin, not a guarantee -- a runner below ~0.2 CPU still
+	// falls under it, and no fixed multiplier can be robust when the ratio
+	// degrades continuously toward 1 as the machine slows. Deriving the bound
+	// from sample.Elapsed would be the structural fix. What 2x does preserve is
+	// the only thing this test exists to catch: if warmup stopped being
+	// excluded the ratio would collapse to ~1.0, which fails loudly here.
 	naive := float64(sample.SampleByteCount) / wallClock.Seconds()
-	if sample.BytesPerSecond < 3*naive {
-		t.Errorf("BytesPerSecond = %.0f, want at least 3x the warmup-inclusive rate %.0f -- the stalled first %s is being counted",
+	if sample.BytesPerSecond < 2*naive {
+		t.Errorf("BytesPerSecond = %.0f, want at least 2x the warmup-inclusive rate %.0f -- the stalled first %s is being counted",
 			sample.BytesPerSecond, naive, WarmupDuration)
 	}
 }
