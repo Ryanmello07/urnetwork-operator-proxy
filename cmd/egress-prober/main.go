@@ -70,6 +70,7 @@ func main() {
 	blackholeInterval := flag.Duration("blackhole-interval", time.Hour, "how often to sweep the WHOLE fleet with the cheap blackhole check (did any traffic get through). Separate from -interval on purpose: the full pass sweeps a fleet over hours to days, and a provider that goes dark keeps its last passing measurement for that whole window. 0 disables the sweep")
 	blackholeLimit := flag.Int("blackhole-limit", 500, "providers per blackhole sweep request; the server clamps it to its own maximum")
 	blackholeConcurrency := flag.Int("blackhole-concurrency", 32, "simultaneous blackhole checks. Higher than -concurrency because a check is one round trip through the tunnel rather than a ~131 destination sweep")
+	blackholeTimeout := flag.Duration("blackhole-timeout", 15*time.Second, "per-request deadline for a blackhole check. Deliberately far shorter than -probe-timeout: this check asks one question and a dark provider must fail it FAST, or the sweep costs the full timeout on every dead provider and stops being the cheap loop it exists to be -- at 2m20s a 500-provider batch at concurrency 32 takes ~37 minutes instead of ~4")
 	probeTimeout := flag.Duration("probe-timeout", 60*time.Second, "per-provider probe timeout, and the per-source deadline within a probe")
 	skipConfinementCheck := flag.Bool("skip-confinement-check", false, "DANGEROUS: start even if this host can reach a geolocation api directly. Only for a one-shot manual probe on a host you know is not the operator's; a direct lookup records the OPERATOR's location for the provider and exposes the operator's address to the api")
 	confinementTimeout := flag.Duration("confinement-timeout", 3*time.Second, "per-address deadline for the startup confinement self-check; a timeout counts as blocked. Must be at least "+confinement.MinTimeout.String())
@@ -352,7 +353,7 @@ func main() {
 			operator:    operator,
 			tunnelCfg:   tunnelCfg,
 			pins:        pins,
-			timeout:     *probeTimeout,
+			timeout:     *blackholeTimeout,
 			concurrency: *blackholeConcurrency,
 			limit:       *blackholeLimit,
 		}
