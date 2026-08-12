@@ -32,6 +32,12 @@ type blackholeSweeper struct {
 	limit       int
 }
 
+// maxBlackholeRounds bounds one sweep's batches. 40 rounds x the server's 5000
+// ceiling is far above any real fleet, so it never truncates a legitimate
+// sweep; it exists so a server that keeps handing back work cannot hold a pass
+// open indefinitely and starve the interval.
+const maxBlackholeRounds = 40
+
 // blackholeResult carries one provider's outcome out of the worker pool.
 type blackholeResult struct {
 	check   ingest.BlackholeCheck
@@ -168,11 +174,29 @@ func (s *blackholeSweeper) checkOne(ctx context.Context, clientId string) blackh
 func (s *blackholeSweeper) run(ctx context.Context, interval time.Duration) {
 	for {
 		start := time.Now()
-		checked, err := s.sweep(ctx)
+		// Drain the queue, do not take one batch and sleep. The requirement is
+		// that the WHOLE fleet is checked every interval, and the batch size is the
+		// server's per-request ceiling, not the size of the fleet: at 500 per
+		// request against ~2,700 eligible providers, one batch per hour covers
+		// under a fifth of them and the oldest evidence would age out faster
+		// than the sweep reaches it. Rounds are bounded so a server that keeps
+		// returning work cannot hold a pass open forever.
+		total, err := 0, error(nil)
+		for round := 0; round < maxBlackholeRounds; round++ {
+			var checked int
+			checked, err = s.sweep(ctx)
+			total += checked
+			if err != nil || checked == 0 || ctx.Err() != nil {
+				break
+			}
+		}
+		checked := total
 		switch {
 		case err == nil:
 			if checked == 0 {
 				log.Printf("blackhole: pass found nothing due")
+			} else {
+				log.Printf("blackhole: sweep complete: %d checked in %s", checked, time.Since(start).Round(time.Second))
 			}
 		case errors.Is(err, ingest.ErrBlackholeUnsupported):
 			log.Printf("blackhole: the server does not implement the blackhole endpoints; sweeping is disabled")
