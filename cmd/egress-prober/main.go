@@ -67,6 +67,9 @@ func main() {
 	concurrency := flag.Int("concurrency", 4, "max simultaneous provider tunnels")
 	cacheTTL := flag.Duration("cache-ttl", 24*time.Hour, "do not re-probe a provider within this window. Only applies to the enumeration fallback used against a server with no due endpoint; when the server supplies the due list it owns the schedule")
 	interval := flag.Duration("interval", time.Hour, "sleep between passes; 0 runs a single pass and exits")
+	blackholeInterval := flag.Duration("blackhole-interval", time.Hour, "how often to sweep the WHOLE fleet with the cheap blackhole check (did any traffic get through). Separate from -interval on purpose: the full pass sweeps a fleet over hours to days, and a provider that goes dark keeps its last passing measurement for that whole window. 0 disables the sweep")
+	blackholeLimit := flag.Int("blackhole-limit", 500, "providers per blackhole sweep request; the server clamps it to its own maximum")
+	blackholeConcurrency := flag.Int("blackhole-concurrency", 32, "simultaneous blackhole checks. Higher than -concurrency because a check is one round trip through the tunnel rather than a ~131 destination sweep")
 	probeTimeout := flag.Duration("probe-timeout", 60*time.Second, "per-provider probe timeout, and the per-source deadline within a probe")
 	skipConfinementCheck := flag.Bool("skip-confinement-check", false, "DANGEROUS: start even if this host can reach a geolocation api directly. Only for a one-shot manual probe on a host you know is not the operator's; a direct lookup records the OPERATOR's location for the provider and exposes the operator's address to the api")
 	confinementTimeout := flag.Duration("confinement-timeout", 3*time.Second, "per-address deadline for the startup confinement self-check; a timeout counts as blocked. Must be at least "+confinement.MinTimeout.String())
@@ -240,7 +243,7 @@ func main() {
 	if *skipConfinementCheck {
 		log.Printf("egress-prober: WARNING -skip-confinement-check is set: the startup confinement self-check is DISABLED.")
 		log.Printf("egress-prober: WARNING if this host can reach a geolocation api directly, a probe that fails to tunnel records the OPERATOR's own location for the provider and exposes the operator's address to third-party apis. Do not set this on the operator's deployment.")
-	} else if err := checkConfinement(ctx, (&net.Dialer{}).DialContext, net.DefaultResolver.LookupHost, confinementAddrs, *confinementTimeout, bandwidthProbeHosts(*skipBandwidth, *bandwidthCDNURL)...); err != nil {
+	} else if err := checkConfinement(ctx, (&net.Dialer{}).DialContext, net.DefaultResolver.LookupHost, confinementAddrs, *confinementTimeout, append(bandwidthProbeHosts(*skipBandwidth, *bandwidthCDNURL), egresshealth.BlackholeHosts()...)...); err != nil {
 		log.Printf("egress-prober: confinement self-check failed: %s", err)
 		// ErrNoEvidence is not a claim that this host is unconfined -- it is
 		// the check saying it could not find out -- so the "go and confine it"
@@ -343,6 +346,18 @@ func main() {
 		*concurrency,
 		*cacheTTL,
 	)
+
+	if 0 < *blackholeInterval {
+		sweeper := &blackholeSweeper{
+			operator:    operator,
+			tunnelCfg:   tunnelCfg,
+			pins:        pins,
+			timeout:     *probeTimeout,
+			concurrency: *blackholeConcurrency,
+			limit:       *blackholeLimit,
+		}
+		go sweeper.run(ctx, *blackholeInterval)
+	}
 
 	// I3: a single-shot run (-interval 0) is the mode the README recommends
 	// for external cron/systemd scheduling, which decides success or
