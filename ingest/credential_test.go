@@ -149,6 +149,13 @@ func TestProberCredentialRejectsAnUnusableBody(t *testing.T) {
 	}{
 		{name: "not json", body: `{"by_client_jwt":`},
 		{name: "not an object", body: `["nope"]`},
+		// The one case the emptiness check cannot backstop, and so the only
+		// one that actually holds the decode-error branch: encoding/json
+		// reports a type mismatch but still populates the fields it could, so
+		// a usable-looking jwt arrives alongside the error. Ignoring the error
+		// here would return a plausible credential from a body the server did
+		// not mean to send.
+		{name: "client_id is not a string", body: `{"by_client_jwt":"a.b.c","client_id":5}`},
 		{name: "null", body: `null`},
 		{name: "empty object", body: `{}`},
 		{name: "empty jwt", body: `{"by_client_jwt":"","client_id":"c"}`},
