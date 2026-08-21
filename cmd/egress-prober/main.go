@@ -62,7 +62,7 @@ func main() {
 	// echoes both secrets verbatim to stderr, into journald or a CI log. That
 	// would invert the README's own advice, which presents these env vars as
 	// the way to keep secrets out of logs and ps.
-	byJwt := flag.String("by-jwt", "", "the prober's network client jwt; prefer the UR_PROBER_BY_JWT env var, which keeps it out of ps (required)")
+	byJwt := flag.String("by-jwt", "", "the prober's network client jwt; prefer the UR_PROBER_BY_JWT env var, which keeps it out of ps. Leave it EMPTY to fetch it from the server's /network/prober-credential endpoint using -operator-secret, which is the unattended mode: the server mints the prober's identity in a bootstrap task and this waits for it. An explicitly supplied value always wins and is never overwritten")
 	operatorSecret := flag.String("operator-secret", "", "ingest secret, must match ingest_secret in provider_egress.yml; prefer the UR_OPERATOR_SECRET env var, which keeps it out of ps (required)")
 	concurrency := flag.Int("concurrency", 4, "max simultaneous provider tunnels")
 	cacheTTL := flag.Duration("cache-ttl", 24*time.Hour, "do not re-probe a provider within this window. Only applies to the enumeration fallback used against a server with no due endpoint; when the server supplies the due list it owns the schedule")
@@ -101,9 +101,10 @@ func main() {
 	if *platformURL == "" {
 		missing = append(missing, "-platform-url")
 	}
-	if *byJwt == "" {
-		missing = append(missing, "-by-jwt (or UR_PROBER_BY_JWT)")
-	}
+	// -by-jwt is deliberately NOT in this list any more: an empty one is
+	// fetched from the server below (see fetchByJwtIfEmpty), which is the
+	// whole point of the prober-credential endpoint. -operator-secret stays
+	// required precisely because that fetch authenticates with it.
 	if *operatorSecret == "" {
 		missing = append(missing, "-operator-secret (or UR_OPERATOR_SECRET)")
 	}
@@ -255,6 +256,44 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Built here rather than after the jwt because the credential fetch below
+	// needs it. Nothing in it depends on the jwt: it authenticates with the
+	// operator secret alone, which is what makes fetching the jwt possible at
+	// all.
+	operator := &ingest.Client{
+		ServerURL:      *apiURL,
+		OperatorSecret: *operatorSecret,
+		DueURL:         *dueURL,
+		ShardIndex:     *shardIndex,
+		ShardCount:     *shardCount,
+		HTTP:           &http.Client{Timeout: 30 * time.Second},
+	}
+
+	// The jwt, if the deployment did not supply one. This sits ABOVE
+	// parseByJwtClientId on purpose: a fetched jwt then travels the identical
+	// path an explicitly supplied one does -- same parse, same client id, same
+	// tunnel config -- so a credential the server hands over but that this
+	// process cannot use still fails loudly, right here, instead of becoming a
+	// fleet-wide outage that looks like nothing at all.
+	//
+	// It also sits below the confinement self-check, which must stay the first
+	// thing that touches the network. The operator's own server is the one
+	// direct call the prober is allowed to make, so this is the earliest point
+	// at which it may run.
+	switch err := fetchByJwtIfEmpty(ctx, byJwt, operator, credentialPollInitial, credentialPollMax); {
+	case err == nil:
+	case ctx.Err() != nil:
+		// Interrupted while waiting for the server's bootstrap task. That is a
+		// shutdown, not a broken deployment, and the same reasoning as the
+		// pass-result exit codes below applies: it must not exit non-zero and
+		// blame a configuration that is fine.
+		log.Printf("egress-prober: interrupted while waiting for the prober credential (%v); nothing was probed", ctx.Err())
+		return
+	default:
+		log.Printf("egress-prober: %s", err)
+		os.Exit(1)
+	}
+
 	clientId, err := parseByJwtClientId(*byJwt)
 	if err != nil {
 		log.Fatalf("parse by-jwt client id: %s", err)
@@ -271,15 +310,6 @@ func main() {
 		DeviceDescription: "egress prober",
 		DeviceSpec:        "egress-prober",
 		Version:           "0.0.0",
-	}
-
-	operator := &ingest.Client{
-		ServerURL:      *apiURL,
-		OperatorSecret: *operatorSecret,
-		DueURL:         *dueURL,
-		ShardIndex:     *shardIndex,
-		ShardCount:     *shardCount,
-		HTTP:           &http.Client{Timeout: 30 * time.Second},
 	}
 
 	// The startup fetch. This is a separate call site from the refresh in the
@@ -846,6 +876,108 @@ func checkConfinement(ctx context.Context, dial confinement.DialFunc, lookup con
 	}
 	log.Printf("egress-prober: confinement self-check passed: %d address(es) tested, none directly reachable", len(addrs))
 	return nil
+}
+
+// credentialFetcher is the server's prober-credential endpoint, injected so
+// fetchByJwtIfEmpty is testable without one.
+type credentialFetcher interface {
+	ProberCredential(ctx context.Context) (*ingest.ProberCredential, error)
+}
+
+// credentialPollInitial and credentialPollMax bound the wait for a credential
+// the server has not minted yet.
+//
+// The server's bootstrap task runs every 6h, so a prober brought up alongside
+// a fresh deployment can legitimately be hours early. That is a WAIT, not a
+// crash: exiting would put a supervised process into a restart loop that
+// re-runs the confinement self-check and re-fetches on every restart, and
+// which reads in journald as a broken prober rather than as one patiently
+// doing the right thing. Starting at 30s keeps the pickup prompt when the task
+// runs minutes later; capping at 5m keeps a six-hour wait to ~75 requests.
+const (
+	credentialPollInitial = 30 * time.Second
+	credentialPollMax     = 5 * time.Minute
+)
+
+// nextBackoff doubles cur without exceeding max. Split out from the loop so the
+// schedule is testable without sleeping through it.
+func nextBackoff(cur, max time.Duration) time.Duration {
+	if max <= cur {
+		return max
+	}
+	if doubled := cur * 2; doubled < max {
+		return doubled
+	}
+	return max
+}
+
+// fetchByJwtIfEmpty fills *byJwt from the server's prober-credential endpoint
+// when it is empty, waiting for the server's bootstrap task if it has to.
+//
+// The precedence is envFallback's, deliberately: an explicitly supplied value
+// is left alone and the server is not even asked. That is what keeps the
+// existing deployment -- which supplies UR_PROBER_BY_JWT today -- working
+// exactly as it does now, and it is why this cannot be written as "fetch, then
+// prefer the explicit one": that would still block startup on a server which
+// has no credential yet, for a prober that never needed one.
+//
+// The three outcomes of the fetch map to three different behaviours, and
+// keeping them apart is the whole point:
+//
+//   - not ready (404): the expected state before the bootstrap task has run.
+//     Log it as a wait and ask again, forever, on a capped backoff. There is no
+//     total deadline: "wait rather than crash-loop" has no useful upper bound
+//     here, and a supervisor's own start timeout is the right place to impose
+//     one if a deployment wants it. ctx is what ends the wait.
+//   - unauthorized (401): a wrong -operator-secret. Fatal and immediate. A
+//     secret the server rejects will be rejected on every retry, so polling
+//     would turn a two-minute fix into an outage nobody is paged for.
+//   - anything else: transient. Retry on the same backoff, but log the actual
+//     error each time rather than the reassuring "not ready" line, because
+//     these are the ones that might need a human.
+func fetchByJwtIfEmpty(ctx context.Context, byJwt *string, f credentialFetcher, initial, max time.Duration) error {
+	if *byJwt != "" {
+		return nil
+	}
+
+	// Guards against a zero or negative interval turning the loop below into a
+	// busy wait against the server (time.After fires immediately, and doubling
+	// zero stays zero).
+	if initial <= 0 {
+		initial = time.Second
+	}
+	if max < initial {
+		max = initial
+	}
+
+	log.Printf("egress-prober: no -by-jwt (or UR_PROBER_BY_JWT) was supplied; asking the server for the prober credential")
+
+	backoff := initial
+	for {
+		cred, err := f.ProberCredential(ctx)
+		switch {
+		case err == nil:
+			*byJwt = cred.ByClientJwt
+			// The client id, never the jwt: this line goes to journald, and
+			// the jwt is a credential. The id is what an operator needs to
+			// match the prober against the server's record of it.
+			log.Printf("egress-prober: got the prober credential from the server for client %s", cred.ClientId)
+			return nil
+		case errors.Is(err, ingest.ErrUnauthorized):
+			return fmt.Errorf("the server rejected the operator secret when asked for the prober credential; check -operator-secret against ingest_secret in the server's provider_egress.yml: %w", err)
+		case errors.Is(err, ingest.ErrCredentialNotReady):
+			log.Printf("egress-prober: the server has not minted the prober credential yet; asking again in %s (its bootstrap task runs every 6h)", backoff)
+		default:
+			log.Printf("egress-prober: could not get the prober credential: %s; asking again in %s", err, backoff)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff = nextBackoff(backoff, max)
+	}
 }
 
 // envFallback fills *value from the named environment variable when the flag
