@@ -66,7 +66,7 @@ func main() {
 	operatorSecret := flag.String("operator-secret", "", "ingest secret, must match ingest_secret in provider_egress.yml; prefer the UR_OPERATOR_SECRET env var, which keeps it out of ps (required)")
 	concurrency := flag.Int("concurrency", 4, "max simultaneous provider tunnels")
 	cacheTTL := flag.Duration("cache-ttl", 24*time.Hour, "do not re-probe a provider within this window. Only applies to the enumeration fallback used against a server with no due endpoint; when the server supplies the due list it owns the schedule")
-	interval := flag.Duration("interval", time.Hour, "sleep between passes; 0 runs a single pass and exits")
+	interval := flag.Duration("interval", time.Hour, "sleep AFTER a pass finishes, not a fixed period: the cycle is pass-duration + interval, so throughput is -due-limit / (pass-duration + interval) rather than -due-limit per interval. A 500-provider pass taking ~30m at -interval 1h yields ~390/hour with the prober idle two thirds of every cycle. Size it against how long a pass actually takes; 0 runs a single pass and exits")
 	blackholeInterval := flag.Duration("blackhole-interval", time.Hour, "how often to sweep the WHOLE fleet with the cheap blackhole check (did any traffic get through). Separate from -interval on purpose: the full pass sweeps a fleet over hours to days, and a provider that goes dark keeps its last passing measurement for that whole window. 0 disables the sweep")
 	blackholeLimit := flag.Int("blackhole-limit", 500, "providers per blackhole sweep request; the server clamps it to its own maximum")
 	blackholeConcurrency := flag.Int("blackhole-concurrency", 32, "simultaneous blackhole checks. Higher than -concurrency because a check is one round trip through the tunnel rather than a ~131 destination sweep")
@@ -297,6 +297,21 @@ func main() {
 	clientId, err := parseByJwtClientId(*byJwt)
 	if err != nil {
 		log.Fatalf("parse by-jwt client id: %s", err)
+	}
+
+	// The credential self-check runs before the first tunnel, for the same
+	// reason the confinement self-check runs before the first request: a fault
+	// the prober cannot detect at runtime has to be caught here or not at all.
+	switch err := checkCredential(ctx, http.DefaultClient, *apiURL, *byJwt); {
+	case err == nil:
+		log.Printf("egress-prober: credential self-check passed: the server accepts the byJwt")
+	case errors.Is(err, errCredentialRejected):
+		log.Printf("egress-prober: credential self-check FAILED: %s", err)
+		log.Printf("egress-prober: the byJwt parses but the server refuses it -- it has expired, or it predates a claim the server now enforces. Probes would not fail loudly: the operator-secret calls would keep working while every tunnel carried nothing and every provider was recorded as no_consensus. Mint a fresh network client jwt (POST /network/auth-client) and set UR_PROBER_BY_JWT to it.")
+		os.Exit(1)
+	default:
+		log.Printf("egress-prober: WARNING credential self-check inconclusive: %s", err)
+		log.Printf("egress-prober: continuing, because being unable to check is not evidence the credential is bad. If every provider comes back no_consensus with ok=0/N, suspect the byJwt first.")
 	}
 
 	// Pins is deliberately NOT set here: it is fetched from the server below
@@ -1353,6 +1368,63 @@ func findProvidersAtLocation(ctx context.Context, client *http.Client, apiURL st
 // is the authority that already validated it when minting a session from it),
 // and the claim is type-switched rather than unmarshaled into a typed struct,
 // since some issuers emit client_id as something other than a bare string.
+// errCredentialRejected reports that the server refused the prober's byJwt.
+//
+// This is kept distinct from "could not check" for the same reason
+// ingest.ErrUnauthorized is kept distinct from ingest.ErrDueUnsupported: a
+// rejected credential is a broken deployment, and anything that lets it look
+// like an ordinary runtime hiccup hides the fault behind work that appears to
+// continue.
+var errCredentialRejected = errors.New("egress-prober: the server rejected the prober's byJwt")
+
+// errCredentialUnverified reports that the check could not reach a verdict --
+// an old server without the endpoint, a transport error, a 5xx. It is NOT a
+// claim that the credential is bad, so it must never stop the prober: doing so
+// would turn "we could not ask" into a new outage of its own.
+var errCredentialUnverified = errors.New("egress-prober: could not verify the byJwt")
+
+// checkCredential asks the server whether it ACCEPTS the byJwt, which is not
+// what parseByJwtClientId establishes -- that only proves the token decodes and
+// carries a client_id.
+//
+// The gap between those two is a real outage mode, not a hypothetical. A token
+// that parses perfectly is still refused once it expires (jwt.expiryDuration is
+// 24h) or once the server begins enforcing a claim the token predates, and the
+// prober has no way to notice: the byJwt authenticates only the provider
+// tunnel, while the due queue, attempt reporting and pin fetch all authenticate
+// with the operator secret. So every one of those keeps working, the prober
+// goes on reporting attempts and looks healthy, and the tunnel silently carries
+// nothing -- every probe fails no_consensus with ok=0/N.
+//
+// That reads as "the whole fleet is bad", which is a convincing wrong answer.
+// On one deployment it ran 8 hours and 870 consecutive failures before the
+// credential was suspected. One request at startup turns that into a message.
+func checkCredential(ctx context.Context, client *http.Client, apiURL string, byJwt string) error {
+	url := strings.TrimRight(apiURL, "/") + "/network/clients"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errCredentialUnverified, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+byJwt)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errCredentialUnverified, err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return nil
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return errCredentialRejected
+	default:
+		// Everything else -- notably 404 from a server that predates this
+		// endpoint -- is inconclusive by design.
+		return fmt.Errorf("%w: status %d", errCredentialUnverified, resp.StatusCode)
+	}
+}
+
 func parseByJwtClientId(byJwt string) (connect.Id, error) {
 	claims := gojwt.MapClaims{}
 	if _, _, err := gojwt.NewParser().ParseUnverified(byJwt, claims); err != nil {
