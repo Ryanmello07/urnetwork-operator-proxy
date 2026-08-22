@@ -45,26 +45,44 @@ go build ./cmd/egress-prober
 ./egress-prober \
   -api-url https://api.example.net \
   -platform-url wss://connect.example.net \
-  -by-jwt "$UR_PROBER_BY_JWT" \
   -operator-secret "$UR_OPERATOR_SECRET" \
   -concurrency 4 \
   -cache-ttl 24h \
   -interval 1h
 ```
 
+That run fetches the prober's own identity from the server. To supply one you
+provisioned yourself instead, add `-by-jwt "$UR_PROBER_BY_JWT"` (or export
+`UR_PROBER_BY_JWT`); it takes precedence and the fetch is skipped entirely.
+
 `-by-jwt` and `-operator-secret` may also be supplied via the
 `UR_PROBER_BY_JWT` and `UR_OPERATOR_SECRET` environment variables instead of
 flags, which is the recommended way to run this under systemd (keeps secrets
-out of `ps`/shell history). All four of `-api-url`, `-platform-url`, `-by-jwt`
-and `-operator-secret` are required; the prober exits immediately with a
-message naming the missing flag(s) if any are absent, rather than starting in
-a broken state.
+out of `ps`/shell history). `-api-url`, `-platform-url` and `-operator-secret`
+are required; the prober exits immediately with a message naming the missing
+flag(s) if any are absent, rather than starting in a broken state.
 
-The prober needs its own network client identity (`-by-jwt`), provisioned like
-any other client. `-operator-secret` must match `ingest_secret` in the server's
-`provider_egress.yml` vault resource — it authenticates the pin fetch as well as
-ingest, so a wrong secret now stops the prober at startup rather than only
-having its submissions rejected.
+The prober needs its own network client identity (`-by-jwt`). **Leave it empty
+and the prober fetches one for itself** from the server's
+`/network/prober-credential` endpoint, authenticating with `-operator-secret` —
+no hand-provisioned identity, and one less secret to place. The server mints
+that identity in a bootstrap task which runs every 6h, so a prober brought up
+alongside a fresh deployment may start before its credential exists: it waits
+for it, logging one line per attempt on a backoff capped at 5 minutes, rather
+than exiting into a restart loop. The wait has no deadline of its own — impose
+one with the supervisor's start timeout if a deployment wants it.
+
+An explicitly supplied `-by-jwt` (or `UR_PROBER_BY_JWT`) always wins and the
+endpoint is never contacted, so an existing deployment that provisions the
+identity by hand is unaffected and acquires no dependency on it. Either way the
+jwt goes through the same startup check, so a credential the process cannot use
+stops it at startup instead of leaving a prober that looks healthy and probes
+nothing.
+
+`-operator-secret` must match `ingest_secret` in the server's
+`provider_egress.yml` vault resource — it authenticates the credential fetch and
+the pin fetch as well as ingest, so a wrong secret stops the prober at startup
+rather than only having its submissions rejected.
 
 The server must have observed the geolocation certificate pins before the
 prober can start: it fetches them at startup and **refuses to run without a
