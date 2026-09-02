@@ -16,6 +16,8 @@ import (
 
 	"github.com/urnetwork/connect"
 	"github.com/urnetwork/connect/protocol"
+
+	"github.com/urnetwork/operator-proxy/controlplane"
 )
 
 // Config is the operator-provided identity and endpoints the prober uses to
@@ -58,6 +60,10 @@ var createTun = func(ctx context.Context, resolver *connect.DnsResolverSettings)
 	return connect.CreateTunWithResolver(ctx, connect.DefaultTunSettings(), resolver)
 }
 
+// The control-plane strategy is a seam so the Open-path test can prove every
+// provider tunnel uses the shared IPv4-only constructor.
+var newControlplaneClientStrategy = controlplane.NewClientStrategy
+
 // inTunnelOnlyDnsResolverSettings returns DNS resolver settings under which
 // every name the tunnel resolves is resolved THROUGH the tunnel, encrypted.
 //
@@ -99,9 +105,17 @@ type Tunnel struct {
 	cancel    context.CancelFunc
 	tun       *connect.Tun
 	mc        *connect.RemoteUserNatMultiClient
+	generator *connect.ApiMultiClientGenerator
+	pumpDone  <-chan struct{}
 	pins      map[string][]string
 	closeOnce sync.Once
 	closeErr  error
+}
+
+const tunnelCloseTimeout = 30 * time.Second
+
+type closeAndWaiter interface {
+	CloseAndWait(context.Context) error
 }
 
 // Open builds a tunnel that routes exclusively through providerClientId.
@@ -120,7 +134,7 @@ func Open(ctx context.Context, cfg Config, providerClientId connect.Id) (*Tunnel
 		[]*connect.ProviderSpec{
 			{ClientId: &providerClientId},
 		},
-		connect.NewClientStrategyWithDefaults(ctx),
+		newControlplaneClientStrategy(ctx),
 		// exclude self
 		[]connect.Id{cfg.ClientId},
 		cfg.ApiURL,
@@ -137,7 +151,13 @@ func Open(ctx context.Context, cfg Config, providerClientId connect.Id) (*Tunnel
 	tun, err := createTun(ctx, inTunnelOnlyDnsResolverSettings())
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("create tun: %w", err)
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), tunnelCloseTimeout)
+		defer closeCancel()
+		closeErr := generator.CloseAndWait(closeCtx)
+		return nil, errors.Join(
+			fmt.Errorf("create tun: %w", err),
+			wrapCloseError("generator", closeErr),
+		)
 	}
 
 	mc := connect.NewRemoteUserNatMultiClientWithDefaults(
@@ -151,7 +171,9 @@ func Open(ctx context.Context, cfg Config, providerClientId connect.Id) (*Tunnel
 
 	// pump tun -> provider
 	source := connect.SourceId(cfg.ClientId)
+	pumpDone := make(chan struct{})
 	go func() {
+		defer close(pumpDone)
 		for {
 			packet, err := tun.Read()
 			if err != nil {
@@ -178,10 +200,12 @@ func Open(ctx context.Context, cfg Config, providerClientId connect.Id) (*Tunnel
 	}
 
 	return &Tunnel{
-		cancel: cancel,
-		tun:    tun,
-		mc:     mc,
-		pins:   pins,
+		cancel:    cancel,
+		tun:       tun,
+		mc:        mc,
+		generator: generator,
+		pumpDone:  pumpDone,
+		pins:      pins,
 	}, nil
 }
 
@@ -232,21 +256,48 @@ func (t *Tunnel) HTTPClientForHosts(timeout time.Duration, extraHosts []string) 
 // first call has effect and its result is what every call returns.
 func (t *Tunnel) Close() error {
 	t.closeOnce.Do(func() {
-		// Close the multiclient explicitly rather than relying on it merely
-		// observing ctx cancellation: t.cancel() below cancels the context
-		// mc was built with, which does tear mc down eventually, but only
-		// asynchronously via whatever goroutines happen to notice. Calling
-		// mc.Close() directly makes teardown synchronous and immediate,
-		// matching tun.Close() below. connect.RemoteUserNatMultiClient.Close
-		// (ip_remote_multi_client.go) is non-blocking -- it cancels its own
-		// context, clears in-memory maps, and closes windows/localUserNat,
-		// none of which wait on a channel or another goroutine -- so this
-		// cannot hang.
-		t.mc.Close()
-		t.cancel()
-		t.closeErr = t.tun.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), tunnelCloseTimeout)
+		defer cancel()
+		t.closeErr = closeTunnelParts(ctx, t.cancel, t.tun.Close, t.pumpDone, t.mc, t.generator)
 	})
 	return t.closeErr
+}
+
+// closeTunnelParts makes every layer's ownership terminal. The multi-client
+// owns packet dispatch and windows, but generated transfer Clients and their
+// OOB transports remain owned by ApiMultiClientGenerator; closing only the
+// former leaves asynchronous retirement tails behind each short-lived probe.
+//
+// Every close is attempted even after an earlier one reports an error. This is
+// teardown: an error is useful to the caller, but it is not permission to leak
+// the remaining owners.
+func closeTunnelParts(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	closeTun func() error,
+	pumpDone <-chan struct{},
+	multiClient closeAndWaiter,
+	generator closeAndWaiter,
+) error {
+	cancel()
+	errList := []error{wrapCloseError("tun", closeTun())}
+	select {
+	case <-pumpDone:
+	case <-ctx.Done():
+		errList = append(errList, fmt.Errorf("wait for tun packet pump: %w", ctx.Err()))
+	}
+	errList = append(errList,
+		wrapCloseError("multi-client", multiClient.CloseAndWait(ctx)),
+		wrapCloseError("generator", generator.CloseAndWait(ctx)),
+	)
+	return errors.Join(errList...)
+}
+
+func wrapCloseError(owner string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("close %s: %w", owner, err)
 }
 
 type dialContextFunc func(ctx context.Context, network string, address string) (net.Conn, error)

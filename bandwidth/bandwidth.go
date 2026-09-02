@@ -565,10 +565,12 @@ func measure(
 	// band is the first one the parallel-stream rewrite unlocked, so giving
 	// it back to the lower-bound path would have undone the point of it.
 	steadyElapsed := windowEnd.Sub(windowStart)
-	representative := !windowStart.IsZero() &&
-		0 < steadyBytes &&
-		0 < steadyElapsed &&
-		totalElapsed <= time.Duration(MaxSteadyInflation)*steadyElapsed
+	representative := steadyWindowIsRepresentative(
+		!windowStart.IsZero(),
+		steadyBytes,
+		totalElapsed,
+		steadyElapsed,
+	)
 	if representative {
 		return Sample{
 			BytesPerSecond:  float64(steadyBytes) / steadyElapsed.Seconds(),
@@ -593,6 +595,24 @@ func measure(
 		WarmupExcluded:  false,
 		Elapsed:         totalElapsed,
 	}, nil
+}
+
+// steadyWindowIsRepresentative is kept as a pure duration predicate so the
+// boundary is testable without scheduler timing. Tests that manufacture a
+// stall with time.Sleep are still useful end-to-end coverage, but under the
+// race detector their paced tail legitimately widens across this threshold;
+// wall-clock scheduling must not decide which side of the contract a unit test
+// believes it exercised.
+func steadyWindowIsRepresentative(
+	hasWindowStart bool,
+	steadyBytes int64,
+	totalElapsed time.Duration,
+	steadyElapsed time.Duration,
+) bool {
+	return hasWindowStart &&
+		0 < steadyBytes &&
+		0 < steadyElapsed &&
+		totalElapsed <= time.Duration(MaxSteadyInflation)*steadyElapsed
 }
 
 // openStream issues one stream's request and leaves the body open and unread,

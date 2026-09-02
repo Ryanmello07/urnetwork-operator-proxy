@@ -5,7 +5,9 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // stubDests builds a connectivity table pointed at one server, plus a
@@ -27,12 +29,13 @@ func stubDests(url string, n int) []Destination {
 	return dests
 }
 
-// A provider that carries traffic passes on the FIRST success, without paying
-// for the rest of the sample.
-func TestBlackholePassesOnFirstSuccess(t *testing.T) {
-	var requests int
+// A provider that carries traffic passes, but the whole small sample is still
+// checked so an unrelated first success cannot hide a later TLS integrity
+// failure.
+func TestBlackholePassesAfterCheckingIntegrityOfWholeSample(t *testing.T) {
+	var requests atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests++
+		requests.Add(1)
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
@@ -46,9 +49,40 @@ func TestBlackholePassesOnFirstSuccess(t *testing.T) {
 	if res.Failure != "" {
 		t.Errorf("Failure = %q, want empty on success", res.Failure)
 	}
-	if requests != 1 {
-		t.Errorf("made %d requests, want 1: the question is answered by the first success, "+
-			"and this runs hourly against the whole fleet", requests)
+	if got := requests.Load(); got != BlackholeSampleSize {
+		t.Errorf("made %d requests, want %d: every sampled TLS identity must be checked", got, BlackholeSampleSize)
+	}
+}
+
+// Checking the whole integrity sample must not multiply the per-provider
+// deadline by three. All three requests share one tunnel and can run together;
+// this barrier proves they are admitted before any one is allowed to finish.
+func TestBlackholeChecksIntegritySampleConcurrently(t *testing.T) {
+	entered := make(chan struct{}, BlackholeSampleSize)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	done := make(chan *BlackholeResult, 1)
+	go func() {
+		done <- blackhole(context.Background(), srv.Client(), stubDests(srv.URL, BlackholeSampleSize),
+			Options{Rand: rand.New(rand.NewSource(1)), PerRequestTimeout: 2 * time.Second})
+	}()
+	for i := 0; i < BlackholeSampleSize; i++ {
+		select {
+		case <-entered:
+		case <-time.After(500 * time.Millisecond):
+			close(release)
+			t.Fatalf("only %d/%d checks entered before completion; the sample is running sequentially", i, BlackholeSampleSize)
+		}
+	}
+	close(release)
+	if res := <-done; !res.OK {
+		t.Fatalf("concurrent healthy sample failed: %+v", res)
 	}
 }
 
@@ -81,10 +115,9 @@ func TestBlackholeFailsOnlyWhenAllFail(t *testing.T) {
 // it dark here would remove working providers on a signal that cannot tell the
 // two apart.
 func TestBlackholePartialReachabilityIsNotABlackhole(t *testing.T) {
-	var n int
+	var n atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n++
-		if n < 3 {
+		if n.Add(1) < 3 {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
@@ -97,6 +130,39 @@ func TestBlackholePartialReachabilityIsNotABlackhole(t *testing.T) {
 
 	if !res.OK {
 		t.Errorf("OK = false, want true: the third destination answered, so traffic is getting through")
+	}
+}
+
+// A successful first destination must not hide a forged TLS certificate on a
+// later canary. This is the exact production failure: the old any-success loop
+// returned immediately, so a TLS-intercepting provider could be recorded OK
+// before the sampled gstatic destination was ever attempted.
+func TestBlackholeTLSAuthenticationFailureOverridesSuccess(t *testing.T) {
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer good.Close()
+	intercepted := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer intercepted.Close()
+
+	dests := []Destination{
+		{Name: "good-a", Class: ClassConnectivity, URL: good.URL, Expect: ExpectStatus, Status: http.StatusNoContent},
+		{Name: "intercepted", Class: ClassConnectivity, URL: intercepted.URL, Expect: ExpectStatus, Status: http.StatusNoContent},
+		{Name: "good-b", Class: ClassConnectivity, URL: good.URL, Expect: ExpectStatus, Status: http.StatusNoContent},
+	}
+	res := blackhole(context.Background(), http.DefaultClient, dests,
+		Options{Rand: rand.New(rand.NewSource(1)), PerRequestTimeout: time.Second})
+
+	if res.OK {
+		t.Fatal("OK = true, want false: a forged certificate is a hard provider failure")
+	}
+	if res.Failure != FailureTLSAuthentication {
+		t.Fatalf("Failure = %q, want %q", res.Failure, FailureTLSAuthentication)
+	}
+	if len(res.Results) < 2 {
+		t.Fatalf("tried only %d destinations: an ordinary success still ended the integrity check early", len(res.Results))
 	}
 }
 

@@ -44,7 +44,9 @@ import (
 
 	"github.com/urnetwork/operator-proxy/bandwidth"
 	"github.com/urnetwork/operator-proxy/confinement"
+	"github.com/urnetwork/operator-proxy/controlplane"
 	"github.com/urnetwork/operator-proxy/egresshealth"
+	"github.com/urnetwork/operator-proxy/fleetprobe"
 	"github.com/urnetwork/operator-proxy/geolocate"
 	"github.com/urnetwork/operator-proxy/ingest"
 	"github.com/urnetwork/operator-proxy/prober"
@@ -122,6 +124,28 @@ func main() {
 		fmt.Fprintf(os.Stderr, "egress-prober: -interval must not be negative (got %s)\n\n", *interval)
 		flag.Usage()
 		os.Exit(2)
+	}
+	if *blackholeInterval < 0 {
+		fmt.Fprintf(os.Stderr, "egress-prober: -blackhole-interval must not be negative (got %s); use 0 to disable the sweep\n\n", *blackholeInterval)
+		flag.Usage()
+		os.Exit(2)
+	}
+	if 0 < *blackholeInterval {
+		if *blackholeConcurrency < 1 {
+			fmt.Fprintf(os.Stderr, "egress-prober: -blackhole-concurrency must be positive (got %d)\n\n", *blackholeConcurrency)
+			flag.Usage()
+			os.Exit(2)
+		}
+		if *blackholeTimeout <= 0 {
+			fmt.Fprintf(os.Stderr, "egress-prober: -blackhole-timeout must be positive (got %s)\n\n", *blackholeTimeout)
+			flag.Usage()
+			os.Exit(2)
+		}
+		if *blackholeLimit < 1 {
+			fmt.Fprintf(os.Stderr, "egress-prober: -blackhole-limit must be positive (got %d)\n\n", *blackholeLimit)
+			flag.Usage()
+			os.Exit(2)
+		}
 	}
 
 	// M5: -probe-timeout 0 disables BOTH the http.Client.Timeout and the
@@ -266,7 +290,7 @@ func main() {
 		DueURL:         *dueURL,
 		ShardIndex:     *shardIndex,
 		ShardCount:     *shardCount,
-		HTTP:           &http.Client{Timeout: 30 * time.Second},
+		HTTP:           controlplane.NewHTTPClient(30 * time.Second),
 	}
 
 	// The jwt, if the deployment did not supply one. This sits ABOVE
@@ -302,7 +326,7 @@ func main() {
 	// The credential self-check runs before the first tunnel, for the same
 	// reason the confinement self-check runs before the first request: a fault
 	// the prober cannot detect at runtime has to be caught here or not at all.
-	switch err := checkCredential(ctx, http.DefaultClient, *apiURL, *byJwt); {
+	switch err := checkCredential(ctx, operator.HTTP, *apiURL, *byJwt); {
 	case err == nil:
 		log.Printf("egress-prober: credential self-check passed: the server accepts the byJwt")
 	case errors.Is(err, errCredentialRejected):
@@ -499,79 +523,18 @@ func newProber(
 	bandwidthSampler *bandwidth.Sampler,
 	bandwidthHosts []string,
 ) *prober.Prober {
-	// One allowlist for every unpinned host the probe reaches through the
-	// tunnel: the egress-health destinations and the two bandwidth targets.
-	extraHosts := append(egresshealth.DestinationHosts(), bandwidthHosts...)
-
-	p := &prober.Prober{
-		Open: func(ctx context.Context, providerClientId string) (*http.Client, func() error, error) {
-			id, err := connect.ParseId(providerClientId)
-			if err != nil {
-				return nil, nil, err
-			}
-			cfg := tunnelCfg
-			cfg.Pins = pins.get()
-			t, err := providertunnel.Open(ctx, cfg, id)
-			if err != nil {
-				return nil, nil, err
-			}
-			// ONE client, for the geolocation lookups, the egress-health check
-			// and the bandwidth measurement, so all three measure the same
-			// tunnel and the provider is only put under contract once. The
-			// geolocation hosts stay pinned; the egress-health destinations and
-			// the bandwidth targets are allowed under ordinary WebPKI
-			// verification -- see providertunnel.HTTPClientForHosts for why
-			// pinning them would make the signal worse rather than better.
-			return t.HTTPClientForHosts(probeTimeout, extraHosts), t.Close, nil
-		},
-		// -probe-timeout must govern the per-source deadline too, not just
-		// the http.Client's overall timeout. geolocate caps each source fetch
-		// independently, and until this was wired the cap was always the 5s
-		// package default, so raising -probe-timeout could not extend the
-		// deadline that actually matters. Every probe runs over a cold tunnel
-		// -- no warm-up, closed again after each provider -- so that one
-		// budget has to cover session establishment, an in-tunnel DoH
-		// resolution, and two TLS handshakes.
-		Locate: func(ctx context.Context, client *http.Client) (*geolocate.ConsensusLocation, error) {
-			return geolocate.LocateWithOptions(ctx, client, geolocate.LocateOptions{
-				PerSourceTimeout: probeTimeout,
-			})
-		},
-		// The egress-health check runs over the tunnel Open already returned --
-		// never a second one. Its results are logged and go no further: there is
-		// deliberately no server endpoint and no submission yet, because the
-		// storage schema and the "is this provider healthy enough to select"
-		// verdict are separate work, and a verdict shipped before the signal has
-		// been watched in the field would start de-listing working providers.
-		//
-		// Its budget is derived from -probe-timeout: see egressHealthOptions for
-		// the arithmetic and for what a full pass therefore costs.
-		Health: func(ctx context.Context, client *http.Client) (*egresshealth.Result, error) {
-			return egresshealth.Check(ctx, client, egressHealthOptions(probeTimeout, allDestinations))
-		},
-		Submit:   operator,
-		Attempts: operator,
-		// The health result now outlives the log line. Fire-and-forget: a
-		// server that has not shipped the endpoint answers 404, which the
-		// prober treats as a clean skip, and no submission failure of any kind
-		// can fail a probe.
-		HealthResults: operator,
-	}
-
-	if bandwidthSampler != nil {
-		// The two figures are always logged side by side, on one line, in
-		// target order -- that side-by-side view is the whole reason there is
-		// a second target, and a divergence between them is only visible when
-		// they are never combined. A target that was skipped says so, with
-		// which reason: "skipped for budget" is the byte budget working as
-		// designed, and reads very differently from a target that failed.
-		p.Bandwidth = func(ctx context.Context, providerClientId string, client *http.Client) {
-			results := bandwidthSampler.Sample(ctx, providerClientId, client)
-			log.Printf("bandwidth: provider=%s %s", providerClientId, bandwidth.Summary(results))
-		}
-	}
-
-	return p
+	return fleetprobe.NewFullProber(fleetprobe.FullOptions{
+		TunnelConfig:    tunnelCfg,
+		Pins:            pins.get,
+		ProbeTimeout:    probeTimeout,
+		Concurrency:     1,
+		AllDestinations: allDestinations,
+		Submit:          operator,
+		Attempts:        operator,
+		HealthResults:   operator,
+		Bandwidth:       bandwidthSampler,
+		BandwidthHosts:  bandwidthHosts,
+	})
 }
 
 // egressHealthOptions derives the health check's bounds from -probe-timeout so
@@ -617,47 +580,11 @@ func newProber(
 // geometries are chosen, so the budget check at startup and the options the
 // run actually uses can never disagree.
 func egressHealthRounds(allDestinations bool) int {
-	// SamplePerRun, never len(Destinations()), for a sampled run: it fetches a
-	// random sample of the table, not the table. Sizing the rounds off the
-	// full table would divide one probe timeout by 24 and hand each request a
-	// couple of seconds over a cold tunnel -- cold-start timeouts, charged to
-	// providers as blackholes, on a run that was only ever going to make 30
-	// requests.
-	requests, concurrency := egresshealth.SamplePerRun(), egresshealth.DefaultConcurrency
-	if allDestinations {
-		requests, concurrency = len(egresshealth.Destinations()), egresshealth.AllConcurrency
-	}
-	if rounds := (requests + concurrency - 1) / concurrency; rounds > 1 {
-		return rounds
-	}
-	return 1
+	return fleetprobe.EgressHealthRounds(allDestinations)
 }
 
 func egressHealthOptions(probeTimeout time.Duration, allDestinations bool) egresshealth.Options {
-	// SamplePerRun, never len(Destinations()), for a sampled run: it fetches a
-	// random sample of the table, not the table. Sizing the rounds off the full
-	// 139 entries would divide one probe timeout by 24 and hand each request a
-	// couple of seconds over a cold tunnel -- cold-start timeouts, charged to
-	// providers as blackholes, on a run that was only ever going to make 30
-	// requests.
-	rounds := egressHealthRounds(allDestinations)
-	concurrency := egresshealth.DefaultConcurrency
-	if allDestinations {
-		concurrency = egresshealth.AllConcurrency
-	}
-	perRequest := probeTimeout / time.Duration(rounds)
-	if perRequest <= 0 {
-		// Only reachable for a -probe-timeout smaller than the round count in
-		// nanoseconds, which flag validation already rules out; falling back to
-		// the whole budget is still bounded.
-		perRequest = probeTimeout
-	}
-	return egresshealth.Options{
-		PerRequestTimeout: perRequest,
-		Budget:            probeTimeout,
-		AllDestinations:   allDestinations,
-		Concurrency:       concurrency,
-	}
+	return fleetprobe.EgressHealthOptions(probeTimeout, allDestinations)
 }
 
 // newSchedulers returns the scheduler for a server-driven pass and the one for
@@ -902,8 +829,8 @@ type credentialFetcher interface {
 // credentialPollInitial and credentialPollMax bound the wait for a credential
 // the server has not minted yet.
 //
-// The server's bootstrap task runs every 6h, so a prober brought up alongside
-// a fresh deployment can legitimately be hours early. That is a WAIT, not a
+// The server's bootstrap task runs immediately and then every 6h, so a prober
+// brought up alongside a fresh deployment can still win the startup race. That is a WAIT, not a
 // crash: exiting would put a supervised process into a restart loop that
 // re-runs the confinement self-check and re-fetches on every restart, and
 // which reads in journald as a broken prober rather than as one patiently
@@ -981,7 +908,7 @@ func fetchByJwtIfEmpty(ctx context.Context, byJwt *string, f credentialFetcher, 
 		case errors.Is(err, ingest.ErrUnauthorized):
 			return fmt.Errorf("the server rejected the operator secret when asked for the prober credential; check -operator-secret against ingest_secret in the server's provider_egress.yml: %w", err)
 		case errors.Is(err, ingest.ErrCredentialNotReady):
-			log.Printf("egress-prober: the server has not minted the prober credential yet; asking again in %s (its bootstrap task runs every 6h)", backoff)
+			log.Printf("egress-prober: the server has not minted the prober credential yet; asking again in %s (its bootstrap task runs immediately and then every 6h)", backoff)
 		default:
 			log.Printf("egress-prober: could not get the prober credential: %s; asking again in %s", err, backoff)
 		}
@@ -1083,37 +1010,7 @@ func fetchGeolocationPins(ctx context.Context, client *ingest.Client) (map[strin
 // nothing to be strict about: the dangerous drift (a source with no pin) is the
 // one that raises.
 func validateGeolocationPins(served map[string]ingest.GeolocationPin) (map[string][]string, error) {
-	hosts := geolocate.SourceHosts()
-	if len(hosts) == 0 {
-		// unreachable while geolocate/sources.go has entries; an empty pin map
-		// would be refused by providertunnel.Open anyway, and this says why
-		return nil, fmt.Errorf("no geolocation source hosts to pin")
-	}
-
-	pins := make(map[string][]string, len(hosts))
-	var missing []string
-	for _, host := range hosts {
-		pin, ok := served[host]
-		if !ok || pin.Leaf == "" || pin.Intermediate == "" {
-			missing = append(missing, host)
-			continue
-		}
-		pins[host] = []string{pin.Leaf, pin.Intermediate}
-	}
-	if 0 < len(missing) {
-		return nil, fmt.Errorf(
-			"the server served no usable certificate pin for geolocation source host(s) %s (it served %d host(s): %s). "+
-				"The prober will not probe an unpinned geolocation source: the lookup rides the tunnel of the provider being measured, so unpinned means that provider can forge its own location. "+
-				"Either the server's observation job has not run for that host, or geolocate/sources.go and the server's host list have drifted apart",
-			strings.Join(missing, " "), len(served), strings.Join(sortedServedHosts(served), " "))
-	}
-
-	for host := range served {
-		if _, wanted := pins[host]; !wanted {
-			log.Printf("egress-prober: the server serves a pin for %q, which is not a geolocation source host; ignoring it (the pin map is also the tunnel's allowlist, and a set fetched over the network must not widen it)", host)
-		}
-	}
-	return pins, nil
+	return fleetprobe.ValidateGeolocationPins(served)
 }
 
 // refreshGeolocationPins re-fetches the pin set once pinRefreshInterval has
@@ -1211,7 +1108,7 @@ const findProvidersCountPerLocation = 5000
 // what can be hundreds is far more useful than a pass that produces
 // nothing because one of them hiccupped.
 func listProviders(ctx context.Context, apiURL string, byJwt string) ([]string, error) {
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	httpClient := controlplane.NewHTTPClient(30 * time.Second)
 
 	locationIds, err := listProviderLocationIds(ctx, httpClient, apiURL)
 	if err != nil {

@@ -11,10 +11,11 @@ For every provider, the prober opens a tunnel pinned to that provider, runs
 geolocation lookups **through** it against three independent free sources, takes
 a consensus, and submits the result to the operator's server.
 
-- The prober host never queries a geolocation api directly — every lookup
-  egresses through a provider, so the api reports *that provider's* location.
-  The prober refuses to start unless it has verified it *cannot* reach those
-  apis directly (see "Confinement" below).
+- A probe request never receives a host-network dialer. Every lookup egresses
+  through the selected provider, including DNS; the allowlist is closed and
+  there is no local fallback. Main runs the library from durable taskworker
+  shards on hosts with ordinary LAN egress. The standalone command retains the
+  confinement check below as defense in depth.
 - The lookups are TLS-pinned (to pins the server observed directly), so a
   provider on the path cannot forge a location.
 - Country is the trusted output. City is recorded only when at least two sources
@@ -66,11 +67,12 @@ The prober needs its own network client identity (`-by-jwt`). **Leave it empty
 and the prober fetches one for itself** from the server's
 `/network/prober-credential` endpoint, authenticating with `-operator-secret` —
 no hand-provisioned identity, and one less secret to place. The server mints
-that identity in a bootstrap task which runs every 6h, so a prober brought up
-alongside a fresh deployment may start before its credential exists: it waits
-for it, logging one line per attempt on a backoff capped at 5 minutes, rather
-than exiting into a restart loop. The wait has no deadline of its own — impose
-one with the supervisor's start timeout if a deployment wants it.
+that identity in a bootstrap task which runs immediately and then every 6h, so
+a prober brought up alongside a fresh deployment may start before its
+credential exists: it waits for it, logging one line per attempt on a backoff
+capped at 5 minutes, rather than exiting into a restart loop. The wait has no
+deadline of its own — impose one with the supervisor's start timeout if a
+deployment wants it.
 
 An explicitly supplied `-by-jwt` (or `UR_PROBER_BY_JWT`) always wins and the
 endpoint is never contacted, so an existing deployment that provisions the

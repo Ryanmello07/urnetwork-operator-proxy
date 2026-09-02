@@ -44,6 +44,10 @@ type submitEgressHealthBody struct {
 	ReputationTotal       int    `json:"reputation_total"`
 	FailedNames           string `json:"failed_names"`
 	ReputationFailedNames string `json:"reputation_failed_names"`
+	// TLSAuthenticationFailure is deliberately outside all score fields. One
+	// unauthenticated destination is a hard provider failure even when the
+	// remaining sampled destinations make the percentage look healthy.
+	TLSAuthenticationFailure bool `json:"tls_authentication_failure"`
 }
 
 // SubmitEgressHealth records one egress-health run for one provider.
@@ -85,12 +89,13 @@ func (c *Client) SubmitEgressHealth(
 	}
 
 	buf, err := json.Marshal(submitEgressHealthBody{
-		ClientId:        providerClientId,
-		OKCount:         res.OKCount,
-		TotalCount:      res.Total,
-		ClassResults:    classResults,
-		ReputationOK:    res.Reputation.OK,
-		ReputationTotal: res.Reputation.Total,
+		ClientId:                 providerClientId,
+		OKCount:                  res.OKCount,
+		TotalCount:               res.Total,
+		ClassResults:             classResults,
+		ReputationOK:             res.Reputation.OK,
+		ReputationTotal:          res.Reputation.Total,
+		TLSAuthenticationFailure: res.TLSAuthenticationFailure,
 		// Bounded like probe_failure, and for the same reason: a run with
 		// many failures names ~131 destinations under -egress-health-all, and
 		// a submission the server rejects for length is a health signal

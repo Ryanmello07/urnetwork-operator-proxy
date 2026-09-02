@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/urnetwork/operator-proxy/controlplane"
 )
 
 // ErrDueUnsupported reports that the server has no due endpoint (404). The
@@ -115,8 +117,12 @@ func (c *Client) httpClient() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
 	}
-	return http.DefaultClient
+	return defaultHTTPClient
 }
+
+// One shared transport preserves connection pooling while making the default
+// safe for every operator endpoint, including call sites that omit Client.HTTP.
+var defaultHTTPClient = controlplane.NewHTTPClient(0)
 
 // DueResult mirrors handlers.ProviderEgressLocationDueResult.
 type dueResult struct {
@@ -133,7 +139,7 @@ type dueResult struct {
 // from "nothing is due", and it clamps the value to its own maximum.
 //
 // When ShardCount is above 1 the shard parameters are sent, so the server hands
-// this prober only its own slice of the queue. Below that they are omitted
+// this worker only its own slice of the queue. Below that they are omitted
 // entirely, which is both the single-prober case and what keeps this working
 // against a server that predates them.
 func (c *Client) Due(ctx context.Context, limit int) ([]string, error) {

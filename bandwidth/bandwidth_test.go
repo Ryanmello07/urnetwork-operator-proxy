@@ -885,14 +885,14 @@ func TestMeasureBurstAfterWarmupBoundaryIsNotASteadyFigure(t *testing.T) {
 	}
 }
 
-// TestMeasureWideStallBurstIsNotASteadyFigure is the case an absolute
-// window floor could not catch: the stall is long and the burst that follows
-// is WIDER than any fixed minimum, so the tail looks like a respectable
-// steady window while still being the tail of a stall. Its bytes divided by
-// its own spread reported 5.1x the true aggregate in review. The bound is
-// relative for exactly this reason -- the tail must be a fraction of the
-// transfer, not merely wide in absolute terms.
-func TestMeasureWideStallBurstIsNotASteadyFigure(t *testing.T) {
+// TestMeasureWideStallBurstBoundsSteadyInflation is the end-to-end case an
+// absolute window floor could not catch: the stall is long and the burst that
+// follows is wider than a fixed minimum. Its bytes divided by its own spread
+// reported 5.1x the true aggregate in review. Whether the raced/scheduled tail
+// lands just above or below the 1/MaxSteadyInflation boundary is deliberately
+// not asserted here; the invariant is that the published figure stays within
+// the configured bound either way.
+func TestMeasureWideStallBurstBoundsSteadyInflation(t *testing.T) {
 	// ~4s of stall, then the last 512 KiB/stream paced out: a steady window
 	// several times WarmupDuration -- so no absolute floor catches it -- and
 	// still under a quarter of the transfer's wall clock.
@@ -921,9 +921,34 @@ func TestMeasureWideStallBurstIsNotASteadyFigure(t *testing.T) {
 		t.Errorf("reported %.0f B/s against a true aggregate of %.0f B/s over %s: %.1fx inflation, bound is %dx (steady=%v window=%s)",
 			sample.BytesPerSecond, trueAggregate, wall, inflation, MaxSteadyInflation, sample.WarmupExcluded, sample.Elapsed)
 	}
-	if sample.WarmupExcluded {
-		t.Errorf("WarmupExcluded = true over a %s window against a %s transfer: a wide tail is still the tail of a stall, and %.0f B/s was published as steady",
-			sample.Elapsed, wall, sample.BytesPerSecond)
+}
+
+// TestSteadyWindowRepresentativenessRejectsWideTailAfterLongStall covers the
+// exact relative-window boundary without sleeps or scheduler assumptions. A
+// 1.2s tail can look wide in absolute terms, but after 4s of earlier stall it
+// is less than one quarter of the 5.2s transfer and must not be labelled
+// steady. Exactly one quarter remains the documented inclusive boundary.
+func TestSteadyWindowRepresentativenessRejectsWideTailAfterLongStall(t *testing.T) {
+	tests := []struct {
+		name          string
+		hasStart      bool
+		steadyBytes   int64
+		totalElapsed  time.Duration
+		steadyElapsed time.Duration
+		want          bool
+	}{
+		{name: "wide tail after long stall", hasStart: true, steadyBytes: 1, totalElapsed: 5200 * time.Millisecond, steadyElapsed: 1200 * time.Millisecond, want: false},
+		{name: "exact relative boundary", hasStart: true, steadyBytes: 1, totalElapsed: 4800 * time.Millisecond, steadyElapsed: 1200 * time.Millisecond, want: true},
+		{name: "no post-warmup bytes", hasStart: true, steadyBytes: 0, totalElapsed: time.Second, steadyElapsed: time.Second, want: false},
+		{name: "no window start", hasStart: false, steadyBytes: 1, totalElapsed: time.Second, steadyElapsed: time.Second, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := steadyWindowIsRepresentative(tt.hasStart, tt.steadyBytes, tt.totalElapsed, tt.steadyElapsed)
+			if got != tt.want {
+				t.Fatalf("steadyWindowIsRepresentative(...) = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

@@ -169,6 +169,42 @@ func TestMissingFlagUsageDoesNotPrintSecrets(t *testing.T) {
 	}
 }
 
+// Invalid blackhole controls used to fail in unsafe ways: zero concurrency
+// deadlocked every worker on an unbuffered semaphore, a non-positive timeout
+// removed the network deadline, and a negative interval silently disabled the
+// only fleet-wide fast check. Reject each at startup instead of starting a
+// healthy-looking but inert service.
+func TestInvalidBlackholeFlagsAreRejected(t *testing.T) {
+	tests := []struct {
+		name  string
+		flag  string
+		value string
+		want  string
+	}{
+		{name: "negative interval", flag: "-blackhole-interval", value: "-1s", want: "-blackhole-interval must not be negative"},
+		{name: "zero concurrency", flag: "-blackhole-concurrency", value: "0", want: "-blackhole-concurrency must be positive"},
+		{name: "zero timeout", flag: "-blackhole-timeout", value: "0", want: "-blackhole-timeout must be positive"},
+		{name: "zero limit", flag: "-blackhole-limit", value: "0", want: "-blackhole-limit must be positive"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			out, code := runProber(t,
+				"-skip-confinement-check",
+				"-api-url", "http://127.0.0.1:1",
+				"-platform-url", "ws://127.0.0.1:1",
+				"-interval", "0",
+				test.flag, test.value,
+			)
+			if code != 2 {
+				t.Fatalf("%s=%s exited %d, want 2. output:\n%s", test.flag, test.value, code, out)
+			}
+			if !strings.Contains(out, test.want) {
+				t.Fatalf("output does not contain %q:\n%s", test.want, out)
+			}
+		})
+	}
+}
+
 // TestListProvidersErrorsWhenEveryLocationFetchFails: the per-location skip
 // exists so one hiccup out of hundreds of locations cannot abort a pass, but
 // when locations exist and EVERY find-providers2 call failed the enumeration

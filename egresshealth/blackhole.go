@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"sync"
 )
 
 // BlackholeSampleSize is how many destinations one blackhole check asks for.
@@ -22,11 +23,11 @@ const BlackholeSampleSize = 3
 
 // BlackholeResult is the outcome of one provider's check.
 type BlackholeResult struct {
-	// OK is true when at least one destination answered correctly. ANY, not
-	// all: the question is whether the provider carries traffic at all, and a
-	// provider that reaches two of three is degraded, not dark. Degradation is
-	// Check's department -- treating it as a blackhole here would remove
-	// working providers on a signal that cannot tell the two apart.
+	// OK is true when at least one destination answered correctly and NONE
+	// failed TLS authentication. Ordinary partial reachability is degradation,
+	// not a blackhole. A forged certificate is different: accepting the provider
+	// after one unrelated endpoint succeeded would knowingly expose clients to
+	// an unauthenticated peer.
 	OK bool
 	// Failure is "" when OK, otherwise a short class suitable for the server's
 	// varchar(64): all_destinations_failed.
@@ -36,10 +37,15 @@ type BlackholeResult struct {
 	Results []CheckResult
 }
 
-// FailureAllDestinationsFailed is the only failure class this check itself
-// produces. A tunnel that could not be opened never reaches here, and is the
-// caller's to classify.
-const FailureAllDestinationsFailed = "all_destinations_failed"
+const (
+	// FailureAllDestinationsFailed means none of the sampled destinations met
+	// its content/status contract.
+	FailureAllDestinationsFailed = "all_destinations_failed"
+	// FailureTLSAuthentication means a sampled HTTPS peer could not authenticate
+	// the requested host. It is a hard integrity failure even when a different
+	// destination worked.
+	FailureTLSAuthentication = "tls_authentication_failed"
+)
 
 // Blackhole answers one question about a provider: did ANY traffic get through.
 //
@@ -53,10 +59,12 @@ const FailureAllDestinationsFailed = "all_destinations_failed"
 // looks different from the outside.
 //
 // So this is deliberately the cheapest useful check: a small fixed sample, one
-// round trip each, pass on the first success. It reuses fetch, and therefore
-// the table's headers, body caps and Verify contracts -- a captive portal that
-// answers 200 with its own body fails here exactly as it fails a full run,
-// which is the property that makes "something got through" mean anything.
+// round trip each. The sample runs concurrently so checking every TLS identity
+// consumes one request deadline rather than multiplying it by the sample size.
+// It reuses fetch, and therefore the table's headers, body caps and Verify
+// contracts -- a captive portal that answers 200 with its own body fails here
+// exactly as it fails a full run, which is the property that makes "something
+// got through" mean anything.
 //
 // Only the connectivity class is drawn. Those destinations exist to answer
 // "is there internet", they are operated by several independent parties, they
@@ -76,21 +84,31 @@ func blackhole(ctx context.Context, client *http.Client, dests []Destination, op
 	sample := blackholeSample(dests, opts.rng())
 
 	result := &BlackholeResult{Failure: FailureAllDestinationsFailed}
-	for _, d := range sample {
-		if ctx.Err() != nil {
-			break
-		}
-		cr := fetch(ctx, client, d, timeout)
-		result.Results = append(result.Results, cr)
-		if cr.OK {
-			// stop on the first success: the question is answered, and every
-			// further request is spend on a provider already known to work.
-			// Sequential rather than concurrent for the same reason -- the
-			// common case costs exactly one round trip.
-			result.OK = true
-			result.Failure = ""
+	results := make([]CheckResult, len(sample))
+	var wg sync.WaitGroup
+	for i, d := range sample {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = fetch(ctx, client, d, timeout)
+		}()
+	}
+	wg.Wait()
+	result.Results = results
+
+	sawSuccess := false
+	for _, cr := range results {
+		if cr.TLSAuthenticationFailure {
+			result.Failure = FailureTLSAuthentication
 			return result
 		}
+		if cr.OK {
+			sawSuccess = true
+		}
+	}
+	if sawSuccess {
+		result.OK = true
+		result.Failure = ""
 	}
 
 	return result
@@ -118,13 +136,10 @@ func blackholeSample(dests []Destination, r *rand.Rand) []Destination {
 	return candidates[:min(BlackholeSampleSize, len(candidates))]
 }
 
-// BlackholeHosts is the set of hosts a blackhole check can dial, for the
-// startup confinement self-check.
-//
-// The check is only meaningful if these are unreachable EXCEPT through a
-// provider tunnel. If the prober could reach them directly, a provider that
-// carries nothing would still be recorded as ok -- the check would confirm the
-// prober's own connectivity and remove nothing, forever, while looking healthy.
+// BlackholeHosts is the closed allowlist passed to the provider-tunnel client.
+// The standalone command also uses it for its defense-in-depth confinement
+// check. fleetprobe has no direct dialer to these hosts, so the taskworker's
+// ordinary LAN route cannot satisfy a check when the provider tunnel is dark.
 func BlackholeHosts() []string {
 	seen := map[string]bool{}
 	hosts := []string{}

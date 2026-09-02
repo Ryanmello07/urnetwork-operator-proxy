@@ -2,12 +2,11 @@
 // the real internet, across several independent classes of destination.
 //
 // All network access goes through an injected *http.Client; this package never
-// constructs a client, a transport, or a dialer of its own. That is the whole
-// trust argument. The prober runs on a docker network declared `internal: true`
-// -- no gateway, no NAT, no direct route out -- so the only client that can
-// reach anything is one bound to a provider tunnel, and a broken tunnel cannot
-// masquerade as a healthy provider because there is no second path. A package
-// that opened its own transport would quietly reintroduce that path.
+// constructs a client, transport, or dialer. fleetprobe supplies a client whose
+// only dial boundary is the selected provider's userspace TUN, with no host
+// fallback. A broken tunnel therefore fails the request even when the host has
+// ordinary LAN egress. The standalone command's confinement check remains
+// defense in depth; correctness does not depend on a special host route.
 //
 // # Why this exists
 //
@@ -135,6 +134,8 @@ package egresshealth
 import (
 	"context"
 	crand "crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -1713,13 +1714,14 @@ func truncate(s string, n int) string {
 // blackhole signature). Losing that distinction would defeat the point of
 // grouping by class.
 type CheckResult struct {
-	Name       string
-	Class      Class
-	OK         bool
-	StatusCode int   // 0 when the request never produced a response
-	ByteCount  int64 // bytes of body actually read, capped; set on failures too
-	Latency    time.Duration
-	Err        string // "" when OK
+	Name                     string
+	Class                    Class
+	OK                       bool
+	StatusCode               int   // 0 when the request never produced a response
+	ByteCount                int64 // bytes of body actually read, capped; set on failures too
+	Latency                  time.Duration
+	Err                      string // "" when OK
+	TLSAuthenticationFailure bool   // the peer's certificate could not authenticate the requested host
 }
 
 // ClassSummary is the ok/total tally for one class.
@@ -1731,6 +1733,11 @@ type ClassSummary struct {
 // Result is one full run.
 type Result struct {
 	Checks []CheckResult
+	// TLSAuthenticationFailure is true when any sampled HTTPS peer failed
+	// certificate-chain or hostname verification. It is intentionally separate
+	// from the score: one forged identity is a hard integrity failure and must
+	// not be diluted by unrelated successful destinations.
+	TLSAuthenticationFailure bool
 	// OKCount and Total cover the SCORED classes only, and only the
 	// destinations this run SAMPLED. A datacenter provider that fails every
 	// reputation destination still reads as fully healthy here, which is the
@@ -2118,7 +2125,11 @@ func check(ctx context.Context, client *http.Client, dests []Destination, opts O
 	}
 
 	okCount := 0
+	tlsAuthenticationFailure := false
 	for _, r := range results {
+		if r.TLSAuthenticationFailure {
+			tlsAuthenticationFailure = true
+		}
 		if !r.OK {
 			continue
 		}
@@ -2136,11 +2147,12 @@ func check(ctx context.Context, client *http.Client, dests []Destination, opts O
 	}
 
 	return &Result{
-		Checks:     results,
-		OKCount:    okCount,
-		Total:      total,
-		ByClass:    byClass,
-		Reputation: reputation,
+		Checks:                   results,
+		TLSAuthenticationFailure: tlsAuthenticationFailure,
+		OKCount:                  okCount,
+		Total:                    total,
+		ByClass:                  byClass,
+		Reputation:               reputation,
 	}, nil
 }
 
@@ -2169,6 +2181,7 @@ func fetch(ctx context.Context, client *http.Client, d Destination, timeout time
 	if err != nil {
 		r.Latency = time.Since(start)
 		r.Err = err.Error()
+		r.TLSAuthenticationFailure = isTLSAuthenticationFailure(err)
 		return r
 	}
 	defer resp.Body.Close()
@@ -2192,6 +2205,33 @@ func fetch(ctx context.Context, client *http.Client, d Destination, timeout time
 	}
 	r.OK = true
 	return r
+}
+
+// isTLSAuthenticationFailure identifies certificate-chain and hostname
+// verification failures without parsing their human-readable text. These are
+// qualitatively different from timeouts, refused connections, HTTP statuses,
+// and content mismatches: a provider returned a TLS identity that does not
+// authenticate the destination the client requested.
+//
+// CertificateVerificationError is the normal crypto/tls wrapper. The x509
+// fallbacks cover transports with a custom VerifyPeerCertificate callback,
+// including the provider tunnel's pinning path, which can return the underlying
+// verification error directly.
+func isTLSAuthenticationFailure(err error) bool {
+	var verificationErr *tls.CertificateVerificationError
+	if errors.As(err, &verificationErr) {
+		return true
+	}
+	var unknownAuthorityErr x509.UnknownAuthorityError
+	if errors.As(err, &unknownAuthorityErr) {
+		return true
+	}
+	var certificateInvalidErr x509.CertificateInvalidError
+	if errors.As(err, &certificateInvalidErr) {
+		return true
+	}
+	var hostnameErr x509.HostnameError
+	return errors.As(err, &hostnameErr)
 }
 
 // judge applies the destination's success contract to what came back. It is
@@ -2342,6 +2382,9 @@ func (r *Result) Summary() string {
 	}
 	if 0 < r.TableTotal {
 		fmt.Fprintf(&b, " table=%d", r.TableTotal)
+	}
+	if r.TLSAuthenticationFailure {
+		b.WriteString(" tls_authentication_failure=true")
 	}
 	return b.String()
 }

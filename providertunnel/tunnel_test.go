@@ -777,6 +777,72 @@ func TestOpenCloseGoroutineLifecycle(t *testing.T) {
 	}
 }
 
+type recordingCloseWaiter struct {
+	name  string
+	order *[]string
+	err   error
+}
+
+func (c *recordingCloseWaiter) CloseAndWait(context.Context) error {
+	*c.order = append(*c.order, c.name)
+	return c.err
+}
+
+// A RemoteUserNatMultiClient does not own the generated transport clients; its
+// ApiMultiClientGenerator does. The old Tunnel.Close canceled the shared
+// context and closed only the multi-client/Tun, so every short-lived probe
+// returned before generator-owned Client and OOB retirement was joined. A
+// fleet sweep then accumulated teardown tails faster than they retired.
+func TestCloseTunnelPartsJoinsGeneratorOwnership(t *testing.T) {
+	order := []string{}
+	pumpDone := make(chan struct{})
+	close(pumpDone)
+	multiClient := &recordingCloseWaiter{name: "multi-client", order: &order}
+	generator := &recordingCloseWaiter{name: "generator", order: &order}
+
+	err := closeTunnelParts(
+		context.Background(),
+		func() { order = append(order, "cancel") },
+		func() error { order = append(order, "tun"); return nil },
+		pumpDone,
+		multiClient,
+		generator,
+	)
+	if err != nil {
+		t.Fatalf("closeTunnelParts: %v", err)
+	}
+	if want := []string{"cancel", "tun", "multi-client", "generator"}; !reflect.DeepEqual(order, want) {
+		t.Fatalf("close order = %v, want %v", order, want)
+	}
+}
+
+// A failure in one owner must not skip the later owners. Teardown is a drain,
+// not a short-circuit: returning the first error while leaving the generator
+// alive would recreate the leak precisely on the unhealthy paths that sweep
+// most often.
+func TestCloseTunnelPartsAttemptsEveryOwnerAfterError(t *testing.T) {
+	order := []string{}
+	pumpDone := make(chan struct{})
+	close(pumpDone)
+	multiClient := &recordingCloseWaiter{name: "multi-client", order: &order, err: errors.New("multi-client close failed")}
+	generator := &recordingCloseWaiter{name: "generator", order: &order}
+
+	err := closeTunnelParts(
+		context.Background(),
+		func() { order = append(order, "cancel") },
+		func() error { order = append(order, "tun"); return errors.New("tun close failed") },
+		pumpDone,
+		multiClient,
+		generator,
+	)
+	if err == nil {
+		t.Fatal("closeTunnelParts returned nil despite close failures")
+	}
+	if want := []string{"cancel", "tun", "multi-client", "generator"}; !reflect.DeepEqual(order, want) {
+		t.Fatalf("close order = %v, want %v", order, want)
+	}
+}
+
 // assertInTunnelOnlyResolver asserts that s permits exactly one resolution
 // path -- remote DoH, dialed through the tun -- and no host-side or cleartext
 // path of any kind.
@@ -844,13 +910,22 @@ func TestInTunnelOnlyDnsResolverSettings(t *testing.T) {
 func TestOpenUsesInTunnelOnlyDnsResolution(t *testing.T) {
 	var captured *connect.DnsResolverSettings
 	var called bool
+	var strategyCalled bool
 	orig := createTun
+	origStrategy := newControlplaneClientStrategy
 	createTun = func(ctx context.Context, resolver *connect.DnsResolverSettings) (*connect.Tun, error) {
 		called = true
 		captured = resolver
 		return orig(ctx, resolver)
 	}
-	defer func() { createTun = orig }()
+	newControlplaneClientStrategy = func(ctx context.Context) *connect.ClientStrategy {
+		strategyCalled = true
+		return origStrategy(ctx)
+	}
+	defer func() {
+		createTun = orig
+		newControlplaneClientStrategy = origStrategy
+	}()
 
 	tunnel, err := Open(context.Background(), dummyOpenConfig(), connect.NewId())
 	if err != nil {
@@ -860,6 +935,9 @@ func TestOpenUsesInTunnelOnlyDnsResolution(t *testing.T) {
 
 	if !called {
 		t.Fatal("Open built its tun without going through createTun; it can no longer be proven that off-tunnel DNS resolution is disabled")
+	}
+	if !strategyCalled {
+		t.Fatal("Open built its API/Connect client without the IPv4-only control-plane strategy")
 	}
 	assertInTunnelOnlyResolver(t, captured)
 }

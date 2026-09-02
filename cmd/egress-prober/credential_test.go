@@ -88,7 +88,7 @@ func TestFetchByJwtIfEmptyFetchesWhenEmpty(t *testing.T) {
 }
 
 // TestFetchByJwtIfEmptyKeepsPollingUntilTheCredentialExists: the bootstrap task
-// runs every 6h, so a prober started alongside a fresh deployment arrives
+// runs immediately and then every 6h, so a prober started alongside a fresh deployment arrives
 // before its credential does. That must be a wait, not an exit.
 func TestFetchByJwtIfEmptyKeepsPollingUntilTheCredentialExists(t *testing.T) {
 	f := &stubCredentialFetcher{results: []credentialResult{

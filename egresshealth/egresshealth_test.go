@@ -178,6 +178,87 @@ func TestCheckAllHealthy(t *testing.T) {
 	}
 }
 
+// TestFetchClassifiesTLSAuthenticationFailure reproduces the production
+// failure where a provider returned a self-signed leaf for a real HTTPS
+// destination. A string-only error is not enough: the operator has to carry a
+// machine-readable, fail-closed signal to the server so one forged certificate
+// cannot be diluted into an otherwise healthy percentage.
+func TestFetchClassifiesTLSAuthenticationFailure(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	result := fetch(context.Background(), http.DefaultClient, Destination{
+		Name:   "intercepted",
+		Class:  ClassConnectivity,
+		URL:    srv.URL,
+		Expect: ExpectStatus,
+		Status: http.StatusNoContent,
+	}, time.Second)
+
+	if result.OK {
+		t.Fatal("a self-signed TLS endpoint passed")
+	}
+	if !result.TLSAuthenticationFailure {
+		t.Fatalf("TLSAuthenticationFailure = false, want true for %q", result.Err)
+	}
+}
+
+// An ordinary application or reachability failure must not be promoted into
+// the hard TLS-authenticity signal. Otherwise one refused endpoint could evict
+// a working provider instead of merely lowering its sampled health score.
+func TestFetchDoesNotClassifyHTTPFailureAsTLSAuthenticationFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	result := fetch(context.Background(), srv.Client(), Destination{
+		Name:   "ordinary-failure",
+		Class:  ClassConnectivity,
+		URL:    srv.URL,
+		Expect: ExpectStatus,
+		Status: http.StatusNoContent,
+	}, time.Second)
+
+	if result.OK {
+		t.Fatal("the wrong status unexpectedly passed")
+	}
+	if result.TLSAuthenticationFailure {
+		t.Fatalf("TLSAuthenticationFailure = true for ordinary HTTP failure %q", result.Err)
+	}
+}
+
+// The run-level bit is what crosses the ingest boundary. A single forged
+// certificate must survive aggregation even though all of the ordinary score
+// math still describes the rest of the sample.
+func TestCheckAggregatesTLSAuthenticationFailure(t *testing.T) {
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer good.Close()
+	intercepted := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer intercepted.Close()
+
+	dests := []Destination{
+		{Name: "good", Class: ClassConnectivity, URL: good.URL, Expect: ExpectStatus, Status: http.StatusNoContent},
+		{Name: "intercepted", Class: ClassConnectivity, URL: intercepted.URL, Expect: ExpectStatus, Status: http.StatusNoContent},
+	}
+	res, err := check(context.Background(), http.DefaultClient, dests, fastOptions())
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if !res.TLSAuthenticationFailure {
+		t.Fatalf("TLSAuthenticationFailure = false; checks = %+v", res.Checks)
+	}
+	if got := res.Summary(); !strings.Contains(got, "tls_authentication_failure=true") {
+		t.Fatalf("Summary = %q, want the hard TLS failure visible in logs", got)
+	}
+}
+
 // TestCheckTotalBlackhole is the case this package exists for, and it asserts
 // BOTH halves of the requirement in one place: a blackhole is a successful run
 // reporting 0/12 (err == nil), while a run that could not happen at all is an

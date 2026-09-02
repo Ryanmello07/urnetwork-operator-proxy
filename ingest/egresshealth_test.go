@@ -125,6 +125,7 @@ func TestSubmitEgressHealthSendsAWellFormedBody(t *testing.T) {
 		"client_id": true, "ok_count": true, "total_count": true,
 		"class_results": true, "reputation_ok": true, "reputation_total": true,
 		"failed_names": true, "reputation_failed_names": true,
+		"tls_authentication_failure": true,
 	}
 	for k := range keys {
 		if !wantKeys[k] {
@@ -135,6 +136,33 @@ func TestSubmitEgressHealthSendsAWellFormedBody(t *testing.T) {
 		if _, present := keys[k]; !present {
 			t.Errorf("body is missing %q", k)
 		}
+	}
+}
+
+// A TLS identity failure is a hard signal, not one failed request diluted into
+// ok_count/total_count. Pin the wire field that lets the server enforce that
+// distinction independently of the broad health-score rollout switch.
+func TestSubmitEgressHealthSendsTLSAuthenticationFailure(t *testing.T) {
+	var raw []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	result := ingestHealthResult()
+	result.TLSAuthenticationFailure = true
+	client := &Client{ServerURL: srv.URL, OperatorSecret: "s3cret", HTTP: srv.Client()}
+	if err := client.SubmitEgressHealth(context.Background(), "provider-1", result); err != nil {
+		t.Fatalf("SubmitEgressHealth: %s", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal body: %s", err)
+	}
+	if value, ok := got["tls_authentication_failure"].(bool); !ok || !value {
+		t.Fatalf("tls_authentication_failure = %#v, want true", got["tls_authentication_failure"])
 	}
 }
 
