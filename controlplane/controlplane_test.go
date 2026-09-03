@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net"
 	"testing"
+
+	"github.com/urnetwork/connect"
 )
 
 func TestIPv4DialContextMapsUnspecifiedTCPToTCP4(t *testing.T) {
@@ -56,12 +58,81 @@ func TestIPv4DialContextRejectsTCP6BeforeDial(t *testing.T) {
 	}
 }
 
-func TestClientStrategySettingsDisableOnlyIPv6(t *testing.T) {
-	settings := clientStrategySettings()
-	if !settings.ConnectSettings.DisableIpv6 {
-		t.Fatal("Connect strategy permits IPv6 control-plane dials")
+func TestIPv4DialContextMapsUnspecifiedUDPToUDP4(t *testing.T) {
+	wantErr := errors.New("stop after observing the network")
+	gotNetwork := ""
+	dialContext := ipv4DialContext(func(_ context.Context, network string, _ string) (net.Conn, error) {
+		gotNetwork = network
+		return nil, wantErr
+	})
+
+	_, err := dialContext(context.Background(), "udp", "resolver.example:53")
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("dial error = %v, want injected error", err)
 	}
-	if settings.ConnectSettings.DisableIpv4 {
-		t.Fatal("Connect strategy also disabled IPv4")
+	if gotNetwork != "udp4" {
+		t.Fatalf("underlying network = %q, want udp4", gotNetwork)
+	}
+}
+
+func TestIPv4DialContextRejectsUDP6BeforeDial(t *testing.T) {
+	called := false
+	dialContext := ipv4DialContext(func(_ context.Context, _ string, _ string) (net.Conn, error) {
+		called = true
+		return nil, nil
+	})
+
+	if _, err := dialContext(context.Background(), "udp6", "[2001:db8::1]:53"); err == nil {
+		t.Fatal("explicit udp6 dial succeeded")
+	}
+	if called {
+		t.Fatal("explicit udp6 request reached the underlying dialer")
+	}
+}
+
+func TestForceIPv4ConnectSettingsPreservesInjectedDialer(t *testing.T) {
+	previousPolicy := connect.ControlIpFamilyPolicy()
+	connect.SetControlIpFamilyPolicy(connect.IpFamilyAuto)
+	t.Cleanup(func() { connect.SetControlIpFamilyPolicy(previousPolicy) })
+
+	wantErr := errors.New("stop after observing the network")
+	gotNetwork := ""
+	settings := connect.DefaultConnectSettings()
+	settings.DialContextSettings = &connect.DialContextSettings{
+		DialContext: func(_ context.Context, network string, _ string) (net.Conn, error) {
+			gotNetwork = network
+			return nil, wantErr
+		},
+	}
+	forceIPv4ConnectSettings(settings)
+
+	_, err := settings.DialContext(context.Background(), "tcp", "connect.bringyour.com:443")
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("dial error = %v, want injected error", err)
+	}
+	if gotNetwork != "tcp4" {
+		t.Fatalf("underlying network = %q, want tcp4", gotNetwork)
+	}
+
+	gotNetwork = ""
+	if _, err := settings.DialContext(context.Background(), "tcp6", "[2001:db8::1]:443"); err == nil {
+		t.Fatal("IPv4-only Connect settings accepted an explicit tcp6 dial")
+	}
+	if gotNetwork != "" {
+		t.Fatalf("explicit tcp6 request reached the underlying dialer as %q", gotNetwork)
+	}
+}
+
+func TestClientStrategySettingsDoNotChangeProcessFamilyPolicy(t *testing.T) {
+	previousPolicy := connect.ControlIpFamilyPolicy()
+	connect.SetControlIpFamilyPolicy(connect.IpFamilyForce6)
+	t.Cleanup(func() { connect.SetControlIpFamilyPolicy(previousPolicy) })
+
+	settings := clientStrategySettings()
+	if settings.ConnectSettings.DialContextSettings == nil {
+		t.Fatal("Connect strategy has no IPv4-only dial boundary")
+	}
+	if got := connect.ControlIpFamilyPolicy(); got != connect.IpFamilyForce6 {
+		t.Fatalf("strategy construction changed process family policy to %d", got)
 	}
 }
