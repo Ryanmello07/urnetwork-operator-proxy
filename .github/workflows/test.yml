@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: urnetwork/connect
-          ref: b4a2bc9b0b10f39c60290b33cef6d270ad7300ea
+          ref: 450715cd27eb8d107b63d12d91656717c5bcd13c
           path: connect
       - uses: actions/checkout@v4
         with:

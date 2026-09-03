@@ -91,10 +91,6 @@ func TestIPv4DialContextRejectsUDP6BeforeDial(t *testing.T) {
 }
 
 func TestForceIPv4ConnectSettingsPreservesInjectedDialer(t *testing.T) {
-	previousPolicy := connect.ControlIpFamilyPolicy()
-	connect.SetControlIpFamilyPolicy(connect.IpFamilyAuto)
-	t.Cleanup(func() { connect.SetControlIpFamilyPolicy(previousPolicy) })
-
 	wantErr := errors.New("stop after observing the network")
 	gotNetwork := ""
 	settings := connect.DefaultConnectSettings()
@@ -123,16 +119,22 @@ func TestForceIPv4ConnectSettingsPreservesInjectedDialer(t *testing.T) {
 	}
 }
 
-func TestClientStrategySettingsDoNotChangeProcessFamilyPolicy(t *testing.T) {
-	previousPolicy := connect.ControlIpFamilyPolicy()
-	connect.SetControlIpFamilyPolicy(connect.IpFamilyForce6)
-	t.Cleanup(func() { connect.SetControlIpFamilyPolicy(previousPolicy) })
+func TestClientStrategySettingsLeaveIndependentSettingsUntouched(t *testing.T) {
+	gotNetwork := ""
+	untouched := connect.DefaultClientStrategySettings()
+	untouched.ConnectSettings.DialContextSettings = &connect.DialContextSettings{
+		DialContext: func(_ context.Context, network string, _ string) (net.Conn, error) {
+			gotNetwork = network
+			return nil, errors.New("stop after observing the network")
+		},
+	}
 
-	settings := clientStrategySettings()
-	if settings.ConnectSettings.DialContextSettings == nil {
+	forced := clientStrategySettings()
+	if forced.ConnectSettings.DialContextSettings == nil {
 		t.Fatal("Connect strategy has no IPv4-only dial boundary")
 	}
-	if got := connect.ControlIpFamilyPolicy(); got != connect.IpFamilyForce6 {
-		t.Fatalf("strategy construction changed process family policy to %d", got)
+	_, _ = untouched.ConnectSettings.DialContext(context.Background(), "tcp", "connect.bringyour.com:443")
+	if gotNetwork != "tcp" {
+		t.Fatalf("strategy construction changed an independent dial network to %q", gotNetwork)
 	}
 }
