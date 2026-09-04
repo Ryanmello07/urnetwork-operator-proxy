@@ -78,6 +78,17 @@ func providerTunnelMultiClientSettings() *connect.MultiClientSettings {
 	return settings
 }
 
+// A read failure while the tunnel is live makes the data path silently stop,
+// so it must remain visible. Tunnel.Close cancels this same context before it
+// closes the tun, however, and Tun.Read then returns its ordinary terminal
+// "Done" error. That lifecycle completion is not a failed connection and is
+// deliberately silent.
+func reportTunReadError(ctx context.Context, err error, print func(...any)) {
+	if ctx.Err() == nil {
+		print("providertunnel: tun read error:", err)
+	}
+}
+
 // inTunnelOnlyDnsResolverSettings returns DNS resolver settings under which
 // every name the tunnel resolves is resolved THROUGH the tunnel, encrypted.
 //
@@ -192,12 +203,7 @@ func Open(ctx context.Context, cfg Config, providerClientId connect.Id) (*Tunnel
 		for {
 			packet, err := tun.Read()
 			if err != nil {
-				// Without this log, the tunnel looks alive (Close() has not
-				// been called, no error is returned anywhere) while this
-				// pump goroutine has silently exited and every subsequent
-				// request blackholes. Matches the read-error handling in
-				// urnetwork/proxy/socks/main.go.
-				log.Println("providertunnel: tun read error:", err)
+				reportTunReadError(ctx, err, log.Println)
 				return
 			}
 			mc.SendPacket(source, protocol.ProvideMode_Network, packet, 15*time.Second)

@@ -754,6 +754,41 @@ func TestProviderTunnelMultiClientSettingsDisableNestedProviderProbe(t *testing.
 	}
 }
 
+// Closing a tunnel cancels its context before closing the tun. The resulting
+// terminal read error is ordinary teardown and must not be reported as a live
+// proxy failure.
+func TestReportTunReadErrorSuppressesCanceledTunnel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	called := false
+	reportTunReadError(ctx, errors.New("Done"), func(...any) {
+		called = true
+	})
+	if called {
+		t.Fatal("canceled tunnel read error was reported")
+	}
+}
+
+// A read error before lifecycle cancellation means the pump has died while
+// its tunnel still appears live, so the original diagnostic must remain.
+func TestReportTunReadErrorPreservesLiveTunnelFailure(t *testing.T) {
+	wantErr := errors.New("synthetic live read failure")
+	var gotArgs []any
+	reportTunReadError(context.Background(), wantErr, func(args ...any) {
+		gotArgs = append([]any(nil), args...)
+	})
+	if len(gotArgs) != 2 {
+		t.Fatalf("log args = %v, want message and error", gotArgs)
+	}
+	if gotArgs[0] != "providertunnel: tun read error:" {
+		t.Fatalf("log message = %v", gotArgs[0])
+	}
+	if gotArgs[1] != wantErr {
+		t.Fatalf("logged error = %v, want original error", gotArgs[1])
+	}
+}
+
 // TestOpenCloseGoroutineLifecycle is the FIX 2 regression test: Open/Close
 // had zero coverage on the theory that exercising them needs a live
 // provider. They do not -- every step Open drives is local construction
