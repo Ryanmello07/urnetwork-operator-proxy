@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"sync"
 	"time"
 )
@@ -134,6 +135,12 @@ type LocateOptions struct {
 	// so the CLI's only latency knob could not raise the deadline that
 	// matters on a cold tunnel.
 	PerSourceTimeout time.Duration
+
+	// ClassifyError recognizes a typed transport error that generic net/http
+	// cannot assign precisely. Production uses this only for the fixed-provider
+	// tunnel's existing certificate-pin sentinels. It changes diagnostics, not
+	// request behavior, deadlines, consensus, or returned success/failure.
+	ClassifyError SourceErrorClassifier
 }
 
 // LocateWithOptions is Locate with per-call tuning. See LocateOptions.
@@ -155,12 +162,13 @@ func locate(ctx context.Context, client *http.Client, srcs []source, opts Locate
 	}
 	perSource := opts.perSourceTimeout()
 	results := make([]SourceResult, len(srcs))
+	diagnostics := make([]SourceDiagnostic, len(srcs))
 	var wg sync.WaitGroup
 	for i := range srcs {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			results[i] = fetchSource(ctx, client, srcs[i], perSource)
+			results[i], diagnostics[i] = fetchSource(ctx, client, srcs[i], perSource, opts.ClassifyError, time.Now)
 		}(i)
 	}
 	wg.Wait()
@@ -172,7 +180,7 @@ func locate(ctx context.Context, client *http.Client, srcs []source, opts Locate
 		}
 	}
 	if len(ok) < MinSources {
-		return nil, ErrNoConsensus
+		return nil, newNoConsensusError(diagnostics)
 	}
 	loc := consensus(ok)
 	loc.Sources = results
@@ -180,41 +188,58 @@ func locate(ctx context.Context, client *http.Client, srcs []source, opts Locate
 	return &loc, nil
 }
 
-func fetchSource(ctx context.Context, client *http.Client, s source, perSourceTimeout time.Duration) SourceResult {
+func fetchSource(
+	ctx context.Context,
+	client *http.Client,
+	s source,
+	perSourceTimeout time.Duration,
+	classify SourceErrorClassifier,
+	now func() time.Time,
+) (SourceResult, SourceDiagnostic) {
 	r := SourceResult{Name: s.Name}
+	startedAt := now()
+	diagnostic := func(class SourceDiagnosticClass, stage SourceDiagnosticStage) SourceDiagnostic {
+		return newSourceDiagnostic(s.Name, class, stage, now().Sub(startedAt))
+	}
 	ctx, cancel := context.WithTimeout(ctx, perSourceTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.URL, nil)
 	if err != nil {
 		r.Err = err.Error()
-		return r
+		return r, diagnostic(SourceDiagnosticRequest, SourceDiagnosticStageRequest)
 	}
+	progress := &sourceProgress{}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), progress.trace()))
 	resp, err := client.Do(req)
 	if err != nil {
 		r.Err = err.Error()
-		return r
+		class, stage := classifySourceRequestError(err, progress, classify)
+		return r, diagnostic(class, stage)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		r.Err = fmt.Sprintf("status %d", resp.StatusCode)
-		return r
+		return r, diagnostic(SourceDiagnosticHTTPStatus, SourceDiagnosticStageResponseHeaders)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBytes+1))
 	if err != nil {
 		r.Err = err.Error()
-		return r
+		if sourceErrorIsTimeout(err) {
+			return r, diagnostic(SourceDiagnosticTimeout, SourceDiagnosticStageResponseBody)
+		}
+		return r, diagnostic(SourceDiagnosticResponseRead, SourceDiagnosticStageResponseBody)
 	}
 	if len(body) > MaxResponseBytes {
 		r.Err = "response too large"
-		return r
+		return r, diagnostic(SourceDiagnosticResponseSize, SourceDiagnosticStageResponseBody)
 	}
 	parsed, err := s.Parse(body)
 	if err != nil {
 		r.Err = err.Error()
-		return r
+		return r, diagnostic(SourceDiagnosticParse, SourceDiagnosticStageParse)
 	}
 	parsed.Name = s.Name
 	parsed.OK = true
-	return parsed
+	return parsed, diagnostic(SourceDiagnosticSuccess, SourceDiagnosticStageComplete)
 }

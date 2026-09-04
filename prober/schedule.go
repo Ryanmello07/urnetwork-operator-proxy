@@ -2,9 +2,14 @@ package prober
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/urnetwork/operator-proxy/geolocate"
 )
 
 // maxLoggedDistinctErrors caps how many DISTINCT probe error messages are
@@ -18,12 +23,92 @@ import (
 // total Failed count is always visible via the Summary the caller logs.
 const maxLoggedDistinctErrors = 10
 
+// maxGeolocationSourceOutcomeGroups bounds the one safe diagnostic line per
+// scheduler pass. The live source set has only three aliases, but stages and
+// elapsed buckets can differ across a large provider batch. Keeping the most
+// frequent groups preserves the failure shape without allowing one line to
+// grow with fleet size.
+const maxGeolocationSourceOutcomeGroups = 24
+
+// GeolocationSourceOutcomeCount is one bounded group in the no-consensus
+// diagnostic. Every string comes from a compile-time enum in geolocate; it
+// contains no provider id, URL, status code, raw error, or response material.
+type GeolocationSourceOutcomeCount struct {
+	Source  string
+	Class   string
+	Stage   string
+	Elapsed string
+	Count   int
+}
+
 // Summary reports one scheduler run.
 type Summary struct {
 	Attempted int
 	Submitted int
 	Skipped   int
 	Failed    int
+
+	// GeolocationSourceOutcomes describes only diagnostic-bearing
+	// ErrNoConsensus failures. Groups and underlying results omitted from the
+	// bounded tail remain explicit rather than disappearing silently.
+	GeolocationSourceOutcomes       []GeolocationSourceOutcomeCount
+	GeolocationSourceGroupsOmitted  int
+	GeolocationSourceResultsOmitted int
+}
+
+type geolocationSourceOutcomeKey struct {
+	source  string
+	class   string
+	stage   string
+	elapsed string
+}
+
+func geolocationSourceOutcomeKeyFromDiagnostic(diagnostic geolocate.SourceDiagnostic) geolocationSourceOutcomeKey {
+	return geolocationSourceOutcomeKey{
+		source:  diagnostic.Source,
+		class:   string(diagnostic.Class),
+		stage:   string(diagnostic.Stage),
+		elapsed: string(diagnostic.Elapsed),
+	}
+}
+
+func boundedGeolocationSourceOutcomes(counts map[geolocationSourceOutcomeKey]int) ([]GeolocationSourceOutcomeCount, int, int) {
+	outcomes := make([]GeolocationSourceOutcomeCount, 0, len(counts))
+	for key, count := range counts {
+		outcomes = append(outcomes, GeolocationSourceOutcomeCount{
+			Source: key.source, Class: key.class, Stage: key.stage, Elapsed: key.elapsed, Count: count,
+		})
+	}
+	sort.Slice(outcomes, func(i, j int) bool {
+		if outcomes[i].Count != outcomes[j].Count {
+			return outcomes[j].Count < outcomes[i].Count
+		}
+		left := strings.Join([]string{outcomes[i].Source, outcomes[i].Class, outcomes[i].Stage, outcomes[i].Elapsed}, "/")
+		right := strings.Join([]string{outcomes[j].Source, outcomes[j].Class, outcomes[j].Stage, outcomes[j].Elapsed}, "/")
+		return left < right
+	})
+	if len(outcomes) <= maxGeolocationSourceOutcomeGroups {
+		return outcomes, 0, 0
+	}
+	omittedResults := 0
+	for _, outcome := range outcomes[maxGeolocationSourceOutcomeGroups:] {
+		omittedResults += outcome.Count
+	}
+	return outcomes[:maxGeolocationSourceOutcomeGroups], len(outcomes) - maxGeolocationSourceOutcomeGroups, omittedResults
+}
+
+func renderGeolocationSourceOutcomes(outcomes []GeolocationSourceOutcomeCount, omittedGroups, omittedResults int) string {
+	groups := make([]string, 0, len(outcomes))
+	for _, outcome := range outcomes {
+		groups = append(groups, fmt.Sprintf(
+			"%s/%s/%s/%s=%d",
+			outcome.Source, outcome.Class, outcome.Stage, outcome.Elapsed, outcome.Count,
+		))
+	}
+	return fmt.Sprintf(
+		"groups=%s omitted_groups=%d omitted_results=%d",
+		strings.Join(groups, ","), omittedGroups, omittedResults,
+	)
 }
 
 // Scheduler probes a set of providers with bounded concurrency, skipping any
@@ -101,8 +186,10 @@ func (s *Scheduler) prune() {
 // every provider fails the same way, only the first maxLoggedDistinctErrors
 // DISTINCT error messages are logged in detail (each with the provider id
 // that first produced it); beyond that, one notice is logged noting further
-// detail is suppressed. The total failure count is unaffected and always
-// visible via the returned Summary.
+// detail is suppressed. Diagnostic-bearing no-consensus failures are the one
+// exception: their raw errors and provider ids are replaced by one bounded
+// per-source aggregate after the entire batch. The total failure count is
+// unaffected and always visible via the returned Summary.
 func (s *Scheduler) Run(ctx context.Context, providerClientIds []string) Summary {
 	s.prune()
 	// Re-arm the prober's per-pass error-log gates (and report what the last
@@ -120,6 +207,7 @@ func (s *Scheduler) Run(ctx context.Context, providerClientIds []string) Summary
 
 	var mu sync.Mutex
 	var sum Summary
+	geolocationSourceOutcomeCounts := map[geolocationSourceOutcomeKey]int{}
 	loggedErrors := map[string]bool{}
 	suppressedNoted := false
 
@@ -186,19 +274,25 @@ func (s *Scheduler) Run(ctx context.Context, providerClientIds []string) Summary
 			mu.Unlock()
 
 			err := s.Prober.ProbeOne(ctx, id)
+			sourceDiagnostics := geolocate.SourceDiagnostics(err)
 
 			mu.Lock()
 			if err != nil {
 				sum.Failed++
-				msg := err.Error()
-				if !loggedErrors[msg] {
-					if len(loggedErrors) < maxLoggedDistinctErrors {
-						loggedErrors[msg] = true
-						log.Printf("prober: probe failed provider=%s: %s", id, err)
-					} else if !suppressedNoted {
-						suppressedNoted = true
-						log.Printf("prober: %d+ distinct probe errors this pass; suppressing further per-error detail (see the pass's failed count for the total)", maxLoggedDistinctErrors)
+				if len(sourceDiagnostics) == 0 {
+					msg := err.Error()
+					if !loggedErrors[msg] {
+						if len(loggedErrors) < maxLoggedDistinctErrors {
+							loggedErrors[msg] = true
+							log.Printf("prober: probe failed provider=%s: %s", id, err)
+						} else if !suppressedNoted {
+							suppressedNoted = true
+							log.Printf("prober: %d+ distinct probe errors this pass; suppressing further per-error detail (see the pass's failed count for the total)", maxLoggedDistinctErrors)
+						}
 					}
+				}
+				for _, diagnostic := range sourceDiagnostics {
+					geolocationSourceOutcomeCounts[geolocationSourceOutcomeKeyFromDiagnostic(diagnostic)]++
 				}
 			} else {
 				sum.Submitted++
@@ -211,5 +305,17 @@ func (s *Scheduler) Run(ctx context.Context, providerClientIds []string) Summary
 		}(id)
 	}
 	wg.Wait()
+	sum.GeolocationSourceOutcomes, sum.GeolocationSourceGroupsOmitted, sum.GeolocationSourceResultsOmitted =
+		boundedGeolocationSourceOutcomes(geolocationSourceOutcomeCounts)
+	if len(sum.GeolocationSourceOutcomes) != 0 {
+		log.Printf(
+			"geolocate-source-outcomes: %s",
+			renderGeolocationSourceOutcomes(
+				sum.GeolocationSourceOutcomes,
+				sum.GeolocationSourceGroupsOmitted,
+				sum.GeolocationSourceResultsOmitted,
+			),
+		)
+	}
 	return sum
 }

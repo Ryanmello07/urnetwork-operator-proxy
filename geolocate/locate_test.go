@@ -2,6 +2,7 @@ package geolocate
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -101,7 +102,7 @@ func TestLocateQuorumFail(t *testing.T) {
 		{Name: "freeipapi", URL: bad.URL, Parse: parseFreeIpApi},
 		{Name: "ipinfo", URL: bad.URL, Parse: parseIpInfo},
 	}
-	if _, err := locate(context.Background(), &http.Client{}, srcs, LocateOptions{}); err != ErrNoConsensus {
+	if _, err := locate(context.Background(), &http.Client{}, srcs, LocateOptions{}); !errors.Is(err, ErrNoConsensus) {
 		t.Fatalf("err = %v, want ErrNoConsensus", err)
 	}
 }
@@ -310,7 +311,7 @@ func TestLocatePerSourceTimeoutFromOptions(t *testing.T) {
 			PerSourceTimeout: 30 * time.Millisecond,
 		})
 		elapsed := time.Since(start)
-		if err != ErrNoConsensus {
+		if !errors.Is(err, ErrNoConsensus) {
 			t.Fatalf("err = %v, want ErrNoConsensus: every source should have exceeded the 30ms per-source timeout", err)
 		}
 		if elapsed >= serverDelay {
@@ -325,7 +326,7 @@ func TestLocatePerSourceTimeoutFromOptions(t *testing.T) {
 		PerSourceTimeout = 30 * time.Millisecond
 		defer func() { PerSourceTimeout = old }()
 
-		if _, err := locate(context.Background(), &http.Client{}, newSources(t), LocateOptions{}); err != ErrNoConsensus {
+		if _, err := locate(context.Background(), &http.Client{}, newSources(t), LocateOptions{}); !errors.Is(err, ErrNoConsensus) {
 			t.Fatalf("err = %v, want ErrNoConsensus: a zero LocateOptions must use the 30ms package default", err)
 		}
 	})

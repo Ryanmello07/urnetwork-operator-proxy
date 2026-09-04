@@ -440,6 +440,16 @@ without the report it sorts to the head of the queue on every poll forever and
 starves every healthy provider, silently, because the endpoint keeps returning a
 full plausible batch.
 
+When a batch contains diagnostic-bearing `no_consensus` results, the scheduler
+also emits exactly one bounded `geolocate-source-outcomes` aggregate. Its groups
+contain only the three compile-time source aliases (or `other`), fixed
+result/stage classes, bounded elapsed buckets, and counts. Per-provider detail
+is suppressed for those results. Raw errors, URLs, status codes, headers,
+bodies, certificates and pins, tokens, and provider IDs never enter this
+diagnostic. This distinguishes a cold tunnel-formation timeout from DNS,
+TLS/pin, HTTP-status, response-read/size, parse, and successful source outcomes
+without changing the probe deadline, quorum, submission, or retry behavior.
+
 If the due endpoint returns **404** the server has not deployed it, and the
 prober falls back to enumerating providers itself (below) with the `-cache-ttl`
 in-memory window applied, exactly as before. A **401** does *not* fall back: that

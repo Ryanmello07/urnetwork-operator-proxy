@@ -5,6 +5,7 @@ package fleetprobe
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -84,6 +85,12 @@ func NewFullProber(options FullOptions) *prober.Prober {
 		Locate: func(ctx context.Context, client *http.Client) (*geolocate.ConsensusLocation, error) {
 			return geolocate.LocateWithOptions(ctx, client, geolocate.LocateOptions{
 				PerSourceTimeout: options.ProbeTimeout,
+				ClassifyError: func(err error) (geolocate.SourceDiagnosticClass, geolocate.SourceDiagnosticStage, bool) {
+					if errors.Is(err, providertunnel.ErrPinMismatch) || errors.Is(err, providertunnel.ErrPinHostUnknown) {
+						return geolocate.SourceDiagnosticTLSOrPin, geolocate.SourceDiagnosticStageTLS, true
+					}
+					return "", "", false
+				},
 			})
 		},
 		Health: func(ctx context.Context, client *http.Client) (*egresshealth.Result, error) {

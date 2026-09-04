@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -199,6 +200,141 @@ func TestSchedulerCountsFailuresAndDoesNotCache(t *testing.T) {
 	sum2 := s.Run(context.Background(), []string{"a"})
 	if sum2.Attempted != 1 {
 		t.Fatal("a failed probe must be retried on the next run")
+	}
+}
+
+type sourceOutcomeRoundTripper func(*http.Request) (*http.Response, error)
+
+func (self sourceOutcomeRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return self(request)
+}
+
+func TestSchedulerEmitsOnePrivacySafeNoConsensusAggregate(t *testing.T) {
+	const (
+		firstProvider  = "provider-private-one"
+		secondProvider = "provider-private-two"
+	)
+	client := &http.Client{Transport: sourceOutcomeRoundTripper(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Hostname() {
+		case "api.i.pn":
+			return nil, fmt.Errorf("private cold-tunnel state: %w", context.DeadlineExceeded)
+		case "free.freeipapi.com":
+			return &http.Response{
+				StatusCode: 599,
+				Body:       io.NopCloser(strings.NewReader("private response body")),
+				Header:     http.Header{},
+			}, nil
+		case "ipinfo.io":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"country":"US"}`)),
+				Header:     http.Header{},
+			}, nil
+		default:
+			return nil, errors.New("private unexpected endpoint")
+		}
+	})}
+	_, diagnosticErr := geolocate.LocateWithOptions(
+		context.Background(), client, geolocate.LocateOptions{PerSourceTimeout: time.Minute},
+	)
+	if !errors.Is(diagnosticErr, geolocate.ErrNoConsensus) {
+		t.Fatalf("diagnostic fixture err = %v, want ErrNoConsensus", diagnosticErr)
+	}
+	reporter := &stubReporter{}
+	p := &Prober{
+		Open: func(context.Context, string) (*http.Client, func() error, error) {
+			return client, func() error { return nil }, nil
+		},
+		Locate: func(context.Context, *http.Client) (*geolocate.ConsensusLocation, error) {
+			return nil, diagnosticErr
+		},
+		Submit:   &stubSubmitter{},
+		Attempts: reporter,
+	}
+
+	var buf bytes.Buffer
+	originalWriter := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(originalWriter)
+
+	summary := (&Scheduler{Prober: p, Concurrency: 2}).Run(
+		context.Background(), []string{firstProvider, secondProvider},
+	)
+	if summary.Failed != 2 || summary.Submitted != 0 {
+		t.Fatalf("summary failed/submitted = %d/%d, want 2/0", summary.Failed, summary.Submitted)
+	}
+	attempts := reporter.snapshot()
+	if len(attempts) != 2 {
+		t.Fatalf("reported attempts = %d, want 2", len(attempts))
+	}
+	for _, attempt := range attempts {
+		if attempt.failure != FailureNoConsensus {
+			t.Fatalf("probe_failure = %q, want unchanged %q", attempt.failure, FailureNoConsensus)
+		}
+	}
+	if len(summary.GeolocationSourceOutcomes) != 3 {
+		t.Fatalf("source outcome groups = %d, want 3: %+v", len(summary.GeolocationSourceOutcomes), summary.GeolocationSourceOutcomes)
+	}
+	want := map[string]int{
+		"ip.pn/timeout/connect_formation":        2,
+		"freeipapi/http_status/response_headers": 2,
+		"ipinfo/success/complete":                2,
+	}
+	for _, outcome := range summary.GeolocationSourceOutcomes {
+		key := strings.Join([]string{outcome.Source, outcome.Class, outcome.Stage}, "/")
+		if outcome.Count != want[key] {
+			t.Errorf("outcome %s count=%d, want %d", key, outcome.Count, want[key])
+		}
+		delete(want, key)
+		if outcome.Elapsed == "" {
+			t.Errorf("outcome %s has no bounded elapsed bucket", key)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing source outcome groups: %v", want)
+	}
+	logged := buf.String()
+	if strings.Count(logged, "geolocate-source-outcomes:") != 1 {
+		t.Fatalf("safe aggregate count != 1:\n%s", logged)
+	}
+	if strings.Contains(logged, "probe failed provider=") {
+		t.Fatalf("diagnostic-bearing no-consensus retained per-provider error detail:\n%s", logged)
+	}
+	for _, private := range []string{
+		firstProvider, secondProvider, "private", "599", "api.i.pn", "free.freeipapi.com", "ipinfo.io", "https://",
+	} {
+		if strings.Contains(logged, private) {
+			t.Fatalf("safe aggregate leaked %q:\n%s", private, logged)
+		}
+	}
+}
+
+func TestGeolocationSourceOutcomeAggregateIsDeterministicallyBounded(t *testing.T) {
+	classes := []string{
+		"success", "dns", "timeout", "connect", "tls_or_pin",
+		"http_status", "response_read", "response_size", "parse", "request",
+	}
+	counts := map[geolocationSourceOutcomeKey]int{}
+	nextCount := 1
+	for _, source := range []string{"ip.pn", "freeipapi", "ipinfo"} {
+		for _, class := range classes {
+			counts[geolocationSourceOutcomeKey{
+				source: source, class: class, stage: "connect_formation", elapsed: "lt1s",
+			}] = nextCount
+			nextCount++
+		}
+	}
+	outcomes, omittedGroups, omittedResults := boundedGeolocationSourceOutcomes(counts)
+	if len(outcomes) != maxGeolocationSourceOutcomeGroups {
+		t.Fatalf("bounded groups = %d, want %d", len(outcomes), maxGeolocationSourceOutcomeGroups)
+	}
+	if omittedGroups != len(counts)-maxGeolocationSourceOutcomeGroups || omittedResults <= 0 {
+		t.Fatalf("omitted groups/results = %d/%d, want %d/positive", omittedGroups, omittedResults, len(counts)-maxGeolocationSourceOutcomeGroups)
+	}
+	for index := 1; index < len(outcomes); index++ {
+		if outcomes[index-1].Count < outcomes[index].Count {
+			t.Fatalf("outcomes are not sorted by descending count: %+v", outcomes)
+		}
 	}
 }
 
