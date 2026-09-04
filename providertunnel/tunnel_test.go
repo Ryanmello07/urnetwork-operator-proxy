@@ -700,8 +700,8 @@ func TestOpenRejectsNilOrEmptyPins(t *testing.T) {
 }
 
 // dummyOpenConfig is a Config that lets Open build a real tunnel entirely
-// offline: every construction step it drives (CreateTunWithDefaults,
-// NewApiMultiClientGenerator, NewRemoteUserNatMultiClientWithDefaults) only
+// offline: every construction step it drives (CreateTunWithResolver,
+// NewApiMultiClientGenerator, NewRemoteUserNatMultiClient) only
 // allocates in-process state (a private gvisor stack, in-memory structs) --
 // none of it dials out or blocks on network I/O, so no live provider or
 // server is needed to open and close a tunnel.
@@ -715,6 +715,42 @@ func dummyOpenConfig() Config {
 		DeviceDescription: "test",
 		DeviceSpec:        "test",
 		Version:           "0.0.0-test",
+	}
+}
+
+// A provider tunnel is already owned by the outer full or blackhole probe. The
+// general multi-client defaults enable their own provider-qualification sweep,
+// which made every short-lived outer probe start a redundant inner probe and
+// emit misleading [rel] failure/transition lines. The tunnel keeps every other
+// default but must turn that second authority off before construction.
+func TestProviderTunnelMultiClientSettingsDisableNestedProviderProbe(t *testing.T) {
+	expected := connect.DefaultMultiClientSettings()
+	if !expected.ProviderProbe {
+		t.Fatal("test precondition: shared defaults no longer enable ProviderProbe")
+	}
+	expected.ProviderProbe = false
+
+	settings := providerTunnelMultiClientSettings()
+	if settings.SecurityPolicyGenerator == nil || expected.SecurityPolicyGenerator == nil {
+		t.Fatal("provider tunnel settings lost the default security policy generator")
+	}
+	if reflect.ValueOf(settings.SecurityPolicyGenerator).Pointer() != reflect.ValueOf(expected.SecurityPolicyGenerator).Pointer() {
+		t.Fatal("provider tunnel settings changed the default security policy generator")
+	}
+	// DeepEqual intentionally reports non-nil functions as unequal, even when
+	// both values name the same function. Compare that hook by code identity
+	// above, then clear it from value copies so every remaining field is still
+	// checked structurally.
+	actualComparable := *settings
+	expectedComparable := *expected
+	actualComparable.SecurityPolicyGenerator = nil
+	expectedComparable.SecurityPolicyGenerator = nil
+	if !reflect.DeepEqual(actualComparable, expectedComparable) {
+		t.Fatal("provider tunnel settings must preserve every default except ProviderProbe=false")
+	}
+	settings.ProviderProbe = true
+	if !connect.DefaultMultiClientSettings().ProviderProbe {
+		t.Fatal("provider tunnel settings mutated the shared defaults")
 	}
 }
 

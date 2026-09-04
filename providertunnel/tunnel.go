@@ -64,6 +64,20 @@ var createTun = func(ctx context.Context, resolver *connect.DnsResolverSettings)
 // provider tunnel uses the shared IPv4-only constructor.
 var newControlplaneClientStrategy = controlplane.NewClientStrategy
 
+// The fixed-provider tunnel is itself the instrument used by the outer
+// geolocation/egress-health probe. Running RemoteUserNatMultiClient's ordinary
+// background provider-qualification sweep inside it asks a second, unrelated
+// set of health questions through every short-lived probe tunnel. Those nested
+// probes cannot affect the outer verdict, but they multiply traffic and emit
+// transition/failure telemetry that looks like another failing workload.
+// Start from the shared defaults so every transport behavior stays aligned,
+// and disable only the redundant inner authority.
+func providerTunnelMultiClientSettings() *connect.MultiClientSettings {
+	settings := connect.DefaultMultiClientSettings()
+	settings.ProviderProbe = false
+	return settings
+}
+
 // inTunnelOnlyDnsResolverSettings returns DNS resolver settings under which
 // every name the tunnel resolves is resolved THROUGH the tunnel, encrypted.
 //
@@ -160,13 +174,14 @@ func Open(ctx context.Context, cfg Config, providerClientId connect.Id) (*Tunnel
 		)
 	}
 
-	mc := connect.NewRemoteUserNatMultiClientWithDefaults(
+	mc := connect.NewRemoteUserNatMultiClient(
 		ctx,
 		generator,
 		func(source connect.TransferPath, provideMode protocol.ProvideMode, ipPath *connect.IpPath, packet []byte) {
 			_, _ = tun.Write(packet)
 		},
 		protocol.ProvideMode_Network,
+		providerTunnelMultiClientSettings(),
 	)
 
 	// pump tun -> provider
